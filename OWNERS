@@ -1,0 +1,4 @@
+include platform/system/core:main:/janitors/OWNERS
+
+# include OWNERS from the top level trusty repo
+include trusty:main:/OWNERS
