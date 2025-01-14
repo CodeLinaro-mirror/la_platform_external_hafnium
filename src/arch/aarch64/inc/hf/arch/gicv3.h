@@ -74,6 +74,12 @@
 
 #define GIC_PRI_MASK (0xff)
 
+/* Mask non-secure interrupts in Secure World. */
+#define SWD_MASK_NS_INT (0x80)
+
+/* Mask all interrupts in Secure World. */
+#define SWD_MASK_ALL_INT (0x0)
+
 /**
  * GICv3 and 3.1 specific Distributor interface register offsets and constants
  */
@@ -144,6 +150,7 @@
 
 /* GICD_TYPER shifts and masks */
 #define TYPER_ESPI (1 << 8)
+#define TYPER_SEC_EXTN (1 << 10)
 #define TYPER_DVIS (1 << 18)
 #define TYPER_ESPI_RANGE_MASK (0x1f)
 #define TYPER_ESPI_RANGE_SHIFT (27)
@@ -298,6 +305,11 @@
 #define IS_SPI(id) (((id) >= MIN_SPI_ID) && ((id) <= MAX_SPI_ID))
 
 #endif /* GIC_EXT_INTID */
+
+/** PPIs associated with various peripheral timers. */
+#define ARM_SEL2_TIMER_PHYS_INT UINT32_C(20)
+#define ARM_EL1_VIRT_TIMER_PHYS_INT UINT32_C(27)
+#define ARM_EL1_PHYS_TIMER_PHYS_INT UINT32_C(30)
 
 static inline uint32_t get_highest_pending_g0_interrupt_id(void)
 {

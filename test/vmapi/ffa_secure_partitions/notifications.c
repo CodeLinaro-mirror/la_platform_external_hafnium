@@ -15,6 +15,7 @@
 #include "vmapi/hf/call.h"
 
 #include "ffa_endpoints.h"
+#include "ffa_secure_partitions.h"
 #include "partition_services.h"
 #include "test/hftest.h"
 #include "test/vmapi/ffa.h"
@@ -111,7 +112,11 @@ TEST(ffa_notifications, signaling_from_sp_to_vm)
  */
 TEST(ffa_notifications, signaling_from_vm_to_sp)
 {
-	notif_signal_vm_to_sp(hf_vm_get_id(), SP_ID(1),
+	/*
+	 * This test can't communicate with SP_ID(1).
+	 * Target SP should be FF-A v1.1 or newer.
+	 */
+	notif_signal_vm_to_sp(hf_vm_get_id(), SP_ID(2),
 			      FFA_NOTIFICATION_MASK(35),
 			      FFA_NOTIFICATIONS_FLAG_DELAY_SRI);
 }
@@ -185,42 +190,35 @@ static void cpu_entry_sp_to_vm_signaling(uintptr_t arg)
 static void base_per_cpu_notifications_test(void (*cpu_entry)(uintptr_t arg))
 {
 	struct spinlock lock = SPINLOCK_INIT;
-	alignas(4096) static uint8_t other_stack[MAX_CPUS - 1][4096];
 	struct notif_cpu_entry_args args = {.lock = &lock};
-	struct ffa_partition_info sp;
 	struct mailbox_buffers mb = set_up_mailbox();
+	struct ffa_partition_info *service2_info = service2(mb.recv);
 
-	EXPECT_EQ(get_ffa_partition_info(
-			  &(struct ffa_uuid){SP_SERVICE_SECOND_UUID}, &sp, 1,
-			  mb.recv),
-		  1);
-	args.sp_id = sp.vm_id;
-	args.is_sp_up = sp.vcpu_count == 1U;
+	args.sp_id = service2_info->vm_id;
+	args.is_sp_up = service2_info->vcpu_count == 1U;
 
 	/* Start secondary while holding lock. */
 	sl_lock(&lock);
 
 	for (size_t i = 1; i < MAX_CPUS - 1; i++) {
-		size_t hftest_cpu_index = MAX_CPUS - i;
-		HFTEST_LOG("Notifications signaling VM to SP. Booting CPU %u.",
+		HFTEST_LOG("Notifications signaling VM to SP. Booting CPU %zu.",
 			   i);
 
 		args.vcpu_id = i;
 
-		EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(hftest_cpu_index),
-					   other_stack[i - 1],
-					   sizeof(other_stack[0]), cpu_entry,
-					   (uintptr_t)&args),
+		EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(i),
+					   hftest_get_secondary_ec_stack(i),
+					   cpu_entry, (uintptr_t)&args),
 			  true);
 
 		/* Wait for CPU to release the lock. */
 		sl_lock(&lock);
 
-		HFTEST_LOG("Done with CPU %u\n", i);
+		HFTEST_LOG("Done with CPU %zu\n", i);
 	}
 }
 
-TEST(ffa_notifications, per_vcpu_vm_to_sp)
+TEST_PRECONDITION(ffa_notifications, per_vcpu_vm_to_sp, service2_is_mp_sp)
 {
 	base_per_cpu_notifications_test(cpu_entry_vm_to_sp_signaling);
 }
@@ -250,6 +248,91 @@ TEST(ffa_notifications, fail_if_mbz_set_in_notification_get)
 	/* Check return is FFA_INVALID_PARAMETERS if any bit that MBZ is set. */
 	res = ffa_notification_get(own_id, 0, 0xFF00U);
 	EXPECT_FFA_ERROR(res, FFA_INVALID_PARAMETERS);
+}
+
+TEST(ffa_notifications, fail_if_mbz_set_in_notification_set)
+{
+	struct ffa_value res;
+	const ffa_id_t sender = SP_ID(1);
+	ffa_id_t own_id = hf_vm_get_id();
+
+	/* Arbitrarily bind notification. */
+	res = ffa_notification_bind(sender, own_id, 0,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_SUCCESS_32);
+
+	/* Requesting sender to set notification. */
+	res = sp_notif_set_cmd_send(own_id, sender, own_id,
+				    ~(FFA_NOTIFICATION_FLAG_PER_VCPU |
+				      FFA_NOTIFICATIONS_FLAG_DELAY_SRI),
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(res), SP_ERROR);
+	EXPECT_EQ((int32_t)sp_resp_value(res), FFA_INVALID_PARAMETERS);
+}
+
+/**
+ * Test that setting global notifications, specifying vCPU other than
+ * 0 fails with the appropriate error code.
+ */
+TEST(ffa_notifications, fail_if_global_notif_vcpu_not_zero)
+{
+	struct ffa_value res;
+	const ffa_id_t sender = SP_ID(1);
+	ffa_id_t own_id = hf_vm_get_id();
+
+	/* Arbitrarily bind notification. */
+	res = ffa_notification_bind(sender, own_id, 0,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_SUCCESS_32);
+
+	/* Requesting sender to set notification. */
+	res = sp_notif_set_cmd_send(own_id, sender, own_id,
+				    FFA_NOTIFICATIONS_FLAGS_VCPU_ID(5),
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(res), SP_ERROR);
+	EXPECT_EQ((int32_t)sp_resp_value(res), FFA_INVALID_PARAMETERS);
+}
+
+TEST(ffa_notifications, fail_if_global_notif_set_as_per_vcpu)
+{
+	struct ffa_value res;
+	const ffa_id_t sender = SP_ID(1);
+	ffa_id_t own_id = hf_vm_get_id();
+
+	/* Arbitrarily bind global notification. */
+	res = ffa_notification_bind(sender, own_id, 0,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_SUCCESS_32);
+
+	/* Requesting sender to set notification: as per-vCPU. */
+	res = sp_notif_set_cmd_send(own_id, sender, own_id,
+				    FFA_NOTIFICATION_FLAG_PER_VCPU,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(res), SP_ERROR);
+	EXPECT_EQ((int32_t)sp_resp_value(res), FFA_INVALID_PARAMETERS);
+}
+
+TEST(ffa_notifications, fail_if_per_vcpu_notif_set_as_global)
+{
+	struct ffa_value res;
+	const ffa_id_t sender = SP_ID(1);
+	ffa_id_t own_id = hf_vm_get_id();
+
+	/* Arbitrarily bind per-vCPU notification. */
+	res = ffa_notification_bind(sender, own_id,
+				    FFA_NOTIFICATION_FLAG_PER_VCPU,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_SUCCESS_32);
+
+	/* Requesting sender to set notification: as global. */
+	res = sp_notif_set_cmd_send(own_id, sender, own_id, 0,
+				    FFA_NOTIFICATION_MASK(1));
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(res), SP_ERROR);
+	EXPECT_EQ((int32_t)sp_resp_value(res), FFA_INVALID_PARAMETERS);
 }
 
 TEST(ffa_notifications, fail_if_mbz_set_in_notifications_bind)

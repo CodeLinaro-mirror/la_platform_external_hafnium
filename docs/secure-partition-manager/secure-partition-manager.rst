@@ -40,7 +40,7 @@ for Arm A class devices, executing at EL3. It includes the implementation of the
 |SPMD|, which manages the world-switch, to relay the FF-A calls to the |SPMC|.
 
 TF-A also serves as the system bootlader, and it was used in the reference
-implemenation for the SPMC and SPs.
+implementation for the SPMC and SPs.
 SPs may be signed by different parties (SiP, OEM/ODM, TOS vendor, etc.).
 Thus they are supplied as distinct signed entities within the FIP flash
 image. The FIP image itself is not signed hence this provides the ability
@@ -95,8 +95,7 @@ implemented and the SPMC is located at S-EL2, for Arm's FVP platform:
     SPD=spmd \
     ARM_ARCH_MINOR=5 \
     BRANCH_PROTECTION=1 \
-    CTX_INCLUDE_PAUTH_REGS=1 \
-    CTX_INCLUDE_MTE_REGS=1 \
+    ENABLE_FEAT_MTE2=1 \
     BL32=<path-to-hafnium-binary> \
     BL33=<path-to-bl33-binary> \
     SP_LAYOUT_FILE=sp_layout.json \
@@ -113,8 +112,7 @@ implemented, the SPMC is located at S-EL2, and enabling secure boot:
     SPD=spmd \
     ARM_ARCH_MINOR=5 \
     BRANCH_PROTECTION=1 \
-    CTX_INCLUDE_PAUTH_REGS=1 \
-    CTX_INCLUDE_MTE_REGS=1 \
+    ENABLE_FEAT_MTE2=1 \
     BL32=<path-to-hafnium-binary> \
     BL33=<path-to-bl33-binary> \
     SP_LAYOUT_FILE=sp_layout.json \
@@ -203,37 +201,44 @@ SPMC to run at S-EL2. SPs run at S-EL1 or S-EL0.
         binary_size = <0x60000>;
     };
 
-- *spmc_id* defines the endpoint ID value that SPMC can query through
+* *spmc_id* defines the endpoint ID value that SPMC can query through
   ``FFA_ID_GET``.
-- *maj_ver/min_ver*. SPMD checks provided FF-A version versus its internal
+* *maj_ver/min_ver*. SPMD checks provided FF-A version versus its internal
   version and aborts if not matching.
-- *exec_state* defines the SPMC execution state (AArch64 or AArch32).
+* *exec_state* defines the SPMC execution state (AArch64 or AArch32).
   Notice Hafnium used as a SPMC only supports AArch64.
-- *load_address* and *binary_size* are mostly used to verify secondary
+* *load_address* and *binary_size* are mostly used to verify secondary
   entry points fit into the loaded binary image.
-- *entrypoint* defines the cold boot primary core entry point used by
+* *entrypoint* defines the cold boot primary core entry point used by
   SPMD (currently matches ``BL32_BASE``) to enter the SPMC.
 
 Other nodes in the manifest are consumed by Hafnium in the secure world.
 A sample can be found at `[7]`_:
 
-- The *hypervisor* node describes SPs. *is_ffa_partition* boolean attribute
-  indicates a FF-A compliant SP. The *load_address* field specifies the load
+* The *hypervisor* node describes SPs. *is_ffa_partition* boolean attribute
+  indicates a |FF-A| compliant SP. The *load_address* field specifies the load
   address at which BL2 loaded the SP package.
-- The *cpus* node provides the platform topology and allows MPIDR to VMPIDR mapping.
+* The *cpus* node provides the platform topology and allows MPIDR to VMPIDR mapping.
   Note the primary core is declared first, then secondary cores are declared
   in reverse order.
-- The *memory* nodes provide platform information on the ranges of memory
+* The *memory* nodes provide platform information on the ranges of memory
   available for use by SPs at runtime. These ranges relate to either
-  secure or non-secure memory, depending on the *device_type* field.
-  If the field specifies "memory" the range is secure, else if it specifies
-  "ns-memory" the memory is non-secure. The system integrator must exclude
-  the memory used by other components that are not SPs, such as the monitor,
-  or the SPMC itself, the OS Kernel/Hypervisor, or other NWd VMs.
-  The SPMC  limits the SP's address space such that they can only refer to memory
-  inside of those ranges, either by defining memory region nodes in their manifest
-  as well as memory starting at the load address until the limit defined by the memory
-  size. Thus, the SPMC prevents rogue SPs from tampering with memory from other
+  normal or device and secure or non-secure memory, depending on the *device_type*
+  field. The system integrator must exclude the memory used by other components
+  that are not SPs, such as the monitor, or the SPMC itself, the OS Kernel/Hypervisor,
+  NWd VMs, or peripherals that shall not be used by any of the SPs. The following are
+  the supported *device_type* fields:
+
+   * "memory": normal secure memory.
+   * "ns-memory": normal non-secure memory.
+   * "device-memory": device secure memory.
+   * "ns-device-memory": device non-secure memory.
+
+  The SPMC limits the SP's address space such that they can only refer to memory
+  inside of those ranges, either by defining memory region or device region nodes in
+  their manifest as well as memory starting at the load address until the limit
+  defined by the memory size. The SPMC also checks for overlaps between the regions.
+  Thus, the SPMC prevents rogue SPs from tampering with memory from other
   components.
 
 .. code:: shell
@@ -248,12 +253,56 @@ A sample can be found at `[7]`_:
 		reg = <0x0 0x90010000 0x70000000>;
 	};
 
+	memory@2 {
+		device_type = "device-memory";
+		reg = <0x0 0x1c090000 0x0 0x40000>, /* UART */
+		      <0x0 0x2bfe0000 0x0 0x20000>, /* SMMUv3TestEngine */
+		      <0x0 0x2a490000 0x0 0x20000>, /* SP805 Trusted Watchdog */
+		      <0x0 0x1c130000 0x0 0x10000>; /* Virtio block device */
+	};
+
+	memory@3 {
+		device_type = "ns-device-memory";
+		reg = <0x0 0x1C1F0000 0x0 0x10000>; /* LCD */
+	};
+
 Above find an example representation of the referred memory description. The
 ranges are described in a list of unsigned 32-bit values, in which the first
 two addresses relate to the based physical address, followed by the respective
 page size. The first secure range defined in the node below has base address
 `0x0 0x6000000` and size `0x2000000`; following there is another range with
 base address `0x0 0xff000000` and size `0x1000000`.
+
+The interrupt-controller node contains the address ranges of GICD and GICR
+so that non-contiguous GICR frames can be probed during boot flow. The GICD
+address is defined in the first cell, followed by the GICR addresses.
+"redistributor-regions" is used to define the number of GICR addresses.
+
+This node is optional. When absent, the default configuration assumes there is
+one redistributor region. The default GICD memory range is from ``GICD_BASE``
+to ``GICD_BASE + GICD_SIZE``. The default GICR memory range is from
+``GICR_BASE`` to ``GICR_BASE + GICR_FRAMES * GIC_REDIST_SIZE_PER_PE``.
+
+.. code:: shell
+
+	gic: interrupt-controller@0x30000000 {
+		compatible = "arm,gic-v3";
+		#address-cells = <2>;
+		#size-cells = <1>;
+		#redistributor-regions = <4>;
+		reg = <0x00 0x30000000 0x10000>,	// GICD
+		      <0x00 0x301C0000 0x400000>,	// GICR 0: Chip 0
+		      <0x10 0x301C0000 0x400000>,	// GICR 1: Chip 1
+		      <0x20 0x301C0000 0x400000>,	// GICR 2: Chip 2
+		      <0x30 0x301C0000 0x400000>;	// GICR 3: Chip 3
+	};
+
+The above is an example representation of the referred interrupt controller
+description. The cells are made up of three values. The first two 32-bit values
+make up a 64-bit value representing the address of the GIC redistributor. The
+third value represents the size of this region. In this example,
+redistributor-regions states there are 4 GICR cells. The address of GICR 0 is
+`0x00301C0000` and the size of that region is `0x400000`.
 
 Secure Partitions Configuration
 -------------------------------
@@ -598,7 +647,7 @@ Secure partitions scheduling
 The FF-A specification `[1]`_ provides two ways to allocate CPU cycles to
 secure partitions. For this a VM (Hypervisor or OS kernel), or SP invokes one of:
 
-- the FFA_MSG_SEND_DIRECT_REQ interface.
+- the FFA_MSG_SEND_DIRECT_REQ (or FFA_MSG_SEND_DIRECT_REQ2) interface.
 - the FFA_RUN interface.
 
 Additionally a secure interrupt can pre-empt the normal world execution and give
@@ -647,7 +696,11 @@ As part of the FF-A v1.1 support, the following interfaces were added:
  - ``FFA_RX_ACQUIRE``
 
 As part of the FF-A v1.2 support, the following interfaces were added:
+
 - ``FFA_PARTITION_INFO_GET_REGS``
+- ``FFA_MSG_SEND_DIRECT_REQ2``
+- ``FFA_MSG_SEND_DIRECT_RESP2``
+- ``FFA_CONSOLE_LOG``
 
 FFA_VERSION
 ~~~~~~~~~~~
@@ -660,6 +713,10 @@ The returned value depends on the caller:
 - SP: the SPMC returns its own implemented version.
 - SPMC at S-EL1/S-EL2: the SPMD returns its own implemented version.
 
+The FF-A version can only be changed by calls to ``FFA_VERSION`` before other
+calls to other FF-A ABIs have been made. Calls to ``FFA_VERSION`` after
+subsequent ABI calls will fail.
+
 FFA_FEATURES
 ~~~~~~~~~~~~
 
@@ -668,6 +725,15 @@ boot (that is prior to NWd is booted) or run-time.
 
 The SPMC calling FFA_FEATURES at secure physical FF-A instance always get
 FFA_SUCCESS from the SPMD.
+
+S-EL1 partitions calling FFA_FEATURES at virtual FF-A instance with NPI and MEI
+interrupt feature IDs get FFA_SUCCESS.
+
+S-EL0 partitions are not supported for NPI: ``FFA_NOT_SUPPORTED`` will be
+returned.
+
+Physical FF-A instances are not supported for NPI and MEI: ``FFA_NOT_SUPPORTED``
+will be returned.
 
 The request made by an Hypervisor or OS kernel is forwarded to the SPMC and
 the response relayed back to the NWd.
@@ -685,32 +751,40 @@ descriptors. The provided addresses may be owned by a VM in the normal world,
 which is expected to receive messages from the secure world. The SPMC will in
 this case allocate internal state structures to facilitate RX buffer access
 synchronization (through FFA_RX_ACQUIRE interface), and to permit SPs to send
-messages.
+messages. The addresses used must be contained in the SPMC manifest NS memory
+node (see `SPMC manifest`_).
 
 The FFA_RXTX_UNMAP unmaps the RX/TX pair from the translation regime of the
 caller, either it being the Hypervisor or OS kernel, as well as a secure
-partition.
+partition, and restores them in the VM's translation regime so that they can be
+used for memory sharing operations from the normal world again.
 
-FFA_PARTITION_INFO_GET
-~~~~~~~~~~~~~~~~~~~~~~
+The minimum and maximum buffer sizes supported by the FF-A instance can be
+queried by calling ``FFA_FEATURES`` with the ``FFA_RXTX_MAP`` function ID.
+
+FFA_PARTITION_INFO_GET/FFA_PARTITION_INFO_GET_REGS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Partition info get call can originate:
 
 - from SP to SPMC
 - from Hypervisor or OS kernel to SPMC. The request is relayed by the SPMD.
+- from SPMC to SPMD (FFA_PARTITION_INFO_GET_REGS only)
 
-FFA_PARTITION_INFO_GET_REGS
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The primary use of the FFA_PARTITION_INFO_GET_REGS is to return partition
+information via registers as opposed to via RX/TX buffers and is useful in
+cases where sharing memory is difficult.
 
-This call can originate:
+The SPMC reports the features supported by an SP in accordance to the caller.
+E.g. SPs can't issue direct message requests to the Normal World. As such,
+even though SP may have enabled sending direct message requests in the manifest,
+the respective SP's properties information will hint that the SP doesn't support
+sending direct message requests.
 
-- from SP to SPMC
-- from SPMC to SPMD
-- from Hypervsior or OS kernel to SPMC. The request is relayed by the SPMD.
-
-The primary use of this ABI is to return partition information via registers
-as opposed to via RX/TX buffers and is useful in cases where sharing memory is
-difficult.
+The information is also filtered by FF-A version. E.g. indirect message support
+in Hafnium was added in FF-A v1.1. An FF-A v1.0 caller will not get indirect
+message support for an SP, even if the SP is v1.1 or higher, and has enabled
+indirect messaging in its manifest.
 
 FFA_ID_GET
 ~~~~~~~~~~
@@ -754,6 +828,18 @@ ID is not consistent:
    world ID",
 -  or initiated by an SP and thus origin endpoint ID must be a "secure world ID".
 
+FFA_MSG_WAIT
+~~~~~~~~~~~~
+
+FFA_MSG_WAIT is used to transition the calling execution context from the
+RUNNING state to the WAITING state, subject to the restrictions of the
+partition's current runtime model (see `Partition runtime models`_).
+
+Secondarily, an invocation of FFA_MSG_WAIT will relinquish ownership of the
+caller's RX buffer to the buffer's producer. FF-A v1.2 introduces the ability to
+optionally retain the buffer on an invocation of FFA_MSG_WAIT through use of a
+flag.
+
 
 FFA_MSG_SEND_DIRECT_REQ/FFA_MSG_SEND_DIRECT_RESP
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -767,6 +853,26 @@ and responses with the following rules:
 - An SP cannot send a direct request to an Hypervisor or OS kernel.
 - An Hypervisor or OS kernel can send a direct request to an SP.
 - An SP can send a direct response to an Hypervisor or OS kernel.
+- An SP cannot reply to a framework direct request with a non-framework direct response.
+
+The hypervisor can inform SPs when a VM is created or destroyed by sending **VM
+availability messages** via the ``FFA_MSG_SEND_DIRECT_REQ`` ABI.
+
+A SP subscribes to receiving VM created and/or VM destroyed messages by
+specifying the ``vm-availability-messages`` field in its manifest (see
+`partition properties`_). The SPM will only forward messages to the SP if the SP
+is subscribed to the message kind. The SP must reply with the corresponding
+direct message response (via the ``FFA_MSG_SEND_DIRECT_RESP`` ABI) after it has
+handled the message.
+
+FFA_MSG_SEND_DIRECT_REQ2/FFA_MSG_SEND_DIRECT_RESP2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The primary usage of these ABIs is to send a direct request to a specified
+UUID within an SP that has multiple UUIDs declared in its manifest.
+
+Secondarily, it can be used to send a direct request with an extended
+set of message payload arguments.
 
 FFA_NOTIFICATION_BITMAP_CREATE/FFA_NOTIFICATION_BITMAP_DESTROY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -887,6 +993,16 @@ The handling of framework notifications is similar to that of
 global notifications. Binding of these is not necessary, as these are
 reserved to be used by the hypervisor or SPMC.
 
+FFA_CONSOLE_LOG
+~~~~~~~~~~~~~~~
+
+``FFA_CONSOLE_LOG`` allows debug logging to the UART console.
+Characters are packed into registers:
+
+- `w2-w7` (|SMCCC| 32-bit)
+- `x2-x7` (|SMCCC| 64-bit, before v1.2)
+- `x2-x17` (|SMCCC| 64-bit, v1.2 or later)
+
 Paravirtualized interfaces
 --------------------------
 
@@ -936,6 +1052,21 @@ commands:
  - ``INT_RECONFIGURE_ENABLE``
      - Enable or disable the physical interrupt.
      - Value must be either 0 (Disable) or 1 (Enable).
+
+HF_INTERRUPT_SEND_IPI
+~~~~~~~~~~~~~~~~~~~~~
+Inter-Processor Interrupts (IPIs) are a mechanism for an SP to send an interrupt to
+itself on another CPU in a multiprocessor system. The details are described below
+in the section `Inter-Processor Interrupts`_.
+
+HF_INTERRUPT_SEND_IPI is the interface that the SP can use to trigger an IPI,
+giving the vCPU ID it wishes to target. 0 is returned if the IPI is successfully sent.
+Otherwise -1 is returned if the target vCPU ID was invalid (the current vCPU ID or
+greater than the vCPU count).
+
+The interface is only available through the HVC conduit for S-EL1 MP partitions. Since
+S-SEL0 or S-EL1 UP partitions only have a single vCPU they cannot target a different
+vCPU and therefore have no need for IPIs.
 
 SPMC-SPMD direct requests/responses
 -----------------------------------
@@ -1014,7 +1145,9 @@ The notifications receipt support is enabled in the partition FF-A manifest.
 Memory Sharing
 --------------
 
-Hafnium implements the following memory sharing interfaces:
+The Hafnium implementation aligns with FF-A v1.2 ALP0 specification,
+'FF-A Memory Management Protocol' supplement `[11]`_. Hafnium supports
+the following ABIs:
 
  - ``FFA_MEM_SHARE`` - for shared access between lender and borrower.
  - ``FFA_MEM_LEND`` - borrower to obtain exclusive access, though lender
@@ -1046,29 +1179,40 @@ Hafnium also supports memory sharing operations between the normal world and the
 secure world. If there is an SP involved, the SPMC allocates data to track the
 state of the operation.
 
-The SPMC is also the designated allocator for the memory handle. The hypervisor
-or OS kernel has the possibility to rely on the SPMC to maintain the state
-of the operation, thus saving memory.
 An SP can not share, lend or donate memory to the NWd.
 
-The SPMC supports the hypervisor retrieve request, as defined by the FF-A
-v1.1 EAC0 specification, in section 16.4.3. The intent is to aid with operations
-that the hypervisor must do for a VM retriever. For example, when handling
-an FFA_MEM_RECLAIM, if the hypervisor relies on SPMC to keep the state
-of the operation, the hypervisor retrieve request can be used to obtain
-that state information, do the necessary validations, and update stage 2
-memory translation.
+The SPMC is also the designated allocator for the memory handle, when borrowers
+include at least an SP. The SPMC doesn't support the hypervisor to be allocator
+to the memory handle.
 
 Hafnium also supports memory lend and share targetting multiple borrowers.
 This is the case for a lender SP to multiple SPs, and for a lender VM to
 multiple endpoints (from both secure world and normal world). If there is
 at least one borrower VM, the hypervisor is in charge of managing its
-stage 2 translation on a successful memory retrieve.
+stage 2 translation on a successful memory retrieve. However, the hypervisor could
+rely on the SPMC to keep track of the state of the operation, namely:
+if all fragments to the memory descriptors have been sent, and if the retrievers
+are still using the memory at any given moment. In this case, the hypervisor might
+need to request the SPMC to obtain a description of the used memory regions.
+For example, when handling an ``FFA_MEM_RECLAIM`` the hypervisor retrieve request
+can be used to obtain that state information, do the necessary validations,
+and update stage-2 memory translation of the lender.
+Hafnium currently only supports one borrower from the NWd, in a multiple borrower
+scenario as described. If there is only a single borrower VM, the SPMC will
+return error to the lender on call to either share, lend or donate ABIs.
+
 The semantics of ``FFA_MEM_DONATE`` implies ownership transmission,
 which should target only one partition.
 
 The memory share interfaces are backwards compatible with memory transaction
-descriptors from FF-A v1.0. These get translated to FF-A v1.1 descriptors for
+descriptors from FF-A v1.0. Starting from FF-A v1.1, with the introduction
+of the `Endpoint memory access descriptor size` and
+`Endpoint memory access descriptor access offset` fields (from Table 11.20 of the
+FF-A v1.2 ALP0 specification), memory transaction descriptors are forward
+compatible, so can be used internally by Hafnium as they are sent.
+These fields must be valid for a memory access descriptor defined for a compatible
+FF-A version to the SPMC FF-A version. For a transaction from an FF-A v1.0 endpoint
+the memory transaction descriptor will be translated to an FF-A v1.1 descriptor for
 Hafnium's internal processing of the operation. If the FF-A version of a
 borrower is v1.0, Hafnium provides FF-A v1.0 compliant memory transaction
 descriptors on memory retrieve response.
@@ -1082,6 +1226,23 @@ is for SPs not to be able to get access to regions they are not intended to acce
 This requires special care from the system integrator to configure the memory ranges
 correctly, such that any SP can't be given access and interfere with execution of
 other components. More information in the :ref:`Threat Model`.
+
+Hafnium SPMC supports memory management transactions for device memory regions.
+Currently this is limited to only the ``FFA_MEM_LEND`` interface and
+to a single borrower. The device memory region used in the transaction must have
+been decalared in the SPMC manifest as described above. Memory defined in a device
+region node is given the attributes Device-nGnRnE, since this is the most restrictive
+memory type the memory must be lent with these attrbutes as well.
+
+In |RME| enabled platforms, there is the ability to change the |PAS|
+of a given memory region `[12]`_. The SPMC can leverage this feature to fulfill the
+semantics of the ``FFA_MEM_LEND`` and ``FFA_MEM_DONATE`` from the NWd into the SWd.
+Currently, there is the implementation for the FVP platform to issue a
+platform-specific SMC call to the EL3 monitor to change the PAS of the regions being
+lent/donated. This shall guarantee the NWd can't tamper with the memory whilst
+the SWd software expects exclusive access. For any other platform, the API under
+the 'src/memory_protect' module can be redefined to leverage an equivalent platform
+specific mechanism. For reference, check the `SPMC FVP build configuration`_.
 
 PE MMU configuration
 --------------------
@@ -1135,7 +1296,8 @@ models supported (refer to `[1]`_ section 7):
   - RTM_FFA_RUN: runtime model presented to an execution context that is
     allocated CPU cycles through FFA_RUN interface.
   - RTM_FFA_DIR_REQ: runtime model presented to an execution context that is
-    allocated CPU cycles through FFA_MSG_SEND_DIRECT_REQ interface.
+    allocated CPU cycles through FFA_MSG_SEND_DIRECT_REQ or FFA_MSG_SEND_DIRECT_REQ2
+    interface.
   - RTM_SEC_INTERRUPT: runtime model presented to an execution context that is
     allocated CPU cycles by SPMC to handle a secure interrupt.
   - RTM_SP_INIT: runtime model presented to an execution context that is
@@ -1391,6 +1553,32 @@ in normal world.
      current design, SPMD expects the platform not to delegate handling to the
      NWd (such as through SDEI) while processing Group0 interrupts.
 
+Inter-Processor Interrupts
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Inter-Processor Interrupts (IPIs) are a mechanism for an SP to send an interrupt
+to to itself on another CPU in a multiprocessor system.
+
+Currently Hafnium only supports a single SP to send an IPI to each CPU at a time.
+This is described in the example below.
+If an SP wants to send an IPI from vCPU0 on CPU0 to vCPU1 on CPU1 it uses the HVC
+paravirtualized interface HF_INTERRUPT_SENT_IPI, specifying the ID of vCPU1 as the target.
+The SPMC on CPU0 records the vCPU1 as the target vCPU the IPI is intended for, and requests
+the GIC to send a secure interrupt to the CPU1 (interrupt ID 9 has been assigned for IPIs).
+This secure interrupt is caught by the SPMC on CPU1 and enters the secure interrupt handler.
+Here the handling of the IPI depends on the current state of the target vCPU1 as follows:
+
+- RUNNING: The IPI is injected to vCPU1 and normal secure interrupt handling handles
+  the IPI.
+- WAITING: The IPI is injected to vCPU1 and an SRI is triggered to notify the Normal
+  World scheduler the SP vCPU1 has a pending IPI and requires cycles to handle it.
+  This SRI is received in the Normal World on CPU1, here the notifications interface
+  has been extended so that FFA_NOTIFICATION_INFO_GET will also return the SP ID and
+  vCPU ID of any vCPUs with pending IPIs. Using this information the Normal World can
+  use FFA_RUN to allocate vCPU1 CPU cycles.
+- PREEMPTED/BLOCKED: Inject and queue the virtual interrupt for vCPU1. We know,
+  for these states, the vCPU will eventually resumed by the Normal World Scheduler
+  and the IPI virtual interrupt will then be serviced by the target vCPU.
+
 Power management
 ----------------
 
@@ -1449,6 +1637,108 @@ Hafnium supports the following architecture extensions for security hardening:
   check failure on load/stores. A random seed is generated at boot time and
   restored upon entry into Hafnium. MTE system registers are saved/restored in
   vCPU contexts permitting MTE usage from VMs/SPs.
+- Realm Management Extension (FEAT_RME): can be deployed in platforms that leverage
+  RME for physical address isolation. The SPMC is capable of recovering from a
+  Granule Protection Fault, if inadvertently accessing a region with the wrong security
+  state setting. Also, the ability to change dynamically the physical address space of
+  a region, can be used to enhance the handling of ``FFA_MEM_LEND`` and ``FFA_MEM_DONATE``.
+  More details in the section about `Memory Sharing`_.
+
+SIMD support
+------------
+
+In this section, the generic term |SIMD| is used to refer to vector and matrix
+processing units offered by the Arm architecture. This concerns the optional
+architecture extensions: Advanced SIMD (formerly FPU / NEON) / |SVE| / |SME|.
+
+The SPMC preserves the |SIMD| state according to the |SMCCC| (ARM DEN 0028F
+1.5F section 10 Appendix C: SME, SVE, SIMD and FP live state preservation by
+the |SMCCC| implementation).
+
+The SPMC implements the |SIMD| support in the following way:
+
+- SPs are allowed to use Advanced SIMD instructions and manipulate
+  the Advanced SIMD state.
+- The SPMC saves and restores vCPU Advanced SIMD state when switching vCPUs.
+- SPs are restricted from using |SVE| and |SME| instructions and manipulating
+  associated system registers and state. Doing so, traps to the same or higher
+  EL.
+- Entry from the normal world into the SPMC and exit from the SPMC to the normal
+  world preserve the |SIMD| state.
+- Corollary to the above, the normal world is free to use any of the referred
+  |SIMD| extensions and emit FF-A SMCs. The SPMC as a callee preserves the live
+  |SIMD| state according to the rules mentioned in the |SMCCC|.
+- This is also true for the case of a secure interrupt pre-empting the normal
+  world while it is currently processing |SIMD| instructions.
+- |SVE| and |SME| traps are enabled while S-EL2/1/0 run. Traps are temporarily
+  disabled on the narrow window of the context save/restore operation within
+  S-EL2. Traps are enabled again after those operations.
+
+Supported configurations
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The SPMC assumes Advanced SIMD is always implemented (despite being an Arm
+optional architecture extension). The SPMC dynamically detects whether |SVE|
+and |SME| are implemented in the platform, then saves and restores the |SIMD|
+state according to the different combinations:
+
++--------------+--------------------+--------------------+---------------+
+| FEAT_AdvSIMD | FEAT_SVE/FEAT_SVE2 | FEAT_SME/FEAT_SME2 | FEAT_SME_FA64 |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         N          |        N           |        N      |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         Y          |        N           |        N      |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         Y          |        Y           |        N      |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         Y          |        Y           |        Y      |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         N          |        Y           |        N      |
++--------------+--------------------+--------------------+---------------+
+|      Y       |         N          |        Y           |        Y      |
++--------------+--------------------+--------------------+---------------+
+
+Y: architectural feature implemented
+N: architectural feature not implemented
+
+SIMD save/restore operations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The SPMC considers the following SIMD registers state:
+
+- Advanced SIMD consists of 32 ``Vn`` 128b vectors. Vector's lower 128b is
+  shared with the larger |SVE| / |SME| variable length vectors.
+- |SVE| consists of 32 ``Zn`` variable length vectors, ``Px`` predicates,
+  ``FFR`` fault status register.
+- |SME| when Streaming SVE is enabled consists of 32 ``Zn`` variable length
+  vectors, ``Px`` predicates, ``FFR`` fault status register (when FEAT_SME_FA64
+  extension is implemented and enabled), ZA array (when enabled).
+- Status and control registers (FPCR/FPSR) common to all above.
+
+For the purpose of supporting the maximum vector length (or Streaming SVE
+vector length) supported by the architecture, the SPMC sets ``SCR_EL2.LEN``
+and ``SMCR_EL2.LEN`` to the maximum permitted value (2048 bits). This makes
+save/restore operations independent from the vector length constrained by EL3
+(by ``ZCR_EL3``), or the ``ZCR_EL2.LEN`` value set by the normal world itself.
+
+For performance reasons, the normal world might let the secure world know it
+doesn't depend on the |SVE| or |SME| live state while doing an SMC. It does
+so by setting the |SMCCC| SVE hint bit. In which case, the secure world limits
+the normal world context save/restore operations to the Advanced SIMD state
+even if either one of |SVE| or |SME|, or both, are implemented.
+
+The following additional design choices were made related to SME save/restore
+operations:
+
+- When FEAT_SME_FA64 is implemented, ``SMCR_EL2.FA64`` is set and FFR register
+  saved/restored when Streaming SVE mode is enabled.
+- For power saving reasons, if Streaming SVE mode is enabled while entering the
+  SPMC, this state is recorded, Streaming SVE state saved and the mode disabled.
+  Streaming SVE is enabled again while restoring the SME state on exiting the
+  SPMC.
+- The ZA array state is left untouched while the SPMC runs. As neither SPMC
+  and SPs alter the ZA array state, this is a conservative approach in terms
+  of memory footprint consumption.
 
 SMMUv3 support in Hafnium
 -------------------------
@@ -1519,15 +1809,11 @@ Peripheral device manifest
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Currently, SMMUv3 driver in Hafnium only supports dependent peripheral devices.
-These devices are dependent on PE endpoint to initiate and receive memory
+These DMA devices are dependent on PE endpoint to initiate and receive memory
 management transactions on their behalf. The acccess to the MMIO regions of
-any such device is assigned to the endpoint during boot. Moreover, SMMUv3 driver
-uses the same stage 2 translations for the device as those used by partition
-manager on behalf of the PE endpoint. This ensures that the peripheral device
-has the same visibility of the physical address space as the endpoint. The
-device node of the corresponding partition manifest (refer to `[1]`_ section 3.2
-) must specify these additional properties for each peripheral device in the
-system :
+any such device is assigned to the endpoint during boot.
+The `device node`_ of the corresponding partition manifest must specify these
+additional properties for each peripheral device in the system:
 
 -  smmu-id: This field helps to identify the SMMU instance that this device is
    upstream of.
@@ -1543,6 +1829,35 @@ system :
         stream-ids = <0x0 0x1>;
         interrupts = <0x2 0x3>, <0x4 0x5>;
         exclusive-access;
+    };
+
+DMA isolation
+-------------
+
+Hafnium, with help of SMMUv3 driver, enables the support for static DMA
+isolation. The DMA device is explicitly granted access to a specific
+memory region only if the partition requests it by declaring the following
+properties of the DMA device in the `memory region node`_ of the partition
+manifest:
+
+-  smmu-id
+-  stream-ids
+-  stream-ids-access-permissions
+
+SMMUv3 driver uses a unqiue set of stage 2 translations for the DMA device
+rather than those used on behalf of the PE endpoint. This ensures that the DMA
+device has a limited visibility of the physical address space.
+
+.. code:: shell
+
+    smmuv3-memcpy-src {
+        description = "smmuv3-memcpy-source";
+        pages-count = <4>;
+        base-address = <0x00000000 0x7400000>;
+        attributes = <0x3>; /* read-write */
+        smmu-id = <0>;
+        stream-ids = <0x0 0x1>;
+        stream-ids-access-permissions = <0x3 0x3>;
     };
 
 SMMUv3 driver limitations
@@ -1585,10 +1900,40 @@ All S-EL0 partitions must use AArch64. AArch32 S-EL0 partitions are not supporte
 Interrupt handling, Memory sharing, indirect messaging, and notifications features
 in context of S-EL0 partitions are supported.
 
+Support for arch timer and system counter
+-----------------------------------------
+Secure Partitions can configure the EL1 physical timer (CNTP_*_EL0) to generate
+a virtual interrupt in the future. SPs have access to CNTPCT_EL0 (system count
+value) and CNTFRQ_EL0 (frequency of the system count). Once the deadline set by
+the timer expires, the SPMC injects a virtual interrupt (ID=3) and resumes
+the SP's execution context at the earliest opportunity as allowed by the secure
+interrupt signaling rules outlined in the FF-A specification.  Hence, it is
+likely that time could have passed between the moment the deadline expired and
+the interrupt is subsequently signaled.
+
+Any access from an SP to EL1 physical timer registers is trapped and emulated
+by SPMC behind the scenes, though this is completely oblivious to the SP.
+This ensures that any EL1 physical timer deadline set by a normal world endpoint
+is not overriden by either SPs or SPMC.
+
+Note: As per Arm ARM, assuming no support for FEAT_ECV, S-EL1 has direct access
+to EL1 virtual timer registers but S-EL0 accesses are trapped to higher ELs.
+Consequently, any attempt by an S-EL0 partition to access EL1 virtual timer
+registers leads to a crash while such an attempt by S-EL1 partition effectively
+has no impact on its execution context.
+
 References
 ==========
 
 .. _TF-A project: https://trustedfirmware-a.readthedocs.io/en/latest/
+
+.. _SPMC FVP build configuration: https://github.com/TF-Hafnium/hafnium-project-reference/blob/main/BUILD.gn#L143
+
+.. _partition properties: https://trustedfirmware-a.readthedocs.io/en/latest/components/ffa-manifest-binding.html#partition-properties
+
+.. _device node: https://trustedfirmware-a.readthedocs.io/en/latest/components/ffa-manifest-binding.html#device-regions
+
+.. _memory region node: https://trustedfirmware-a.readthedocs.io/en/latest/components/ffa-manifest-binding.html#memory-regions
 
 .. _[1]:
 
@@ -1630,6 +1975,14 @@ Client <https://developer.arm.com/documentation/den0006/d/>`__
 .. _[10]:
 
 [10] https://trustedfirmware-a.readthedocs.io/en/latest/getting_started/build-options.html#
+
+ .. _[11]:
+
+[11] https://developer.arm.com/documentation/den0140/a
+
+ .. _[12]:
+
+[12] https://developer.arm.com/documentation/den0129/latest/
 
 --------------
 

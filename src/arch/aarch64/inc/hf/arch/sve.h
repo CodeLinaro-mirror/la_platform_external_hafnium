@@ -8,10 +8,12 @@
 
 #include "hf/arch/types.h"
 
+#include "hf/vcpu.h"
+
 /** Max SVE vector length supported by the architecture. */
 #define HF_SVE_VECTOR_LEN_MAX UINT32_C(2048)
 
-struct sve_context_t {
+struct sve_context {
 	/* FFR and predicates are one-eigth of the SVE vector length */
 	uint8_t ffr[HF_SVE_VECTOR_LEN_MAX / 64];
 
@@ -19,3 +21,7 @@ struct sve_context_t {
 
 	uint8_t vectors[32][HF_SVE_VECTOR_LEN_MAX / 8];
 } __attribute__((aligned(16)));
+
+void arch_sve_disable_traps(void);
+void arch_sve_enable_traps(void);
+void arch_sve_configure_vector_length(void);

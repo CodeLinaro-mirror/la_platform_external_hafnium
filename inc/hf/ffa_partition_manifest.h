@@ -12,6 +12,7 @@
 
 #include "hf/addr.h"
 #include "hf/memiter.h"
+#include "hf/static_assert.h"
 #include "hf/string.h"
 
 #include "vmapi/hf/ffa.h"
@@ -57,7 +58,24 @@ enum execution_state { AARCH64 = 0, AARCH32 };
 enum xlat_granule { PAGE_4KB = 0, PAGE_16KB, PAGE_64KB };
 
 /**
- * Partition Memory region as described in FFA v1.0 spec, Table 10
+ * Properties of the DMA capable device upstream of an SMMU as specified in the
+ * memory region description of the partition manifest.
+ */
+struct dma_device_properties {
+	/** SMMU ID - optional */
+	uint32_t smmu_id;
+	/** IMPDEF id tracking DMA peripheral device - optional */
+	uint8_t dma_device_id;
+	/** Count of Stream IDs assigned to device - optional */
+	uint8_t stream_count;
+	/** List of Stream IDs assigned to device - optional */
+	uint32_t stream_ids[PARTITION_MAX_STREAMS_PER_DEVICE];
+};
+
+/**
+ * Partition Memory region as described in FFA v1.2 spec, Table 5.2 along with
+ * an implementation defined struct to track the properties of a DMA capable
+ * device that has access to this memory region.
  */
 struct memory_region {
 	struct string name;
@@ -70,7 +88,26 @@ struct memory_region {
 	uint32_t page_count;
 	/** Memory attributes - mandatory */
 	uint32_t attributes;
+	/** DMA device properties - optional */
+	struct dma_device_properties dma_prop;
+	/** Instruction and data access permissions for DMA device - optional */
+	uint32_t dma_access_permissions;
 };
+
+/**
+ * Interrupts attibutes encoding in the manifest:
+ * Field                Bit(s)
+ * ---------------------------
+ * Priority             7:0
+ * Security_State       8
+ * Config(Edge/Level)   9
+ * Type(SPI/PPI/SGI)    11:10
+ * Reserved             31:12
+ */
+#define INT_INFO_ATTR_PRIORITY_SHIFT 0
+#define INT_INFO_ATTR_SEC_STATE_SHIFT 8
+#define INT_INFO_ATTR_CONFIG_SHIFT 9
+#define INT_INFO_ATTR_TYPE_SHIFT 10
 
 struct interrupt_info {
 	uint32_t id;
@@ -80,7 +117,8 @@ struct interrupt_info {
 };
 
 /**
- * Partition Device region as described in FFA v1.0 spec, Table 11
+ * Partition Device region as described in FFA v1.2 spec, Table 5.3 along with
+ * few implementation defined fields.
  */
 struct device_region {
 	/** Device base PA - mandatory */
@@ -93,12 +131,8 @@ struct device_region {
 	struct interrupt_info interrupts[PARTITION_MAX_INTERRUPTS_PER_DEVICE];
 	/** Count of physical interrupts - optional */
 	uint8_t interrupt_count;
-	/** SMMU ID - optional */
-	uint32_t smmu_id;
-	/** Count of Stream IDs assigned to device - optional */
-	uint8_t stream_count;
-	/** List of Stream IDs assigned to device - optional */
-	uint32_t stream_ids[PARTITION_MAX_STREAMS_PER_DEVICE];
+	/** DMA device properties - optional */
+	struct dma_device_properties dma_prop;
 	/** Exclusive access to an endpoint - optional */
 	bool exclusive_access;
 	/** Name of Device region - optional */
@@ -117,14 +151,24 @@ struct rx_tx {
 	struct memory_region *tx_buffer;
 };
 
+struct vm_availability_messages {
+	bool vm_created : 1;
+	bool vm_destroyed : 1;
+	uint32_t mbz : 30;
+};
+
+static_assert(sizeof(struct vm_availability_messages) == sizeof(uint32_t),
+	      "vm_availability_messages must have same size as uint32_t");
+
 /**
  * Partition manifest as described in FF-A v1.0 spec section 3.1
  */
 struct ffa_partition_manifest {
 	/** FF-A expected version - mandatory */
-	uint32_t ffa_version;
-	/** UUID - mandatory */
-	struct ffa_uuid uuid;
+	enum ffa_version ffa_version;
+	/** UUID - at least one UUID mandatory */
+	uint16_t uuid_count;
+	struct ffa_uuid uuids[PARTITION_MAX_UUIDS];
 	/** Partition id - optional */
 	ffa_id_t id;
 	/** Aux ids for mem transactions - optional */
@@ -158,13 +202,18 @@ struct ffa_partition_manifest {
 	struct rx_tx rxtx;
 
 	/** mandatory - direct/indirect msg or both */
-	uint8_t messaging_method;
+	uint16_t messaging_method;
 	/** mandatory - action in response to non secure interrupt */
 	uint8_t ns_interrupts_action;
 	/** optional - managed exit signaled through vIRQ */
 	bool me_signal_virq;
 	/** optional - receipt of notifications. */
 	bool notification_support;
+	/**
+	 * optional - VM availability messages bitfield.
+	 */
+	struct vm_availability_messages vm_availability_messages;
+
 	/**
 	 * optional - power management messages bitfield.
 	 *
@@ -189,6 +238,9 @@ struct ffa_partition_manifest {
 	/** Device regions */
 	uint16_t dev_region_count;
 	struct device_region dev_regions[PARTITION_MAX_DEVICE_REGIONS];
+	/** DMA device count. */
+	uint8_t dma_device_count;
+
 	/** optional - action in response to Other-Secure interrupt */
 	uint8_t other_s_interrupts_action;
 };

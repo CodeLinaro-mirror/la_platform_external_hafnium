@@ -243,7 +243,7 @@ class ManifestDtBuilder
 		Property("entrypoint-offset", "<0x00002000>");
 		Property("xlat-granule", "<0>");
 		Property("boot-order", "<0>");
-		Property("messaging-method", "<4>");
+		Property("messaging-method", "<0x4>");
 		Property("ns-interrupts-action", "<1>");
 		return *this;
 	}
@@ -405,6 +405,18 @@ class manifest : public ::testing::Test
 			pa_init((uintpaddr_t)0x7000000);
 		params->ns_mem_ranges[0].end = pa_init((uintpaddr_t)0x8ffffff);
 		params->ns_mem_ranges_count = 1;
+
+		params->ns_device_mem_ranges[0].begin =
+			pa_init((uintpaddr_t)0x20000000);
+		params->ns_device_mem_ranges[0].end =
+			pa_init((uintpaddr_t)0x24000000);
+		params->ns_device_mem_ranges_count = 1;
+
+		params->device_mem_ranges[0].begin =
+			pa_init((uintpaddr_t)0x24000000);
+		params->device_mem_ranges[0].end =
+			pa_init((uintpaddr_t)0x28000000);
+		params->device_mem_ranges_count = 1;
 	}
 
 	enum manifest_return_code manifest_from_vec(
@@ -911,7 +923,29 @@ TEST_F(manifest, ffa_validate_sanity_check)
 		  MANIFEST_ERROR_NOT_COMPATIBLE);
 	manifest_dealloc();
 
-	/* Incompatible messaging method */
+	/* Incompatible messaging method - unrecognized messaging-method. */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10002>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("xlat-granule", "<0>")
+		.Property("boot-order", "<0>")
+		.Property("messaging-method", "<0x272>")
+		.Property("ns-interrupts-action", "<0>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_NOT_COMPATIBLE);
+	manifest_dealloc();
+
+	/* Incompatible messaging method - only endpoints using FF-A version >=
+	 * FF-A v1.2 are allowed to set FFA_PARTITION_DIRECT_REQ2_RECV and
+	 * FFA_PARTITION_DIRECT_REQ2_SEND. */
 	/* clang-format off */
 	dtb = ManifestDtBuilder()
 		.Compatible({ "arm,ffa-manifest-1.0" })
@@ -923,7 +957,7 @@ TEST_F(manifest, ffa_validate_sanity_check)
 		.Property("entrypoint-offset", "<0x00002000>")
 		.Property("xlat-granule", "<0>")
 		.Property("boot-order", "<0>")
-		.Property("messaging-method", "<16>")
+		.Property("messaging-method", "<0x204>")
 		.Property("ns-interrupts-action", "<0>")
 		.Build();
 	/* clang-format on */
@@ -1023,6 +1057,133 @@ TEST_F(manifest, ffa_validate_interrupt_actions)
 	/* clang-format on */
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_ILLEGAL_OTHER_S_INT_ACTION);
+}
+
+TEST_F(manifest, vm_availability_messages)
+{
+	struct manifest_vm *vm;
+	struct_manifest *m;
+	std::vector<char> dtb;
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<1>")
+		.Property("vm-availability-messages", "<0>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<1>")
+		.Property("vm-availability-messages", "<1>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 1);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<1>")
+		.Property("vm-availability-messages", "<2>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 1);
+	ASSERT_EQ(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<1>")
+		.Property("vm-availability-messages", "<3>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 1);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 1);
+	ASSERT_EQ(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<1>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.Property("execution-ctx-count", "<8>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("messaging-method", "<2>")
+		.Property("vm-availability-messages", "<4>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_VM_AVAILABILITY_MESSAGE_INVALID);
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_created, 0);
+	ASSERT_EQ(vm->partition.vm_availability_messages.vm_destroyed, 0);
+	ASSERT_NE(vm->partition.vm_availability_messages.mbz, 0);
+	manifest_dealloc();
 }
 
 TEST_F(manifest, power_management)
@@ -1214,7 +1375,8 @@ TEST_F(manifest, ffa_validate_mem_regions)
 		  MANIFEST_ERROR_MEM_REGION_EMPTY);
 	manifest_dealloc();
 
-	/* Mutually exclusive base-address and relative-address properties */
+	/* Mutually exclusive base-address and load-address-relative-offset
+	 * properties */
 	/* clang-format off */
 	dtb = ManifestDtBuilder()
 		.FfaValidManifest()
@@ -1224,7 +1386,7 @@ TEST_F(manifest, ffa_validate_mem_regions)
 			.StartChild("rx")
 				.Description("rx-buffer")
 				.Property("base-address", "<0x7300000>")
-				.Property("relative-address", "<0x7300000>")
+				.Property("load-address-relative-offset", "<0x7300000>")
 				.Property("pages-count", "<1>")
 				.Property("attributes", "<1>")
 			.EndChild()
@@ -1244,7 +1406,7 @@ TEST_F(manifest, ffa_validate_mem_regions)
 			.Label("rx")
 			.StartChild("rx")
 				.Description("rx-buffer")
-				.Property("relative-address", "<0xffffff00 0xffffff00>")
+				.Property("load-address-relative-offset", "<0xffffff00 0xffffff00>")
 				.Property("pages-count", "<1>")
 				.Property("attributes", "<1>")
 			.EndChild()
@@ -1447,7 +1609,7 @@ TEST_F(manifest, ffa_validate_dev_regions)
 			.Compatible({ "arm,ffa-manifest-device-regions" })
 			.StartChild("test-device")
 				.Description("test-device")
-				.Property("base-address", "<0x7200000>")
+				.Property("base-address", "<0x24000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("smmu-id", "<1>")
@@ -1469,20 +1631,21 @@ TEST_F(manifest, ffa_validate_dev_regions)
 			.Compatible({ "arm,ffa-manifest-device-regions" })
 			.StartChild("test-device-0")
 				.Description("test-device-0")
-				.Property("base-address", "<0x7200000>")
+				.Property("base-address", "<0x24000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("interrupts", "<2 3>")
 			.EndChild()
 			.StartChild("test-device-1")
 				.Description("test-device-1")
-				.Property("base-address", "<0x8200000>")
+				.Property("base-address", "<0x25000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("interrupts", "<1 3>, <2 5> ")
 			.EndChild()
 		.EndChild()
 		.Build();
+
 	/* clang-format on */
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_INTERRUPT_ID_REPEATED);
@@ -1493,6 +1656,75 @@ TEST_F(manifest, ffa_validate_dev_regions)
 	ASSERT_EQ(m->vm[0].partition.dev_regions[1].interrupts[0].id, 1);
 	ASSERT_EQ(m->vm[0].partition.dev_regions[1].interrupts[0].attributes,
 		  3);
+	manifest_dealloc();
+
+	/* Overlapping address space between two device region nodes. */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("device-regions")
+			.Compatible({"arm,ffa-manifest-device-regions"})
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+			.StartChild("test-device-1")
+				.Description("test-device-1")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_MEM_REGION_OVERLAP);
+	manifest_dealloc();
+
+	/*
+	 * Device regions cannot be defined outside of the regions specified in
+	 * the spmc.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("device-regions")
+			.Compatible({"arm,ffa-manifest-device-regions"})
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x50000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_DEVICE_MEM_REGION_INVALID);
+	manifest_dealloc();
+
+	/*
+	 * Memory defined as NS in SPMC manifest given Secure attribute should
+	 * fail.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("device-regions")
+			.Compatible({"arm,ffa-manifest-device-regions"})
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x20000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_DEVICE_MEM_REGION_INVALID);
 }
 
 TEST_F(manifest, ffa_invalid_memory_region_attributes)
@@ -1606,12 +1838,6 @@ TEST_F(manifest, ffa_valid)
 		.EndChild()
 		.StartChild("memory-regions")
 			.Compatible({ "arm,ffa-manifest-memory-regions" })
-			.StartChild("test-memory")
-				.Description("test-memory")
-				.Property("relative-address", "<0x7100000>")
-				.Property("pages-count", "<4>")
-				.Property("attributes", "<3>")
-			.EndChild()
 			.StartChild("test-memory-ns")
 				.Description("test-memory")
 				.Property("base-address", "<0x7200000>")
@@ -1637,7 +1863,7 @@ TEST_F(manifest, ffa_valid)
 			.Compatible({ "arm,ffa-manifest-device-regions" })
 			.StartChild("test-device")
 				.Description("test-device")
-				.Property("base-address", "<0x7400000>")
+				.Property("base-address", "<0x24000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("smmu-id", "<1>")
@@ -1646,19 +1872,20 @@ TEST_F(manifest, ffa_valid)
 			.EndChild()
 			.StartChild("test-device-ns")
 				.Description("test-device")
-				.Property("base-address", "<0x7500000>")
+				.Property("base-address", "<0x20000000>")
 				.Property("pages-count", "<1>")
 				.Property("attributes", "<0x9>")
 			.EndChild()
 		.EndChild()
 		.Build();
+
 	/* clang-format on */
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
 
 	vm = &m->vm[0];
 	ASSERT_EQ(vm->partition.ffa_version, 0x10000);
 	ASSERT_THAT(
-		std::span(vm->partition.uuid.uuid, 4),
+		std::span(vm->partition.uuids[0].uuid, 4),
 		ElementsAre(0xb4b5671e, 0x4a904fe1, 0xb81ffb13, 0xdae1dacb));
 	ASSERT_EQ(vm->partition.execution_ctx_count, 1);
 	ASSERT_EQ(vm->partition.run_time_el, S_EL1);
@@ -1668,10 +1895,7 @@ TEST_F(manifest, ffa_valid)
 	ASSERT_EQ(vm->partition.boot_order, 0);
 	ASSERT_EQ(vm->partition.messaging_method, FFA_PARTITION_INDIRECT_MSG);
 	ASSERT_EQ(vm->partition.ns_interrupts_action, NS_ACTION_ME);
-	ASSERT_EQ(vm->partition.mem_regions[0].base_address, 0x7100000);
-	ASSERT_EQ(vm->partition.mem_regions[0].page_count, 4);
-	ASSERT_EQ(vm->partition.mem_regions[0].attributes, 3);
-	ASSERT_EQ(vm->partition.mem_regions[1].attributes, (8 | 3));
+	ASSERT_EQ(vm->partition.mem_regions[0].attributes, (8 | 3));
 
 	ASSERT_EQ(vm->partition.rxtx.available, true);
 	ASSERT_EQ(vm->partition.rxtx.rx_buffer->base_address, 0x7300000);
@@ -1681,16 +1905,17 @@ TEST_F(manifest, ffa_valid)
 	ASSERT_EQ(vm->partition.rxtx.tx_buffer->page_count, 1);
 	ASSERT_EQ(vm->partition.rxtx.tx_buffer->attributes, 3);
 
-	ASSERT_EQ(vm->partition.dev_regions[0].base_address, 0x7400000);
+	ASSERT_EQ(vm->partition.dev_regions[0].base_address, 0x24000000);
 	ASSERT_EQ(vm->partition.dev_regions[0].page_count, 16);
 	ASSERT_EQ(vm->partition.dev_regions[0].attributes, 3);
-	ASSERT_EQ(vm->partition.dev_regions[0].smmu_id, 1);
-	ASSERT_EQ(vm->partition.dev_regions[0].stream_ids[0], 0);
-	ASSERT_EQ(vm->partition.dev_regions[0].stream_ids[1], 1);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.smmu_id, 1);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.stream_ids[0], 0);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.stream_ids[1], 1);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[0].id, 2);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[0].attributes, 3);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[1].id, 4);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[1].attributes, 5);
+	ASSERT_EQ(vm->partition.dev_regions[1].base_address, 0x20000000);
 	ASSERT_EQ(vm->partition.dev_regions[1].attributes, (8 | 1));
 }
 
@@ -1706,7 +1931,7 @@ TEST_F(manifest, ffa_valid_interrupt_target_manifest)
 			.Compatible({ "arm,ffa-manifest-device-regions" })
 			.StartChild("test-device")
 				.Description("test-device")
-				.Property("base-address", "<0x7400000>")
+				.Property("base-address", "<0x24000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("smmu-id", "<1>")
@@ -1722,12 +1947,12 @@ TEST_F(manifest, ffa_valid_interrupt_target_manifest)
 
 	vm = &m->vm[0];
 
-	ASSERT_EQ(vm->partition.dev_regions[0].base_address, 0x7400000);
+	ASSERT_EQ(vm->partition.dev_regions[0].base_address, 0x24000000);
 	ASSERT_EQ(vm->partition.dev_regions[0].page_count, 16);
 	ASSERT_EQ(vm->partition.dev_regions[0].attributes, 3);
-	ASSERT_EQ(vm->partition.dev_regions[0].smmu_id, 1);
-	ASSERT_EQ(vm->partition.dev_regions[0].stream_ids[0], 0);
-	ASSERT_EQ(vm->partition.dev_regions[0].stream_ids[1], 1);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.smmu_id, 1);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.stream_ids[0], 0);
+	ASSERT_EQ(vm->partition.dev_regions[0].dma_prop.stream_ids[1], 1);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[0].id, 2);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[0].attributes, 3);
 	ASSERT_EQ(vm->partition.dev_regions[0].interrupts[0].mpidr_valid, true);
@@ -1751,7 +1976,7 @@ TEST_F(manifest, ffa_invalid_interrupt_target_manifest)
 			.Compatible({ "arm,ffa-manifest-device-regions" })
 			.StartChild("test-device")
 				.Description("test-device")
-				.Property("base-address", "<0x7400000>")
+				.Property("base-address", "<0x24000000>")
 				.Property("pages-count", "<16>")
 				.Property("attributes", "<3>")
 				.Property("smmu-id", "<1>")
@@ -1837,5 +2062,450 @@ TEST_F(manifest, ffa_boot_order_not_unique)
 	memiter_init(&it, core_dtb.data(), core_dtb.size());
 	ASSERT_EQ(manifest_init(mm_stage1_locked, &m, &it, &params, &ppool),
 		  MANIFEST_ERROR_INVALID_BOOT_ORDER);
+}
+
+TEST_F(manifest, ffa_valid_multiple_uuids)
+{
+	struct manifest_vm *vm;
+	struct_manifest *m;
+
+	/* clang-format off */
+	std::vector<char>  dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10002>")
+		.Property("uuid",
+			 "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>,\
+			  <0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>")
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("xlat-granule", "<0>")
+		.Property("boot-order", "<0>")
+		.Property("messaging-method", "<4>")
+		.Property("ns-interrupts-action", "<1>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+
+	vm = &m->vm[0];
+	ASSERT_EQ(vm->partition.ffa_version, 0x10002);
+	ASSERT_THAT(
+		std::span(vm->partition.uuids[0].uuid, 4),
+		ElementsAre(0xb4b5671e, 0x4a904fe1, 0xb81ffb13, 0xdae1dacb));
+	ASSERT_THAT(
+		std::span(vm->partition.uuids[1].uuid, 4),
+		ElementsAre(0xb4b5671e, 0x4a904fe1, 0xb81ffb13, 0xdae1daaa));
+	ASSERT_EQ(vm->partition.uuid_count, 2);
+	ASSERT_EQ(vm->partition.execution_ctx_count, 1);
+	ASSERT_EQ(vm->partition.run_time_el, S_EL1);
+	ASSERT_EQ(vm->partition.execution_state, AARCH64);
+	ASSERT_EQ(vm->partition.ep_offset, 0x00002000);
+	ASSERT_EQ(vm->partition.xlat_granule, PAGE_4KB);
+	ASSERT_EQ(vm->partition.boot_order, 0);
+	ASSERT_EQ(vm->partition.messaging_method, FFA_PARTITION_INDIRECT_MSG);
+	ASSERT_EQ(vm->partition.ns_interrupts_action, NS_ACTION_ME);
+}
+
+TEST_F(manifest, ffa_too_many_uuids)
+{
+	struct_manifest *m;
+
+	/* clang-format off */
+	std::vector<char>  dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10002>")
+		.Property("uuid",
+			 "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>,"
+			  "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>,"
+			  "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>,"
+			  "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>,"
+			  "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>")
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("xlat-granule", "<0>")
+		.Property("boot-order", "<0>")
+		.Property("messaging-method", "<4>")
+		.Property("ns-interrupts-action", "<1>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_TOO_MANY_UUIDS);
+}
+
+TEST_F(manifest, ffa_uuid_all_zeros)
+{
+	struct_manifest *m;
+
+	/* clang-format off */
+	std::vector<char>  dtb = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10002>")
+		.Property("uuid",
+			 "<0x0 0x0 0x0 0x0>, <0x0 0x0 0x0 0x0>")
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<2>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x00002000>")
+		.Property("xlat-granule", "<0>")
+		.Property("boot-order", "<0>")
+		.Property("messaging-method", "<4>")
+		.Property("ns-interrupts-action", "<1>")
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_UUID_ALL_ZEROS);
+}
+
+/*
+ * Test that the address space of two device region nodes specified across
+ * different SPs cannot overlap.
+ */
+TEST_F(manifest, ffa_device_region_multi_sps)
+{
+	struct_manifest *m;
+	struct memiter it;
+	struct mm_stage1_locked mm_stage1_locked;
+	struct boot_params params;
+	Partition_package spkg_1;
+	Partition_package spkg_2;
+
+	/* clang-format off */
+	std::vector<char>  dtb1 = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.FfaLoadAddress((uint64_t)&spkg_1)
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<0>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x0>")
+		.Property("xlat-granule", "<0>")
+		.Property("messaging-method", "<0x7>")
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+
+	std::vector<char> dtb2 = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>")
+		.FfaLoadAddress((uint64_t)&spkg_2)
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<0>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x0>")
+		.Property("xlat-granule", "<0>")
+		.Property("messaging-method", "<0x7>")
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device-0")
+				.Description("test-device-1")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+
+	/* clang-format on */
+	spkg_1.init(dtb1);
+	spkg_2.init(dtb2);
+
+	/* clang-format off */
+	std::vector<char> core_dtb = ManifestDtBuilder()
+		.StartChild("hypervisor")
+			.Compatible()
+			.StartChild("vm1")
+				.DebugName("ffa_partition_1")
+				.FfaPartition()
+				.LoadAddress((uint64_t)&spkg_1)
+				.VcpuCount(1)
+				.MemSize(0x4000)
+			.EndChild()
+			.StartChild("vm2")
+				.DebugName("ffa_partition_2")
+				.FfaPartition()
+				.LoadAddress((uint64_t)&spkg_2)
+				.VcpuCount(1)
+				.MemSize(0x4000)
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	boot_params_init(&params, &spkg_1);
+	memiter_init(&it, core_dtb.data(), core_dtb.size());
+	ASSERT_EQ(manifest_init(mm_stage1_locked, &m, &it, &params, &ppool),
+		  MANIFEST_ERROR_MEM_REGION_OVERLAP);
+
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb1 = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
+		.FfaLoadAddress((uint64_t)&spkg_1)
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<0>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x0>")
+		.Property("xlat-granule", "<0>")
+		.Property("messaging-method", "<0x7>")
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+
+	dtb2 = ManifestDtBuilder()
+		.Compatible({ "arm,ffa-manifest-1.0" })
+		.Property("ffa-version", "<0x10001>")
+		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1daaa>")
+		.FfaLoadAddress((uint64_t)&spkg_2)
+		.Property("execution-ctx-count", "<1>")
+		.Property("exception-level", "<0>")
+		.Property("execution-state", "<0>")
+		.Property("entrypoint-offset", "<0x0>")
+		.Property("xlat-granule", "<0>")
+		.Property("messaging-method", "<0x7>")
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device-0")
+				.Description("test-device-1")
+				.Property("base-address", "<0x25000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+
+	/* clang-format on */
+	spkg_1.init(dtb1);
+	spkg_2.init(dtb2);
+
+	/* clang-format off */
+	core_dtb = ManifestDtBuilder()
+		.StartChild("hypervisor")
+			.Compatible()
+			.StartChild("vm1")
+				.DebugName("ffa_partition_1")
+				.FfaPartition()
+				.LoadAddress((uint64_t)&spkg_1)
+				.VcpuCount(1)
+				.MemSize(0x4000)
+			.EndChild()
+			.StartChild("vm2")
+				.DebugName("ffa_partition_2")
+				.FfaPartition()
+				.LoadAddress((uint64_t)&spkg_2)
+				.VcpuCount(1)
+				.MemSize(0x4000)
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	boot_params_init(&params, &spkg_1);
+	memiter_init(&it, core_dtb.data(), core_dtb.size());
+	ASSERT_EQ(manifest_init(mm_stage1_locked, &m, &it, &params, &ppool),
+		  MANIFEST_SUCCESS);
+}
+
+/*
+ * Tests to trigger various error conditions while parsing dma related
+ * properties of memory region nodes.
+ */
+TEST_F(manifest, ffa_memory_region_invalid_dma_properties)
+{
+	struct_manifest *m;
+
+	/*
+	 * SMMU ID must be specified if the partition specifies Stream IDs for
+	 * any device upstream of SMMU.
+	 */
+	/* clang-format off */
+	std::vector<char> dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.StartChild("test-memory")
+				.Description("test-memory")
+				.Property("base-address", "<0x7100000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("stream-ids", "<0 1>")
+				.Property("interrupts", "<2 3>, <4 5>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_MISSING_SMMU_ID);
+	manifest_dealloc();
+
+	/*
+	 * All stream ids belonging to a dma device must specify the same access
+	 * permissions.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.StartChild("test-memory")
+				.Description("test-memory")
+				.Property("base-address", "<0x7100000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<0 1>")
+				.Property("stream-ids-access-permissions", "<0x3 0xb>")
+				.Property("interrupts", "<2 3>, <4 5>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_MISMATCH_DMA_ACCESS_PERMISSIONS);
+	manifest_dealloc();
+
+	/*
+	 * DMA device stream ID count exceeds predefined limit.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.StartChild("test-memory")
+				.Description("test-memory")
+				.Property("base-address", "<0x7100000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<0 1 4 9 12 >")
+				.Property("stream-ids-access-permissions", "<0x3 0x3 0x3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_STREAM_IDS_OVERFLOW);
+	manifest_dealloc();
+
+	/*
+	 * DMA access permissions count exceeds predefined limit
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.StartChild("test-memory")
+				.Description("test-memory")
+				.Property("base-address", "<0x7100000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<0 1>")
+				.Property("stream-ids-access-permissions", "<0x3 0x3 0x3 0x3 0x3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_DMA_ACCESS_PERMISSIONS_OVERFLOW);
+}
+
+/*
+ * Tests to trigger various error conditions while parsing dma related
+ * properties of device region nodes.
+ */
+TEST_F(manifest, ffa_device_region_invalid_dma_properties)
+{
+	struct_manifest *m;
+
+	/*
+	 * SMMU ID must be specified if the partition specifies Stream IDs for
+	 * any device upstream of SMMU.
+	 */
+	/* clang-format off */
+	std::vector<char> dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device")
+				.Description("test-device")
+				.Property("base-address", "<0x24000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("stream-ids", "<0 1>")
+				.Property("interrupts", "<2 3>, <4 5>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_MISSING_SMMU_ID);
+	manifest_dealloc();
+
+	/*
+	 *  Dma devices defined through device region nodes exceed predefined
+	 * limit.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("device-regions")
+			.Compatible({ "arm,ffa-manifest-device-regions" })
+			.StartChild("test-device-0")
+				.Description("test-device-0")
+				.Property("base-address", "<0x27000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<0 1>")
+			.EndChild()
+			.StartChild("test-device-1")
+				.Description("test-device-1")
+				.Property("base-address", "<0x25000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<2 3>")
+			.EndChild()
+			.StartChild("test-device-2")
+				.Description("test-device-2")
+				.Property("base-address", "<0x26000000>")
+				.Property("pages-count", "<16>")
+				.Property("attributes", "<3>")
+				.Property("smmu-id", "<1>")
+				.Property("stream-ids", "<4 5>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_DMA_DEVICE_OVERFLOW);
 }
 } /* namespace */

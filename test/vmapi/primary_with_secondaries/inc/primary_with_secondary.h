@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "hf/mm.h"
+
 #include "test/vmapi/ffa.h"
 
 /*
@@ -20,6 +22,14 @@
  * attempting to communicate with it. Thus, the code for the PVM becomes
  * portable between setups where the test service is either a VM or an SP.
  */
+#define PVM                                                     \
+	(struct ffa_uuid)                                       \
+	{                                                       \
+		{                                               \
+			0xbdfaab86, 0xe9ee, 0x409a, 0xde614c01, \
+		}                                               \
+	}
+
 #define SERVICE1                                                        \
 	(struct ffa_uuid)                                               \
 	{                                                               \
@@ -36,12 +46,27 @@
 		}                                              \
 	}
 
+#define SERVICE2_UUID2                                         \
+	(struct ffa_uuid)                                      \
+	{                                                      \
+		{                                              \
+			0x6e56993f, 0x0748, 0xb831, 0xf977aed, \
+		}                                              \
+	}
+
 #define SERVICE3                                             \
 	(struct ffa_uuid)                                    \
 	{                                                    \
 		{                                            \
 			0xcbd4482f, 0xcbab, 0x4dba, 0x0738d, \
 		}                                            \
+	}
+#define SERVICE4                                                       \
+	(struct ffa_uuid)                                              \
+	{                                                              \
+		{                                                      \
+			0xd6d78930, 0x6cb26103, 0xda311d35, 0xfc03fced \
+		}                                                      \
 	}
 
 /*
@@ -51,11 +76,16 @@
 struct ffa_partition_info* service1(void* recv);
 struct ffa_partition_info* service2(void* recv);
 struct ffa_partition_info* service3(void* recv);
+struct ffa_partition_info* service4(void* recv);
 
 /* Precondition functions for this test setup. */
 bool service1_is_vm(void);
 bool service1_is_not_vm(void);
+bool service1_is_secure(void);
 bool service1_and_service2_are_secure(void);
+bool service1_service2_and_service3_are_secure(void);
+bool service1_is_mp_sp(void);
+bool service2_is_mp_sp(void);
 bool hypervisor_only(void);
 
 #define SERVICE_VM1 (HF_VM_ID_OFFSET + 1)

@@ -61,6 +61,15 @@ You can find additional definitions in the `Arm Glossary`_.
    GIC
       Generic Interrupt Controller
 
+   GPF
+      Granlue Protection Fault
+
+   GPT
+      Granule Protection Table
+
+   IPI
+      Inter-Processor Interrupt
+
    ISA
       Instruction Set Architecture
 
@@ -98,6 +107,9 @@ You can find additional definitions in the `Arm Glossary`_.
    PA
       Physical Address
 
+   PAS
+      Physical Address Space
+
    PE
       Processing Element
 
@@ -118,6 +130,9 @@ You can find additional definitions in the `Arm Glossary`_.
       extension for the Armv8.2 architecture and later. An optional extension to
       the base Armv8 architecture.
 
+   RME
+      Realm Manage Extension
+
    ROP
       Return-Oriented Programming
 
@@ -126,6 +141,9 @@ You can find additional definitions in the `Arm Glossary`_.
 
    SEA
       Synchronous External Abort
+
+   SIMD
+      Single Instruction Multiple Data
 
    SiP
       Silicon Provider
@@ -156,6 +174,9 @@ You can find additional definitions in the `Arm Glossary`_.
 
    SVE
       Scalable Vector Extension
+
+   SME
+      Scalable Matrix Extension
 
    SWd
       Secure World

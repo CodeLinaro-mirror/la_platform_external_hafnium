@@ -13,6 +13,13 @@
 
 #include "vmapi/hf/ffa.h"
 
+bool is_ffa_hypervisor_retrieve_request(struct ffa_memory_region *request);
+
+bool ffa_memory_region_sanity_check(struct ffa_memory_region *memory_region,
+				    enum ffa_version ffa_version,
+				    uint32_t fragment_length,
+				    bool send_transaction);
+
 struct ffa_value ffa_memory_send(struct vm_locked from_locked,
 				 struct ffa_memory_region *memory_region,
 				 uint32_t memory_share_length,
@@ -31,6 +38,7 @@ struct ffa_value ffa_memory_retrieve_continue(struct vm_locked to_locked,
 					      ffa_memory_handle_t handle,
 					      uint32_t fragment_offset,
 					      ffa_id_t sender_vm_id,
+					      void *retrieve_continue_page,
 					      struct mpool *page_pool);
 struct ffa_value ffa_memory_relinquish(
 	struct vm_locked from_locked,

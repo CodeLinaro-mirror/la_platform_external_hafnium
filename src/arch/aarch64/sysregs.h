@@ -27,11 +27,6 @@ uintreg_t get_cptr_el2_value(void);
 uintreg_t get_sctlr_el2_value(bool is_el0_partition);
 
 /**
- * Branch Target Identification mechanism support in AArch64 state.
- */
-bool is_arch_feat_bti_supported(void);
-
-/**
  * Returns true if the processor supports ARMv8.1 VHE.
  */
 static inline bool has_vhe_support(void)
@@ -56,6 +51,71 @@ static inline void vhe_switch_to_host_or_guest(bool guest)
 }
 
 /**
+ * Branch Target Identification mechanism support in AArch64 state.
+ */
+static inline bool is_arch_feat_bti_supported(void)
+{
+	uint64_t id_aa64pfr1_el1 = read_msr(ID_AA64PFR1_EL1);
+
+	return (id_aa64pfr1_el1 & ID_AA64PFR1_EL1_BT) == 1ULL;
+}
+
+/**
+ * Returns true if the RME feature is implemented.
+ */
+static inline bool is_arch_feat_rme_supported(void)
+{
+	return ((read_msr(ID_AA64PFR0_EL1) >> ID_AA64PFR0_EL1_RME_SHIFT) &
+		ID_AA64PFR0_EL1_RME_MASK) != 0;
+}
+
+/**
  * Returns true if the SVE feature is implemented.
  */
-bool is_arch_feat_sve_supported(void);
+static inline bool is_arch_feat_sve_supported(void)
+{
+	uint64_t id_aa64pfr0_el1 = read_msr(ID_AA64PFR0_EL1);
+
+	return ((id_aa64pfr0_el1 >> ID_AA64PFR0_EL1_SVE_SHIFT) &
+		ID_AA64PFR0_EL1_SVE_MASK) == ID_AA64PFR0_EL1_SVE_SUPPORTED;
+}
+
+/**
+ * FEAT_SME/FEAT_SME2.
+ */
+
+/**
+ * Returns true if FEAT_SME/FEAT_SME2 is implemented.
+ */
+static inline bool is_arch_feat_sme_supported(void)
+{
+	uint64_t id_aa64pfr1_el1 = read_msr(ID_AA64PFR1_EL1);
+
+	return ((id_aa64pfr1_el1 >> ID_AA64PFR1_EL1_SME_SHIFT) &
+		ID_AA64PFR1_EL1_SME_MASK) >= ID_AA64PFR1_EL1_SME_SUPPORTED;
+}
+
+/**
+ * Returns true if FEAT_SME_FA64 is implemented.
+ */
+static inline bool is_arch_feat_sme_fa64_supported(void)
+{
+	uint64_t id_aa64smfr0_el1 = read_msr(MSR_ID_AA64SMFR0_EL1);
+
+	return ((id_aa64smfr0_el1 >> ID_AA64SMFR0_EL1_FA64_SHIFT) &
+		ID_AA64SMFR0_EL1_FA64_MASK) == ID_AA64SMFR0_EL1_FA64_SUPPORTED;
+}
+
+/**
+ * Returns true if Pointer Authentication is implemented.
+ */
+static inline bool is_arch_feat_pauth_supported(void)
+{
+	uint64_t id_aa64isar1_el1 = read_msr(ID_AA64ISAR1_EL1);
+	uint64_t id_aa64isar2_el1 = read_msr(ID_AA64ISAR2_EL1);
+
+	return (((id_aa64isar1_el1 >> ID_AA64ISAR1_EL1_PAUTH_SHIFT) &
+		 ID_AA64ISAR1_EL1_PAUTH_MASK) |
+		((id_aa64isar2_el1 >> ID_AA64ISAR2_EL1_PAUTH_SHIFT) &
+		 ID_AA64ISAR2_EL1_PAUTH_MASK)) != 0U;
+}

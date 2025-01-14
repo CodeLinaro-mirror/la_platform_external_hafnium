@@ -13,6 +13,7 @@
 #include "hf/dlog.h"
 
 #include "msr.h"
+#include "sysregs_defs.h"
 #include "test/hftest.h"
 
 extern uint8_t vector_table_el1;
@@ -40,13 +41,13 @@ noreturn static bool default_sync_current_exception(void)
 {
 	uintreg_t esr = read_msr(esr_el1);
 	uintreg_t elr = read_msr(elr_el1);
+	uintreg_t ec = GET_ESR_EC(esr);
 
-	switch (esr >> 26) {
-	case 0x25: /* EC = 100101, Data abort. */
-		dlog("Data abort: pc=%#x, esr=%#x, ec=%#x", elr, esr,
-		     esr >> 26);
-		if (!(esr & (1U << 10))) { /* Check FnV bit. */
-			dlog(", far=%#x", read_msr(far_el1));
+	switch (ec) {
+	case EC_DATA_ABORT_SAME_EL: /* EC = 100101, Data abort. */
+		dlog("Data abort: pc=%#lx, esr=%#lx, ec=%#lx", elr, esr, ec);
+		if (!GET_ESR_FNV(esr)) {
+			dlog(", far=%#lx", read_msr(far_el1));
 		} else {
 			dlog(", far=invalid");
 		}
@@ -55,9 +56,9 @@ noreturn static bool default_sync_current_exception(void)
 		break;
 
 	default:
-		dlog("Unknown current sync exception pc=%#x, esr=%#x, "
-		     "ec=%#x\n",
-		     elr, esr, esr >> 26);
+		dlog("Unknown current sync exception pc=%#lx, esr=%#lx, "
+		     "ec=%#lx\n",
+		     elr, esr, ec);
 	}
 
 	for (;;) {
@@ -93,4 +94,14 @@ void exception_setup(void (*irq)(void), bool (*exception)(void))
 void interrupt_wait(void)
 {
 	__asm__ volatile("wfi");
+}
+
+void interrupts_enable(void)
+{
+	__asm__ volatile("msr DAIFClr, #0x3");
+}
+
+void interrupts_disable(void)
+{
+	__asm__ volatile("msr DAIFSet, #0x3");
 }

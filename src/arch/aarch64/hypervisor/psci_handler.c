@@ -183,7 +183,7 @@ bool psci_primary_vm_handler(struct vcpu *vcpu, uint32_t func, uintreg_t arg0,
 					(uintreg_t)&cpu_entry, (uintreg_t)c, 0,
 					0, 0, SMCCC_CALLER_HYPERVISOR);
 			*ret = smc_res.func;
-		} while (*ret == PSCI_ERROR_ALREADY_ON);
+		} while (*ret == (uintreg_t)PSCI_ERROR_ALREADY_ON);
 
 		if (*ret != PSCI_RETURN_SUCCESS) {
 			cpu_off(c);
@@ -212,16 +212,6 @@ bool psci_primary_vm_handler(struct vcpu *vcpu, uint32_t func, uintreg_t arg0,
 	}
 
 	return true;
-}
-
-/**
- * Convert a PSCI CPU / affinity ID for a secondary VM to the corresponding vCPU
- * index.
- */
-ffa_vcpu_index_t vcpu_id_to_index(cpu_id_t vcpu_id)
-{
-	/* For now we use indices as IDs for the purposes of PSCI. */
-	return vcpu_id;
 }
 
 /**
@@ -387,7 +377,7 @@ bool psci_handler(struct vcpu *vcpu, uint32_t func, uintreg_t arg0,
 		  uintreg_t arg1, uintreg_t arg2, uintreg_t *ret,
 		  struct vcpu **next)
 {
-	if (vcpu->vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(vcpu->vm)) {
 		return psci_primary_vm_handler(vcpu, func, arg0, arg1, arg2,
 					       ret);
 	}

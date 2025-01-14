@@ -58,89 +58,45 @@
 .endm
 
 /**
- * Helper macros for SIMD vectors save/restore operations.
+ * Restores the volatile registers from the stack.
+ *
+ * Register x0: if false restores elr_elx if true retains the value of elr_elx.
+ * This enables exception handlers to indicate whether they have changed the
+ * value of elr_elx (e.g., to skip the faulting instruction).
  */
-.macro simd_op_vectors op:req reg:req
-	\op q0, q1, [\reg], #32
-	\op q2, q3, [\reg], #32
-	\op q4, q5, [\reg], #32
-	\op q6, q7, [\reg], #32
-	\op q8, q9, [\reg], #32
-	\op q10, q11, [\reg], #32
-	\op q12, q13, [\reg], #32
-	\op q14, q15, [\reg], #32
-	\op q16, q17, [\reg], #32
-	\op q18, q19, [\reg], #32
-	\op q20, q21, [\reg], #32
-	\op q22, q23, [\reg], #32
-	\op q24, q25, [\reg], #32
-	\op q26, q27, [\reg], #32
-	\op q28, q29, [\reg], #32
-	\op q30, q31, [\reg], #32
+.macro restore_from_stack_and_return elx:req
+restore_from_stack_and_return_\elx:
+
+	/* Restore registers x2-x18, x29 & x30. */
+	ldp x2, x3, [sp, #8 * 2]
+	ldp x4, x5, [sp, #8 * 4]
+	ldp x6, x7, [sp, #8 * 6]
+	ldp x8, x9, [sp, #8 * 8]
+	ldp x10, x11, [sp, #8 * 10]
+	ldp x12, x13, [sp, #8 * 12]
+	ldp x14, x15, [sp, #8 * 14]
+	ldp x16, x17, [sp, #8 * 16]
+	ldr x18, [sp, #8 * 18]
+	ldp x29, x30, [sp, #8 * 20]
+
+	cbnz x0, skip_restore_elr_\elx
+
+	/* Restore register elr_elx using x1 as scratch. */
+	ldr x1, [sp, #8 * 22]
+	msr elr_\elx, x1
+
+skip_restore_elr_\elx:
+	/* Restore register spsr_elx using x1 as scratch. */
+	ldr x1, [sp, #8 * 23]
+	msr spsr_\elx, x1
+
+	/* Restore x0 & x1, and release stack space. */
+	ldp x0, x1, [sp], #8 * 24
+
+	b exception_handler_return
 .endm
 
-/**
- * Helper macros for SVE vectors save/restore operations.
- */
-.macro sve_op_vectors op:req reg:req
-	\op z0, [\reg, #0, MUL VL]
-	\op z1, [\reg, #1, MUL VL]
-	\op z2, [\reg, #2, MUL VL]
-	\op z3, [\reg, #3, MUL VL]
-	\op z4, [\reg, #4, MUL VL]
-	\op z5, [\reg, #5, MUL VL]
-	\op z6, [\reg, #6, MUL VL]
-	\op z7, [\reg, #7, MUL VL]
-	\op z8, [\reg, #8, MUL VL]
-	\op z9, [\reg, #9, MUL VL]
-	\op z10, [\reg, #10, MUL VL]
-	\op z11, [\reg, #11, MUL VL]
-	\op z12, [\reg, #12, MUL VL]
-	\op z13, [\reg, #13, MUL VL]
-	\op z14, [\reg, #14, MUL VL]
-	\op z15, [\reg, #15, MUL VL]
-	\op z16, [\reg, #16, MUL VL]
-	\op z17, [\reg, #17, MUL VL]
-	\op z18, [\reg, #18, MUL VL]
-	\op z19, [\reg, #19, MUL VL]
-	\op z20, [\reg, #20, MUL VL]
-	\op z21, [\reg, #21, MUL VL]
-	\op z22, [\reg, #22, MUL VL]
-	\op z23, [\reg, #23, MUL VL]
-	\op z24, [\reg, #24, MUL VL]
-	\op z25, [\reg, #25, MUL VL]
-	\op z26, [\reg, #26, MUL VL]
-	\op z27, [\reg, #27, MUL VL]
-	\op z28, [\reg, #28, MUL VL]
-	\op z29, [\reg, #29, MUL VL]
-	\op z30, [\reg, #30, MUL VL]
-	\op z31, [\reg, #31, MUL VL]
-
-.endm
-
-/**
- * Helper macros for SVE predicates save/restore operations.
- */
-.macro sve_predicate_op op:req reg:req
-	\op p0, [\reg, #0, MUL VL]
-	\op p1, [\reg, #1, MUL VL]
-	\op p2, [\reg, #2, MUL VL]
-	\op p3, [\reg, #3, MUL VL]
-	\op p4, [\reg, #4, MUL VL]
-	\op p5, [\reg, #5, MUL VL]
-	\op p6, [\reg, #6, MUL VL]
-	\op p7, [\reg, #7, MUL VL]
-	\op p8, [\reg, #8, MUL VL]
-	\op p9, [\reg, #9, MUL VL]
-	\op p10, [\reg, #10, MUL VL]
-	\op p11, [\reg, #11, MUL VL]
-	\op p12, [\reg, #12, MUL VL]
-	\op p13, [\reg, #13, MUL VL]
-	\op p14, [\reg, #14, MUL VL]
-	\op p15, [\reg, #15, MUL VL]
-.endm
-
-/**
+/*
  * Restores the volatile registers from the stack. This currently takes 14
  * instructions, so it can be used in exception handlers while still leaving 18
  * instructions left; if paired with save_volatile_to_stack, there are 4
@@ -211,7 +167,7 @@
 .macro current_exception_spx elx:req handler:req
 	save_volatile_to_stack \elx
 	bl \handler
-	b restore_from_stack_and_return
+	b restore_from_stack_and_return_\elx
 .endm
 
 /**

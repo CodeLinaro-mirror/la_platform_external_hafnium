@@ -19,6 +19,7 @@
 int64_t hf_call(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3);
 struct ffa_value ffa_call(struct ffa_value args);
 struct ffa_value ffa_call_ext(struct ffa_value args);
+/* NOLINTNEXTLINE(readability-redundant-declaration) */
 void memcpy_s(void *dest, size_t destsz, const void *src, size_t count);
 
 /**
@@ -47,10 +48,11 @@ static inline struct ffa_value ffa_partition_info_get_regs(
 	const struct ffa_uuid *uuid, const uint16_t start_index,
 	const uint16_t tag)
 {
-	uint64_t arg1 = (uint64_t)uuid->uuid[1] << 32 | uuid->uuid[0];
-	uint64_t arg2 = (uint64_t)uuid->uuid[3] << 32 | uuid->uuid[2];
+	uint64_t arg1;
+	uint64_t arg2;
 	uint64_t arg3 = start_index | (uint64_t)tag << 16;
 
+	ffa_uuid_to_u64x2(&arg1, &arg2, uuid);
 	return ffa_call_ext((struct ffa_value){
 		.func = FFA_PARTITION_INFO_GET_REGS_64,
 		.arg1 = arg1,
@@ -116,8 +118,8 @@ static inline ffa_id_t hf_vm_get_id(void)
 static inline struct ffa_value ffa_run(ffa_id_t vm_id,
 				       ffa_vcpu_index_t vcpu_idx)
 {
-	return ffa_call((struct ffa_value){.func = FFA_RUN_32,
-					   ffa_vm_vcpu(vm_id, vcpu_idx)});
+	return ffa_call_ext((struct ffa_value){.func = FFA_RUN_32,
+					       ffa_vm_vcpu(vm_id, vcpu_idx)});
 }
 
 /**
@@ -296,6 +298,10 @@ static inline struct ffa_value ffa_mem_frag_tx(ffa_memory_handle_t handle,
  *
  * The mailbox must be cleared before a new message can be received.
  *
+ * By default, FFA_MSG_WAIT will release the mailbox back to the SPMC. The
+ * FFA_MSG_WAIT_FLAG_RETAIN_RX flag can be used with `ffa_msg_wait_with_flags`
+ * function to override this default and allow the VM to retain the RX buffer.
+ *
  * If no message is immediately available and there are no enabled and pending
  * interrupts (irrespective of whether interrupts are enabled globally), then
  * this will block until a message is available or an enabled interrupt becomes
@@ -303,13 +309,18 @@ static inline struct ffa_value ffa_mem_frag_tx(ffa_memory_handle_t handle,
  * that a message becoming available is also treated like a wake-up event.
  *
  * Returns:
- *  - FFA_MSG_SEND if a message is successfully received.
  *  - FFA_ERROR FFA_NOT_SUPPORTED if called from the primary VM.
  *  - FFA_ERROR FFA_INTERRUPTED if an interrupt happened during the call.
  */
+static inline struct ffa_value ffa_msg_wait_with_flags(uint32_t flags)
+{
+	return ffa_call_ext(
+		(struct ffa_value){.func = FFA_MSG_WAIT_32, .arg2 = flags});
+}
+
 static inline struct ffa_value ffa_msg_wait(void)
 {
-	return ffa_call((struct ffa_value){.func = FFA_MSG_WAIT_32});
+	return ffa_msg_wait_with_flags(0);
 }
 
 /**
@@ -347,34 +358,6 @@ static inline struct ffa_value ffa_rx_release(void)
 }
 
 /**
- * Retrieves the next VM whose mailbox became writable. For a VM to be notified
- * by this function, the caller must have called api_mailbox_send before with
- * the notify argument set to true, and this call must have failed because the
- * mailbox was not available.
- *
- * It should be called repeatedly to retrieve a list of VMs.
- *
- * Returns -1 if no VM became writable, or the id of the VM whose mailbox
- * became writable.
- */
-static inline int64_t hf_mailbox_writable_get(void)
-{
-	return hf_call(HF_MAILBOX_WRITABLE_GET, 0, 0, 0);
-}
-
-/**
- * Retrieves the next VM waiting to be notified that the mailbox of the
- * specified VM became writable. Only primary VMs are allowed to call this.
- *
- * Returns -1 on failure or if there are no waiters; the VM id of the next
- * waiter otherwise.
- */
-static inline int64_t hf_mailbox_waiter_get(ffa_id_t vm_id)
-{
-	return hf_call(HF_MAILBOX_WAITER_GET, vm_id, 0, 0);
-}
-
-/**
  * Enables or disables a given interrupt ID.
  *
  * Returns 0 on success, or -1 if the intid is invalid.
@@ -406,27 +389,6 @@ static inline int64_t hf_interrupt_deactivate(uint32_t intid)
 }
 
 /**
- * Injects a virtual interrupt of the given ID into the given target vCPU.
- * This doesn't cause the vCPU to actually be run immediately; it will be taken
- * when the vCPU is next run, which is up to the scheduler.
- *
- * Returns:
- *  - -1 on failure because the target VM or vCPU doesn't exist, the interrupt
- *    ID is invalid, or the current VM is not allowed to inject interrupts to
- *    the target VM.
- *  - 0 on success if no further action is needed.
- *  - 1 if it was called by the primary VM and the primary VM now needs to wake
- *    up or kick the target vCPU.
- */
-static inline int64_t hf_interrupt_inject(ffa_id_t target_vm_id,
-					  ffa_vcpu_index_t target_vcpu_idx,
-					  uint32_t intid)
-{
-	return hf_call(HF_INTERRUPT_INJECT, target_vm_id, target_vcpu_idx,
-		       intid);
-}
-
-/**
  * Reconfigure the virtual interrupt belonging to the current SP. Note that the
  * virtual interrupt is identity mapped to the physical interrupt id.
  *
@@ -445,11 +407,21 @@ static inline int64_t hf_interrupt_reconfigure_target_cpu(
 					(uint32_t)target_cpu_index);
 }
 
-/** Obtains the Hafnium's version of the implemented FF-A specification. */
-static inline int32_t ffa_version(uint32_t requested_version)
+/**
+ * Trigger an IPI to target vcpu.
+ */
+static inline int64_t hf_interrupt_send_ipi(ffa_vcpu_index_t target_vcpu_id)
 {
-	return ffa_call((struct ffa_value){.func = FFA_VERSION_32,
-					   .arg1 = requested_version})
+	return hf_call(HF_INTERRUPT_SEND_IPI, (uint64_t)target_vcpu_id, 0, 0);
+}
+
+/** Obtains the Hafnium's version of the implemented FF-A specification. */
+static inline enum ffa_version ffa_version(enum ffa_version requested_version)
+{
+	return ffa_call((struct ffa_value){
+				.func = FFA_VERSION_32,
+				.arg1 = (uint32_t)requested_version,
+			})
 		.func;
 }
 
@@ -495,6 +467,7 @@ static inline struct ffa_value ffa_msg_send_direct_req(
 	return ffa_call((struct ffa_value){
 		.func = FFA_MSG_SEND_DIRECT_REQ_32,
 		.arg1 = ((uint64_t)sender_vm_id << 16) | target_vm_id,
+		.arg2 = 0,
 		.arg3 = arg3,
 		.arg4 = arg4,
 		.arg5 = arg5,
@@ -503,11 +476,80 @@ static inline struct ffa_value ffa_msg_send_direct_req(
 	});
 }
 
+static inline struct ffa_value ffa_framework_msg_send_direct_req(
+	ffa_id_t sender_vm_id, ffa_id_t target_vm_id, uint32_t func,
+	ffa_id_t vm_id)
+{
+	return ffa_call((struct ffa_value){
+		.func = FFA_MSG_SEND_DIRECT_REQ_32,
+		.arg1 = ((uint64_t)sender_vm_id << 16) | target_vm_id,
+		.arg2 = FFA_FRAMEWORK_MSG_BIT | func,
+		.arg5 = vm_id,
+	});
+}
+
+/** Create an `ffa_value` suitable for the response to a framework message. */
+static inline struct ffa_value ffa_framework_msg_resp(ffa_id_t sender_vm_id,
+						      ffa_id_t receiver_vm_id,
+						      uint32_t func,
+						      uint64_t arg3)
+{
+	return (struct ffa_value){
+		.func = FFA_MSG_SEND_DIRECT_RESP_32,
+		.arg1 = ((uint64_t)sender_vm_id << 16) | receiver_vm_id,
+		/* Set bit 31 since this is a framework message. */
+		.arg2 = FFA_FRAMEWORK_MSG_BIT | func,
+		.arg3 = arg3,
+	};
+}
+
+static inline struct ffa_value ffa_msg_send_direct_req2(
+	ffa_id_t sender_vm_id, ffa_id_t target_vm_id,
+	const struct ffa_uuid *uuid, const uint64_t *msg, size_t count)
+{
+	struct ffa_value args;
+	size_t arg_idx = 0;
+	uint64_t total_args;
+	size_t msg_idx = 0;
+	uint64_t *arg_ptrs[] = {
+		&args.arg4,
+		&args.arg5,
+		&args.arg6,
+		&args.arg7,
+		&args.extended_val.arg8,
+		&args.extended_val.arg9,
+		&args.extended_val.arg10,
+		&args.extended_val.arg11,
+		&args.extended_val.arg12,
+		&args.extended_val.arg13,
+		&args.extended_val.arg14,
+		&args.extended_val.arg15,
+		&args.extended_val.arg16,
+		&args.extended_val.arg17,
+	};
+
+	args.func = FFA_MSG_SEND_DIRECT_REQ2_64;
+	args.arg1 = ((uint64_t)sender_vm_id << 16) | target_vm_id;
+	ffa_uuid_to_u64x2(&args.arg2, &args.arg3, uuid);
+
+	total_args = (sizeof(arg_ptrs) / sizeof(uint64_t *));
+
+	while (arg_idx < total_args && msg_idx < count) {
+		*arg_ptrs[arg_idx++] = msg[msg_idx++];
+	}
+
+	while (arg_idx < total_args) {
+		*arg_ptrs[arg_idx++] = 0;
+	}
+
+	return ffa_call_ext(args);
+}
+
 static inline struct ffa_value ffa_msg_send_direct_resp(
 	ffa_id_t sender_vm_id, ffa_id_t target_vm_id, uint32_t arg3,
 	uint32_t arg4, uint32_t arg5, uint32_t arg6, uint32_t arg7)
 {
-	return ffa_call((struct ffa_value){
+	return ffa_call_ext((struct ffa_value){
 		.func = FFA_MSG_SEND_DIRECT_RESP_32,
 		.arg1 = ((uint64_t)sender_vm_id << 16) | target_vm_id,
 		.arg3 = arg3,
@@ -516,6 +558,58 @@ static inline struct ffa_value ffa_msg_send_direct_resp(
 		.arg6 = arg6,
 		.arg7 = arg7,
 	});
+}
+
+static inline struct ffa_value ffa_framework_message_send_direct_resp(
+	ffa_id_t sender_vm_id, ffa_id_t target_vm_id, uint32_t func,
+	uint32_t arg3)
+{
+	return ffa_call_ext(
+		ffa_framework_msg_resp(sender_vm_id, target_vm_id, func, arg3));
+}
+
+static inline struct ffa_value ffa_msg_send_direct_resp2(ffa_id_t sender_vm_id,
+							 ffa_id_t target_vm_id,
+							 const uint64_t *msg,
+							 size_t count)
+{
+	struct ffa_value args;
+	size_t arg_idx = 0;
+	size_t total_args;
+	size_t msg_idx = 0;
+	uint64_t *arg_ptrs[] = {
+		&args.arg4,
+		&args.arg5,
+		&args.arg6,
+		&args.arg7,
+		&args.extended_val.arg8,
+		&args.extended_val.arg9,
+		&args.extended_val.arg10,
+		&args.extended_val.arg11,
+		&args.extended_val.arg12,
+		&args.extended_val.arg13,
+		&args.extended_val.arg14,
+		&args.extended_val.arg15,
+		&args.extended_val.arg16,
+		&args.extended_val.arg17,
+	};
+
+	args.func = FFA_MSG_SEND_DIRECT_RESP2_64;
+	args.arg1 = ((uint64_t)sender_vm_id << 16) | target_vm_id;
+	args.arg2 = 0;
+	args.arg3 = 0;
+
+	total_args = sizeof(arg_ptrs) / sizeof(uint64_t *);
+
+	while (arg_idx < total_args && msg_idx < count) {
+		*arg_ptrs[arg_idx++] = msg[msg_idx++];
+	}
+
+	while (arg_idx < total_args) {
+		*arg_ptrs[arg_idx++] = 0;
+	}
+
+	return ffa_call_ext(args);
 }
 
 static inline struct ffa_value ffa_notification_bind(
@@ -621,7 +715,25 @@ static inline struct ffa_value ffa_console_log_64(const char *src, size_t size)
 		.func = FFA_CONSOLE_LOG_64,
 		.arg1 = size,
 	};
-	memcpy_s(&req.arg2, sizeof(uint64_t) * 6, src, size);
+	const size_t destsz = sizeof(uint64_t) * 6;
+	const size_t count = size > destsz ? destsz : size;
+
+	memcpy_s(&req.arg2, destsz, src, count);
 
 	return ffa_call(req);
+}
+
+static inline struct ffa_value ffa_console_log_64_extended(const char *src,
+							   size_t size)
+{
+	struct ffa_value req = {
+		.func = FFA_CONSOLE_LOG_64,
+		.arg1 = size,
+	};
+	const size_t destsz = sizeof(uint64_t) * 16;
+	const size_t count = size > destsz ? destsz : size;
+
+	memcpy_s(&req.arg2, destsz, src, count);
+
+	return ffa_call_ext(req);
 }

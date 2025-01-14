@@ -6,22 +6,6 @@
 
 import("//build/image/image.gni")
 
-# Service that can be interrupted.
-source_set("interruptible") {
-  testonly = true
-  public_configs = [
-    "//test/vmapi/primary_with_secondaries:config",
-    "//test/hftest:hftest_config",
-  ]
-
-  sources = [
-    "interruptible.c",
-    "interruptible_echo.c",
-  ]
-
-  deps = [ "//src/arch/aarch64/hftest/el0:interrupts" ]
-}
-
 # Service to exercise the FFA_MEM_PERM_GET and FFA_MEM_PERM_SET interfaces
 # for el0 partitions.
 source_set("mem_permissions") {
@@ -50,7 +34,6 @@ vm_kernel("service_el0_vm1") {
   testonly = true
 
   deps = [
-    ":interruptible",
     ":mem_permissions",
     ":receive_block",
     "//src/arch/${plat_arch}/hftest/el0:interrupts",
@@ -58,6 +41,7 @@ vm_kernel("service_el0_vm1") {
     "//test/hftest:hftest_secondary_el0_partition",
     "//test/hftest/arch/${plat_arch}/el0:mm",
     "//test/vmapi/common:ffa",
+    "//test/vmapi/common/arch/${plat_arch}/el0:exception_handler",
     "//test/vmapi/primary_with_secondaries:primary_with_secondaries",
     "//test/vmapi/primary_with_secondaries/services:boot",
     "//test/vmapi/primary_with_secondaries/services:echo",
@@ -78,6 +62,7 @@ vm_kernel("service_el0_vm2") {
     "//src/arch/${plat_arch}/hftest/el0:mm",
     "//test/hftest:hftest_secondary_el0_partition",
     "//test/vmapi/common:ffa",
+    "//test/vmapi/common/arch/${plat_arch}/el0:exception_handler",
     "//test/vmapi/primary_with_secondaries/services/:memory",
     "//test/vmapi/primary_with_secondaries/services/:relay",
     "//vmlib",
@@ -90,6 +75,7 @@ vm_kernel("service_el0_vm3") {
   deps = [
     "//test/hftest:hftest_secondary_el0_partition",
     "//test/vmapi/common:ffa",
+    "//test/vmapi/common/arch/${plat_arch}/el0:exception_handler",
     "//vmlib",
   ]
 }

@@ -358,14 +358,15 @@ element of the data flow diagram.
 +------------------------+------------------+---------------+-----------------+
 | ``Total Risk Rating``  | High (12)        | High (12)     |                 |
 +------------------------+------------------+---------------+-----------------+
-| ``Mitigations``        | A platform may prefer assigning boot time,         |
-|                        | statically alocated memory regions through the SMMU|
-|                        | configuration and page tables. The FF-A v1.1       |
-|                        | specification provisions this capability through   |
-|                        | static DMA isolation.                              |
-|                        | The TF-A SPMC does not mitigate this threat.       |
-|                        | It will adopt the static DMA isolation approach in |
-|                        | a future release.                                  |
+| ``Mitigations``        | Hafnium SPMC mitigates this threat by enforcing    |
+|                        | static dma isolation. Under this model, every      |
+|                        | partition uses its manifest to specify the memory  |
+|                        | regions in its physical address space that it      |
+|                        | intends to make visible to each DMA device with    |
+|                        | specific memory attributes.                        |
+|                        | The SPMC enforces access control to make sure a DMA|
+|                        | device cannot access a memory region unless        |
+|                        | explicitly specified in partition manifest.        |
 +------------------------+----------------------------------------------------+
 
 +------------------------+----------------------------------------------------+
@@ -893,10 +894,11 @@ element of the data flow diagram.
 |                        | SPMC and SPs, potentially leading to illegal state |
 |                        | transitions and deadlocks.**                       |
 |                        | An endpoint can call into another endpoint         |
-|                        | execution context using FFA_MSG_SEND_DIRECT_REQ    |
-|                        | ABI to create a call chain. A malicious endpoint   |
-|                        | could abuse this to form loops in a call chain that|
-|                        | could lead to potential deadlocks.                 |
+|                        | execution context using FFA_MSG_SEND_DIRECT_REQ (or|
+|                        | FFA_MSG_SEND_DIRECT_REQ2) ABI to create a call     |
+|                        | chain. A malicious endpoint could abuse this to    |
+|                        | form loops in a call chain that could lead to      |
+|                        | potential deadlocks.                               |
 +------------------------+----------------------------------------------------+
 | ``Diagram Elements``   | DF1, DF2, DF4                                      |
 +------------------------+----------------------------------------------------+
@@ -1496,6 +1498,220 @@ element of the data flow diagram.
 |                        | partition is deactivated as soon as it triggers.   |
 +------------------------+----------------------------------------------------+
 
++------------------------+----------------------------------------------------+
+| ID                     | 33                                                 |
++========================+====================================================+
+| ``Threat``             | **A rogue NWd FF-A endpoint could provide an RXTX  |
+|                        | buffer pair from a wrong physical address space.** |
+|                        | The NWd FF-A endpoint is expected to provide RXTX  |
+|                        | buffers in the non-secure physical address space.  |
+|                        | The SPMC maps them as non-secure memory in its S1  |
+|                        | page tables.                                       |
+|                        | In an attempt to attack the state of the SPMC or   |
+|                        | other SPs, the NWd FF-A endpoint could provide     |
+|                        | an address in the secure PAS. In this case, an     |
+|                        | access to the secure memory results in a           |
+|                        | synchronous data abort.                            |
+|                        | In Armv9 platforms, the NWd FF-A endpoint could    |
+|                        | also provide root memory or realm memory. In this  |
+|                        | case an access from the SPMC would result in a     |
+|                        | Granule Protection Fault.                          |
+|                        | In all cases, there could be an explicit attempt   |
+|                        | from the NWd FF-A endpoint to tamper with SPMC     |
+|                        | execution.                                         |
++------------------------+----------------------------------------------------+
+| ``Diagram Elements``   | DF1, DF5                                           |
++------------------------+----------------------------------------------------+
+| ``Affected TF-A        | SPMC                                               |
+| Components``           |                                                    |
++------------------------+----------------------------------------------------+
+| ``Assets``             | SPMC state, SP state                               |
++------------------------+----------------------------------------------------+
+| ``Threat Agent``       | S-Endpoint                                         |
++------------------------+----------------------------------------------------+
+| ``Threat Type``        | Tampering, Denial of Service                       |
++------------------------+------------------+-----------------+---------------+
+| ``Application``        |   ``Server``     |   ``Mobile``    |               |
++------------------------+------------------+-----------------+---------------+
+| ``Impact``             | High (4)         | High (4)        |               |
++------------------------+------------------+-----------------+---------------+
+| ``Likelihood``         | Medium (3)       | Medium (3)      |               |
++------------------------+------------------+-----------------+---------------+
+| ``Total Risk Rating``  | Medium (12)      | Medium (12)     |               |
++------------------------+------------------+-----------------+---------------+
+| ``Mitigations``        | The non-secure memory that the SWd is expected to  |
+|                        | use should be configured in the SPMC's manifest.   |
+|                        | The SPMC can't validate the physical address       |
+|                        | of the provided ranges. That responsibility is     |
+|                        | reserved to the EL3 monitor of the system. The     |
+|                        | ranges are provided by the system integrator in the|
+|                        | SPMC manifest. The contents of the manifest are    |
+|                        | integral due to the secure boot process.           |
+|                        | In an Armv8 platform, if there is a                |
+|                        | misconfiguration and any access results in a data  |
+|                        | abort, the TF-A SPMC has no way to recover from    |
+|                        | this. In an Armv9 platform, if there is a          |
+|                        | misconfiguration or the addresses get updated in   |
+|                        | runtime by using the RME system architecture       |
+|                        | features, the SPMC's access originates a Granule   |
+|                        | Protection Fault.                                  |
+|                        | In this case, the threat is mitigated by using     |
+|                        | a special function whose access is conceived for   |
+|                        | possibly getting trapped and to return error.      |
+|                        | The scenarios in which the SPMC is prone to such   |
+|                        | attacks are:                                       |
+|                        | - Indirect messaging targetting or from a VM.      |
+|                        | - Memory sharing when exchanging memory regions    |
+|                        | descriptors with the hypervisor/OS Kernel.         |
+|                        | - FFA_PARTITION_INFO_GET via buffers.              |
+|                        | In these scenarios, the SPMC is able to detect the |
+|                        | fault, recover, and relinquish smoothly, returning |
+|                        | error FFA_ABORTED back to the caller FF-A endpoint.|
++------------------------+----------------------------------------------------+
+
++------------------------+----------------------------------------------------+
+| ID                     | 34                                                 |
++========================+====================================================+
+| ``Threat``             | **A rogue NWd FF-A endpoint could attempt to       |
+|                        | share/lend/donate a memory region with the wrong   |
+|                        | security state attribute.**                        |
+|                        | The attacker could attempt to corrupt the state of |
+|                        | the SP.                                            |
++------------------------+----------------------------------------------------+
+| ``Diagram Elements``   | DF1, DF5                                           |
++------------------------+----------------------------------------------------+
+| ``Affected TF-A        | SPMC                                               |
+| Components``           |                                                    |
++------------------------+----------------------------------------------------+
+| ``Assets``             | SPMC state, SP state, CPU cycles                   |
++------------------------+----------------------------------------------------+
+| ``Threat Agent``       | S-Endpoint                                         |
++------------------------+----------------------------------------------------+
+| ``Threat Type``        | Tampering, Denial of Service                       |
++------------------------+------------------+-----------------+---------------+
+| ``Application``        |   ``Server``     |   ``Mobile``    |               |
++------------------------+------------------+-----------------+---------------+
+| ``Impact``             | High (4)         | High (4)        |               |
++------------------------+------------------+-----------------+---------------+
+| ``Likelihood``         | Medium (3)       | Medium (3)      |               |
++------------------------+------------------+-----------------+---------------+
+| ``Total Risk Rating``  | Medium (12)      | Medium (12)     |               |
++------------------------+------------------+-----------------+---------------+
+| ``Mitigations``        | The platform owner must configure the NS/S regions |
+|                        | that the secure world is allowed to use during     |
+|                        | runtime in the SPMC's manifest.                    |
+|                        | This configuration must be coherent with that of   |
+|                        | platform's memory map, and its PAS setup.          |
+|                        | The EL3 monitor can configure the PAS:             |
+|                        | - In Armv8-A platforms, e.g. by leveraging the     |
+|                        | TZC.                                               |
+|                        | - In Armv9-A platforms, by configuring the GPT     |
+|                        | following the `RME system architecture`_.          |
+|                        | The SPMC doesn't allow the NWd to share/lend/donate|
+|                        | NS memory outside of the ranges specified in the   |
+|                        | manifest.                                          |
+|                        | If the operation is a lend/donate from the NWd to  |
+|                        | an SP or multiple SPs, the platform can leverage   |
+|                        | the ability to change the PAS in runtime to        |
+|                        | enforce the semantics of the lend/donate operation.|
+|                        | The SPMC implementation, for the FVP platform      |
+|                        | leverages the RME architecture to dynamically      |
+|                        | change the PAS from NS to S. In case the update    |
+|                        | fails because the region is not on NS PAS, the     |
+|                        | SPMC returns error back to the NWd caller.         |
+|                        | For the share operation, the SPMC will check that  |
+|                        | is within the NS ranges from the manifest, but     |
+|                        | won't attest that the PAS is correctly set by      |
+|                        | EL3 monitor. The impact of a GPF in a partition    |
+|                        | depends on its EL:                                 |
+|                        | * S-EL1: the SP should handle the GPF, recover     |
+|                        | and relinquish access to the memory.               |
+|                        | * S-EL0: the GPF would trap onto SPMC, which sets  |
+|                        | the SP in an aborted state.                        |
+|                        | Platform owners are encouraged to implement a      |
+|                        | similar interface for the SPMC to leverage,        |
+|                        | equivalent to that detailed for the FVP platform.  |
++------------------------+----------------------------------------------------+
+
++------------------------+----------------------------------------------------+
+| ID                     | 35                                                 |
++========================+====================================================+
+| ``Threat``             | **A rogue SP could try use IPIs to steal cycles    |
+|                        | from other SPs.**                                  |
++------------------------+----------------------------------------------------+
+| ``Diagram Elements``   | DF1,                                               |
++------------------------+----------------------------------------------------+
+| ``Affected TF-A        | SPMC, FF-A Endpoint                                |
+| Components``           |                                                    |
++------------------------+----------------------------------------------------+
+| ``Assets``             | SPMC state, SP state, CPU cycles                   |
++------------------------+----------------------------------------------------+
+| ``Threat Agent``       | S-Endpoint                                         |
++------------------------+----------------------------------------------------+
+| ``Threat Type``        | Denial of Service                                  |
++------------------------+------------------+-----------------+---------------+
+| ``Application``        |   ``Server``     |   ``Mobile``    |               |
++------------------------+------------------+-----------------+---------------+
+| ``Impact``             | High (4)         | High (4)        |               |
++------------------------+------------------+-----------------+---------------+
+| ``Likelihood``         | Medium (3)       | Medium (3)      |               |
++------------------------+------------------+-----------------+---------------+
+| ``Total Risk Rating``  | Medium (12)      | Medium (12)     |               |
++------------------------+------------------+-----------------+---------------+
+| ``Mitigations``        | When an IPI is received, if the target vCPU is     |
+|                        | in the RUNNING state, since the vCPU               |
+|                        | already has cycles it can use to handle the        |
+|                        | interrupt, the virtual interrupt is injected       |
+|                        | straight away.                                     |
+|                        | In the case the target vCPU is in the              |
+|                        | PREEMPTED/BLOCKED state, the IPI virtual interrupt |
+|                        | is simply pended. In both cases, it is implicit    |
+|                        | with the states that the vCPU will be resumed      |
+|                        | eventually. The virtual interrupt is injected and  |
+|                        | handled then.                                      |
+|                        | If the vCPU is in the WAITING state, it needs the  |
+|                        | scheduler to provide CPU cycles to it. To mitigate |
+|                        | the threat described above, the SPMC sends the SRI |
+|                        | SGI to inform the Normal World that the target     |
+|                        | vCPU has a pending IPI. It can then schedule time  |
+|                        | for the vCPU to handle the IPI virtual interrupt.  |
+|                        | This means the SP is unable to take cycles without |
+|                        | the knowledge of the Normal World Scheduler.       |
++------------------------+----------------------------------------------------+
+
++------------------------+----------------------------------------------------+
+| ID                     | 36                                                 |
++========================+====================================================+
+| ``Threat``             | **A rogue SP could try use IPIs to interrupt       |
+|                        | another SP.**                                      |
++------------------------+----------------------------------------------------+
+| ``Diagram Elements``   | DF1                                                |
++------------------------+----------------------------------------------------+
+| ``Affected TF-A        | SPMC, FF-A Endpoint                                |
+| Components``           |                                                    |
++------------------------+----------------------------------------------------+
+| ``Assets``             | SPMC state, SP state, CPU cycles                   |
++------------------------+----------------------------------------------------+
+| ``Threat Agent``       | S-Endpoint                                         |
++------------------------+----------------------------------------------------+
+| ``Threat Type``        | Denial of Service                                  |
++------------------------+------------------+-----------------+---------------+
+| ``Application``        |   ``Server``     |   ``Mobile``    |               |
++------------------------+------------------+-----------------+---------------+
+| ``Impact``             | Medium (3)       | Medium (3)      |               |
++------------------------+------------------+-----------------+---------------+
+| ``Likelihood``         | Low (2)          | Low (2)         |               |
++------------------------+------------------+-----------------+---------------+
+| ``Total Risk Rating``  | Medium (6)       | Medium (6)      |               |
++------------------------+------------------+-----------------+---------------+
+| ``Mitigations``        | This is not possible. The ABI only allows an SP to |
+|                        | specify the target vCPU ID. Hafnium then directs   |
+|                        | the IPI to the vCPU with that ID, that belongs to  |
+|                        | the SP currently running on the source CPU. As     |
+|                        | such it is impossible for an SP to target another  |
+|                        | SP for an IPI.                                     |
++------------------------+----------------------------------------------------+
+
 --------------
 
 *Copyright (c) 2023, Arm Limited. All rights reserved.*
@@ -1503,4 +1719,4 @@ element of the data flow diagram.
 .. _Arm Firmware Framework for Arm A-profile: https://developer.arm.com/docs/den0077/latest
 .. _Generic TF-A threat model: https://trustedfirmware-a.readthedocs.io/en/latest/threat_model/threat_model.html
 .. _FF-A ACS: https://github.com/ARM-software/ff-a-acs/releases
-
+.. _RME system architecture: https://developer.arm.com/documentation/den0129/latest/

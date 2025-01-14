@@ -41,6 +41,8 @@ HFTEST_CTRL_JSON_END = "[hftest_ctrl:json_end]"
 HFTEST_CTRL_GET_COMMAND_LINE = "[hftest_ctrl:get_command_line]"
 HFTEST_CTRL_FINISHED = "[hftest_ctrl:finished]"
 
+HFTEST_CTRL_JSON_REGEX = re.compile("^\\[[0-9a-fA-F]+ [0-9a-fA-F]+\\] ")
+
 HF_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 DTC_SCRIPT = os.path.join(HF_ROOT, "build", "image", "dtc.py")
@@ -155,6 +157,7 @@ DriverArgs = collections.namedtuple("DriverArgs", [
         "partitions",
         "global_run_name",
         "coverage_plugin",
+        "disable_visualisation"
     ])
 
 # State shared between the common Driver class and its subclasses during
@@ -231,7 +234,7 @@ class QemuDriver(Driver):
 
     def gen_exec_args(self, test_args, is_long_running):
         """Generate command line arguments for QEMU."""
-        time_limit = "120s" if is_long_running else "10s"
+        time_limit = "120s" if is_long_running else "30s"
         # If no CPU configuration is selected, then test against the maximum
         # configuration, "max", supported by QEMU.
         if not self.args.cpu or self.args.cpu == "max":
@@ -345,7 +348,8 @@ class FvpDriver(Driver, ABC):
             debug = False, show_output = False):
         """Generate command line arguments for FVP."""
         show_output = debug or show_output
-        time_limit = "100s" if is_long_running else "40s"
+        disable_visualisation = self.args.disable_visualisation is True
+        time_limit = "150s" if is_long_running else "40s"
         fvp_args = []
 
         if not show_output:
@@ -404,17 +408,23 @@ class FvpDriver(Driver, ABC):
 
         if not show_output:
             fvp_args += [
-                "-C", "bp.vis.disable_visualisation=true",
                 "-C", "bp.terminal_0.start_telnet=false",
                 "-C", "bp.terminal_1.start_telnet=false",
                 "-C", "bp.terminal_2.start_telnet=false",
                 "-C", "bp.terminal_3.start_telnet=false",
                 "-C", "bp.ve_sysregs.exit_on_shutdown=1",
             ]
+            disable_visualisation = True
+
+        if disable_visualisation:
+            fvp_args += [
+                "-C", "bp.vis.disable_visualisation=true"
+            ]
 
         if debug:
             fvp_args += [
-                    "-I", "-p"
+                    "--iris-connect", "tcpserver,allowRemote",
+                    "-p",
                     ]
 
         if self.cov_plugin is not None:
@@ -784,7 +794,7 @@ class TestRunner:
         lines_to_process = lines_to_process[hftest_start : hftest_end]
 
         for line in lines_to_process:
-            match = re.search(f"^(VM|SP) \d+: ", line)
+            match = HFTEST_CTRL_JSON_REGEX.search(line)
             if match is not None:
                 line = line[match.end():]
             if line.startswith(HFTEST_LOG_PREFIX):
@@ -796,12 +806,22 @@ class TestRunner:
         test suites."""
         out = self.driver.run("json", "json", self.force_long_running)
         hf_out = self.extract_hftest_lines(out)
-        hf_out = hf_out[hf_out.index(HFTEST_CTRL_JSON_START) + 1
+        try:
+            hf_out = hf_out[hf_out.index(HFTEST_CTRL_JSON_START) + 1
                         :hf_out.index(HFTEST_CTRL_JSON_END)];
+        except ValueError as e:
+            print("Unable to find JSON control string:")
+            print(f"out={out}")
+            print(f"hf_out={hf_out}")
+            raise e
+
         hf_out = "\n".join(hf_out)
         try:
             return json.loads(hf_out)
         except ValueError as e:
+            print("Unable to parse JSON:")
+            print(f"out={out}")
+            print(f"hf_out={hf_outout}")
             print(out)
             raise e
 
@@ -988,6 +1008,7 @@ def Main():
         help="Selects the CPU configuration for the run environment.")
     parser.add_argument("--tfa", action="store_true")
     parser.add_argument("--coverage_plugin", default="")
+    parser.add_argument("--disable_visualisation", action="store_true")
     args = parser.parse_args()
 
     # Create class which will manage all test artifacts.
@@ -1010,7 +1031,7 @@ def Main():
     vm_args = args.vm_args or ""
 
     partitions = None
-    global_run_name = None
+    global_run_name = "arch"
     if args.driver == "fvp":
         if args.partitions_json is not None:
             partitions_dir = os.path.join(
@@ -1024,13 +1045,13 @@ def Main():
                 global_run_name = os.path.basename(args.hypervisor).split(".")[0]
 
     # Create class which will manage all test artifacts.
-    log_dir = os.path.join(args.log, test_set_up)
+    log_dir = os.path.join(os.path.join(args.log, test_set_up), global_run_name)
     artifacts = ArtifactsManager(log_dir)
 
     # Create a driver for the platform we want to test on.
     driver_args = DriverArgs(artifacts, args.hypervisor, args.spmc, initrd,
                              vm_args, args.cpu, partitions, global_run_name,
-                             args.coverage_plugin)
+                             args.coverage_plugin, args.disable_visualisation)
 
     if args.el3_spmc:
         # So far only FVP supports tests for SPMC.

@@ -8,10 +8,10 @@
 
 #include <stdint.h>
 
-/* Secure watchdog timer interrupt id. */
-#define IRQ_TWDOG_INTID 56
+#include "test/hftest.h"
 
 uint64_t sp_sleep_active_wait(uint32_t ms);
 void sp_enable_irq(void);
-struct ffa_value handle_ffa_interrupt(struct ffa_value res);
-struct ffa_value handle_ffa_run(struct ffa_value res);
+void sp_disable_irq(void);
+struct ffa_value handle_interrupt(struct ffa_value res);
+void sp_register_secondary_ep(struct hftest_context *ctx);

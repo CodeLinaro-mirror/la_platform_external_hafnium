@@ -151,15 +151,22 @@ uintreg_t get_cptr_el2_value(void)
 {
 	uintreg_t ret;
 
+	/*
+	 * Do not trap Advanced SIMD access.
+	 * Trap SVE, SME, trace and AMU system register accesses.
+	 */
 	if (has_vhe_support()) {
-		ret = CPTR_EL2_VHE_FPEN | CPTR_EL2_VHE_TTA;
+		ret = CPTR_EL2_VHE_FPEN | CPTR_EL2_VHE_TTA | CPTR_EL2_TAM;
+	} else {
+		ret = CPTR_EL2_TTA | CPTR_EL2_TAM;
 
 		if (is_arch_feat_sve_supported()) {
-			/* CPTR_EL2.ZEN Disable SVE traps at EL2/1/0. */
-			ret |= CPTR_EL2_VHE_ZEN;
+			ret |= CPTR_EL2_TZ;
 		}
-	} else {
-		ret = CPTR_EL2_TTA;
+
+		if (is_arch_feat_sme_supported()) {
+			ret |= CPTR_EL2_TSM;
+		}
 	}
 
 	return ret;
@@ -222,25 +229,4 @@ uintreg_t get_sctlr_el2_value(bool is_el0_partition)
 	sctlr_el2_value |= SCTLR_EL2_EIS;
 
 	return sctlr_el2_value;
-}
-
-/*
- * Returns true if FEAT_BTI is supported.
- */
-bool is_arch_feat_bti_supported(void)
-{
-	uint64_t id_aa64pfr1_el1 = read_msr(ID_AA64PFR1_EL1);
-
-	return (id_aa64pfr1_el1 & ID_AA64PFR1_EL1_BT) == 1ULL;
-}
-
-/**
- * Returns true if the SVE feature is implemented.
- */
-bool is_arch_feat_sve_supported(void)
-{
-	uint64_t id_aa64pfr0_el1 = read_msr(ID_AA64PFR0_EL1);
-
-	return ((id_aa64pfr0_el1 >> ID_AA64PFR0_EL1_SVE_SHIFT) &
-		ID_AA64PFR0_EL1_SVE_MASK) == ID_AA64PFR0_EL1_SVE_SUPPORTED;
 }

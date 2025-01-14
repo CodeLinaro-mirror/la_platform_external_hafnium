@@ -13,11 +13,13 @@
 #include <stdint.h>
 
 #include "hf/arch/gicv3.h"
+#include "hf/arch/host_timer.h"
 #include "hf/arch/plat/psci.h"
 
 #include "hf/addr.h"
 #include "hf/check.h"
 #include "hf/ffa.h"
+#include "hf/hf_ipi.h"
 #include "hf/plat/interrupts.h"
 #include "hf/std.h"
 #include "hf/vm.h"
@@ -25,6 +27,7 @@
 #include "feature_id.h"
 #include "msr.h"
 #include "perfmon.h"
+#include "plat/prng/prng.h"
 #include "sysregs.h"
 
 #if BRANCH_PROTECTION
@@ -59,6 +62,9 @@ static void lor_disable(void)
 
 static void gic_regs_reset(struct arch_regs *r, bool is_primary)
 {
+	(void)r;
+	(void)is_primary;
+
 #if GIC_VERSION == 3 || GIC_VERSION == 4
 	uint32_t ich_hcr = 0;
 	uint32_t icc_sre_el2 =
@@ -77,10 +83,25 @@ static void gic_regs_reset(struct arch_regs *r, bool is_primary)
 #endif
 }
 
+static void pauth_el0_keys_reset(struct arch_regs *r)
+{
+	(void)r;
+
+#if BRANCH_PROTECTION
+	if (is_arch_feat_pauth_supported()) {
+		__uint128_t apia_key_for_el0 = plat_prng_get_number();
+
+		r->pac.apiakeylo_el1 =
+			(uint64_t)(apia_key_for_el0 & UINT64_MAX);
+		r->pac.apiakeyhi_el1 = (uint64_t)(apia_key_for_el0 >> 64);
+	}
+#endif
+}
+
 void arch_regs_reset(struct vcpu *vcpu)
 {
 	ffa_id_t vm_id = vcpu->vm->id;
-	bool is_primary = vm_id == HF_PRIMARY_VM_ID;
+	bool is_primary = vm_is_primary(vcpu->vm);
 	cpu_id_t vcpu_id = is_primary ? vcpu->cpu->id : vcpu_index(vcpu);
 
 	paddr_t table = vcpu->vm->ptable.root;
@@ -96,16 +117,29 @@ void arch_regs_reset(struct vcpu *vcpu)
 
 	cnthctl = 0;
 
+	/*
+	 * EL0PTEN  = 0: Trap EL0 access to physical timer registers.
+	 * EL0PCTEN = 1: Don't trap EL0 access to physical counter and
+	 *               frequency register.
+	 * EL1PCEN  = 0: Trap EL1 access to physical timer registers.
+	 * EL1PCTEN = 1: Don't trap EL1 access to physical counter.
+	 */
+	if (vcpu->vm->el0_partition) {
+		cnthctl |= CNTHCTL_EL2_VHE_EL0PCTEN;
+	} else {
+		cnthctl |= CNTHCTL_EL2_VHE_EL1PCTEN;
+	}
+
+	r->hyp_state.cptr_el2 = get_cptr_el2_value();
 	if (is_primary) {
-		/*
-		 * cnthctl_el2 is redefined when VHE is enabled.
-		 * EL1PCTEN, don't trap phys cnt access.
-		 * EL1PCEN, don't trap phys timer access.
-		 */
+		/* Do not trap FPU/Adv. SIMD/SVE/SME in the primary VM. */
 		if (has_vhe_support()) {
-			cnthctl |= (1U << 10) | (1U << 11);
+			r->hyp_state.cptr_el2 |=
+				(CPTR_EL2_VHE_ZEN | CPTR_EL2_VHE_FPEN |
+				 CPTR_EL2_SME_VHE_SMEN);
 		} else {
-			cnthctl |= (1U << 0) | (1U << 1);
+			r->hyp_state.cptr_el2 &=
+				~(CPTR_EL2_TFP | CPTR_EL2_TZ | CPTR_EL2_TSM);
 		}
 	}
 
@@ -114,6 +148,8 @@ void arch_regs_reset(struct vcpu *vcpu)
 	r->hyp_state.sctlr_el2 = get_sctlr_el2_value(vcpu->vm->el0_partition);
 	r->lazy.cnthctl_el2 = cnthctl;
 	if (vcpu->vm->el0_partition) {
+		pauth_el0_keys_reset(r);
+
 		CHECK(has_vhe_support());
 		/*
 		 * AArch64 hafnium only uses 8 bit ASIDs at the moment.
@@ -218,7 +254,7 @@ void arch_regs_set_retval(struct arch_regs *r, struct ffa_value v)
 	}
 }
 
-struct ffa_value arch_regs_get_args(struct arch_regs *regs)
+static struct ffa_value arch_regs_get_args_ext(struct arch_regs *regs)
 {
 	return (struct ffa_value){
 		.func = regs->r[0],
@@ -229,50 +265,42 @@ struct ffa_value arch_regs_get_args(struct arch_regs *regs)
 		.arg5 = regs->r[5],
 		.arg6 = regs->r[6],
 		.arg7 = regs->r[7],
-		.extended_val.valid = false,
+		.extended_val.valid = true,
+		.extended_val.arg8 = regs->r[8],
+		.extended_val.arg9 = regs->r[9],
+		.extended_val.arg10 = regs->r[10],
+		.extended_val.arg11 = regs->r[11],
+		.extended_val.arg12 = regs->r[12],
+		.extended_val.arg13 = regs->r[13],
+		.extended_val.arg14 = regs->r[14],
+		.extended_val.arg15 = regs->r[15],
+		.extended_val.arg16 = regs->r[16],
+		.extended_val.arg17 = regs->r[17],
 	};
 }
 
-/* Returns the SVE implemented VL in bytes (constrained by ZCR_EL3.LEN) */
-static uint64_t arch_cpu_sve_len_get(void)
+struct ffa_value arch_regs_get_args(struct arch_regs *regs)
 {
-	uint64_t vl;
+	uint32_t func_id = regs->r[0];
 
-	__asm__ volatile(
-		".arch_extension sve;"
-		"rdvl %0, #1;"
-		".arch_extension nosve;"
-		: "=r"(vl));
+	if (func_id == FFA_MSG_SEND_DIRECT_REQ2_64 ||
+	    func_id == FFA_MSG_SEND_DIRECT_RESP2_64 ||
+	    (func_id == FFA_CONSOLE_LOG_64 &&
+	     FFA_VERSION_1_2 <= FFA_VERSION_COMPILED)) {
+		return arch_regs_get_args_ext(regs);
+	}
 
-	return vl;
-}
-
-static void arch_cpu_sve_configure_sve_vector_length(void)
-{
-	uint64_t vl_bits;
-	uint32_t zcr_len;
-
-	/*
-	 * Set ZCR_EL2.LEN to the maximum vector length permitted by the
-	 * architecture which applies to EL2 and lower ELs (limited by the
-	 * HW implementation).
-	 * This is done so that the VL read by arch_cpu_sve_len_get isn't
-	 * constrained by EL2 and thus indirectly retrieves the value
-	 * constrained by EL3 which applies to EL3 and lower ELs (limited by
-	 * the HW implementation).
-	 */
-	write_msr(MSR_ZCR_EL2, ZCR_LEN_MAX);
-	isb();
-
-	vl_bits = arch_cpu_sve_len_get() << 3;
-	zcr_len = (vl_bits >> 7) - 1;
-
-	/*
-	 * Set ZCR_EL2.LEN to the discovered value which contrains the VL at
-	 * EL2 and lower ELs to the value set by EL3.
-	 */
-	write_msr(MSR_ZCR_EL2, zcr_len & ZCR_LEN_MASK);
-	isb();
+	return (struct ffa_value){
+		.func = func_id,
+		.arg1 = regs->r[1],
+		.arg2 = regs->r[2],
+		.arg3 = regs->r[3],
+		.arg4 = regs->r[4],
+		.arg5 = regs->r[5],
+		.arg6 = regs->r[6],
+		.arg7 = regs->r[7],
+		.extended_val.valid = false,
+	};
 }
 
 void arch_cpu_init(struct cpu *c)
@@ -289,11 +317,16 @@ void arch_cpu_init(struct cpu *c)
 	write_msr(CNTVOFF_EL2, 0);
 	isb();
 
-	if (is_arch_feat_sve_supported()) {
-		arch_cpu_sve_configure_sve_vector_length();
-	}
-
 	plat_interrupts_controller_hw_init(c);
+
+	/*
+	 * Initialize the interrupt associated with S-EL2 physical timer for
+	 * running core.
+	 */
+	host_timer_init();
+
+	/* Initialise IPIs for the current cpu. */
+	hf_ipi_init_interrupt();
 }
 
 struct vcpu *arch_vcpu_resume(struct cpu *c)

@@ -27,6 +27,7 @@ struct arch_vm {
 	struct {
 		uintreg_t id_aa64mmfr1_el1;
 		uintreg_t id_aa64pfr0_el1;
+		uintreg_t id_aa64pfr1_el1;
 		uintreg_t id_aa64dfr0_el1;
 		uintreg_t id_aa64isar1_el1;
 	} tid3_masks;
@@ -40,5 +41,11 @@ struct arch_vm {
 	 * the SPMC defining the SP non-secure IPA space.
 	 */
 	struct mm_ptable ptable_ns;
+
+	/**
+	 * Set of page tables used for definiting the peripheral's non-secure
+	 * IPA space, in the context of SPMC.
+	 */
+	struct mm_ptable iommu_ptables_ns[PARTITION_MAX_DMA_DEVICES];
 #endif
 };

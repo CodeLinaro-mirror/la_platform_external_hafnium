@@ -13,6 +13,9 @@ ENABLE_ASSERTIONS ?= 1
 
 PLATFORM ?= default
 
+LIST_SEPARATOR := ,
+PLATFORM_LIST := $(subst $(LIST_SEPARATOR), ,$(PLATFORM))
+
 GN_ARGS := project="$(PROJECT)"
 GN_ARGS += toolchain_lib="$(TOOLCHAIN_LIB)"
 ifeq ($(filter $(ENABLE_ASSERTIONS), 1 0),)
@@ -53,8 +56,10 @@ PREBUILTS := $(CURDIR)/prebuilts/$(UNAME_S)-$(UNAME_M)
 GN ?= $(PREBUILTS)/gn/gn
 NINJA ?= $(PREBUILTS)/ninja/ninja
 
-CHECKPATCH := $(CURDIR)/third_party/linux/scripts/checkpatch.pl \
-	--ignore BRACES,SPDX_LICENSE_TAG,VOLATILE,SPLIT_STRING,AVOID_EXTERNS,USE_SPINLOCK_T,NEW_TYPEDEFS,INITIALISED_STATIC,FILE_PATH_CHANGES,EMBEDDED_FUNCTION_NAME,SINGLE_STATEMENT_DO_WHILE_MACRO,MACRO_WITH_FLOW_CONTROL,PREFER_PACKED,PREFER_ALIGNED,INDENTED_LABEL,SPACING --quiet
+CHECKPATCH_SCRIPT:=$(CURDIR)/out/checkpatch/checkpatch.pl
+
+CHECKPATCH := $(CHECKPATCH_SCRIPT) \
+	--ignore BRACES,SPDX_LICENSE_TAG,VOLATILE,SPLIT_STRING,AVOID_EXTERNS,USE_SPINLOCK_T,NEW_TYPEDEFS,INITIALISED_STATIC,FILE_PATH_CHANGES,EMBEDDED_FUNCTION_NAME,SINGLE_STATEMENT_DO_WHILE_MACRO,MACRO_WITH_FLOW_CONTROL,PREFER_PACKED,PREFER_ALIGNED,INDENTED_LABEL,SPACING,PREFER_PRINTF --quiet
 
 # Specifies the grep pattern for ignoring specific files in checkpatch.
 # C++ headers, *.hh, are automatically excluded.
@@ -62,17 +67,24 @@ CHECKPATCH := $(CURDIR)/third_party/linux/scripts/checkpatch.pl \
 # debug_el1.c : uses XMACROS, which checkpatch doesn't understand.
 # perfmon.c : uses XMACROS, which checkpatch doesn't understand.
 # feature_id.c : uses XMACROS, which checkpatch doesn't understand.
-CHECKPATCH_IGNORE := "src/arch/aarch64/hypervisor/debug_el1.c\|src/arch/aarch64/hypervisor/perfmon.c\|src/arch/aarch64/hypervisor/feature_id.c"
+# el1_physical_timer.c : uses XMACROS, which checkpatch doesn't understand.
+CHECKPATCH_IGNORE := "src/arch/aarch64/hypervisor/debug_el1.c\|src/arch/aarch64/hypervisor/perfmon.c\|src/arch/aarch64/hypervisor/feature_id.c\|src/arch/aarch64/stack_protector.c\|src/arch/aarch64/inc/hf/arch/sve.h\|inc/hf/dlog.h\|inc/hf/arch/std.h\|inc/hf/panic.h\|inc/system/sys/cdefs.h\|inc/hf/bits.h\|src/arch/aarch64/hypervisor/el1_physical_timer.c"
+
+# el1_physical_timer.c : Use of macros causes a fail due to identical consecutive branches in switch.
+TIDY_IGNORE := "src/arch/aarch64/hypervisor/el1_physical_timer.c"
 
 OUT ?= out/$(PROJECT)
-OUT_DIR = out/$(PROJECT)
+OUT_DIR = $(OUT)
 
 .PHONY: all
 all: $(OUT_DIR)/build.ninja
-ifneq ($(PLATFORM),default)
-	@$(NINJA) -C $(OUT_DIR) project/$(PROJECT):$(PLATFORM)
-else
+ifeq ($(PLATFORM),default)
 	@$(NINJA) -C $(OUT_DIR)
+else
+	@build/check_platform_exists.py $(PROJECT) $(PLATFORM_LIST) || (exit 1)
+	@for PLAT in $(PLATFORM_LIST); do \
+		$(NINJA) -C $(OUT_DIR) project/$(PROJECT):$$PLAT; \
+	done
 endif
 
 $(OUT_DIR)/build.ninja:
@@ -88,7 +100,7 @@ clean:
 
 .PHONY: clobber
 clobber:
-	rm -rf $(OUT)
+	rm -rf $(OUT_DIR)
 
 # see .clang-format.
 .PHONY: format
@@ -102,11 +114,14 @@ format:
 	@find . \( -name \*.gn -o -name \*.gni \) | xargs -n1 $(GN) format
 
 .PHONY: checkpatch
-checkpatch:
-	@find src/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f
-	@find inc/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f
+checkpatch: $(CHECKPATCH_SCRIPT)
+	@find src/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
+	@find inc/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
 	# TODO: enable for test/
-	@find project/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f
+	@find project/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
+
+$(CHECKPATCH_SCRIPT):
+	@build/setup_checkpatch.sh
 
 # see .clang-tidy.
 .PHONY: tidy
@@ -115,16 +130,7 @@ tidy: $(OUT_DIR)/build.ninja
 	@echo "Tidying..."
 	# TODO: enable readability-magic-numbers once there are fewer violations.
 	# TODO: enable for c++ tests as it currently gives spurious errors.
-	@find src/ \( -name \*.c \) | xargs clang-tidy -p $(OUT_DIR) -fix
-	@find test/ \( -name \*.c \) | xargs clang-tidy -p $(OUT_DIR) -fix
-
-.PHONY: check
-check: $(OUT_DIR)/build.ninja
-	@$(NINJA) -C $(OUT_DIR)
-	@echo "Checking..."
-	# TODO: enable for c++ tests as it currently gives spurious errors.
-	@find src/ \( -name \*.c \) | xargs clang-check -p $(OUT_DIR) -analyze -fix-what-you-can
-	@find test/ \( -name \*.c \) | xargs clang-check -p $(OUT_DIR) -analyze -fix-what-you-can
+	@find src/ test/ -name '*.c' | grep -v $(TIDY_IGNORE) | xargs run-clang-tidy -quiet -p $(OUT_DIR) -fix
 
 .PHONY: license
 license:
@@ -136,13 +142,9 @@ license:
 	@find build/ -name \*.py -o -name \*.sh -o -name \*.inc -o -name Dockerfile* | xargs -n1 python3 build/license.py --style hash
 	@find kokoro/ -name \*.sh -o -name \*.cfg | xargs -n1 python3 build/license.py --style hash
 	@find test/ -name \*.py| xargs -n1 python3 build/license.py --style hash
-	@find . \( -path ./driver/linux -o -path ./third_party \) -prune -o \( -name \*.gn -o -name \*.gni \) -print | xargs -n1 python3 build/license.py --style hash
 
-.PHONY: update-prebuilts
-update-prebuilts: prebuilts/linux-aarch64/linux/vmlinuz
-
-prebuilts/linux-aarch64/linux/vmlinuz: $(OUT_DIR)/build.ninja
-	@$(NINJA) -C $(OUT_DIR) "third_party/linux"
-	cp out/reference/obj/third_party/linux/linux.bin $@
+.PHONY: list
+list:
+	@build/check_platform_exists.py $(PROJECT)
 
 endif  # HAFNIUM_HERMETIC_BUILD

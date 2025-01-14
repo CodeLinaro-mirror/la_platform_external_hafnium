@@ -100,6 +100,11 @@ bool feature_id_is_register_access(uintreg_t esr)
 #define ID_AA64PFR0_EL1_RAS (UINT64_C(0xf) << 28)
 
 /**
+ * Activity Monitor Unit.
+ */
+#define ID_AA64PFR0_EL1_AMU (UINT64_C(0xf) << 44)
+
+/**
  * Self-hosted Trace Extension Version
  */
 #define ID_AA64DFR0_EL1_TRACE_FILT (UINT64_C(0xf) << 40)
@@ -164,6 +169,7 @@ void feature_set_traps(struct vm *vm, struct arch_regs *regs)
 	/* By default do not mask out any features. */
 	vm->arch.tid3_masks.id_aa64mmfr1_el1 = ~0ULL;
 	vm->arch.tid3_masks.id_aa64pfr0_el1 = ~0ULL;
+	vm->arch.tid3_masks.id_aa64pfr1_el1 = ~0ULL;
 	vm->arch.tid3_masks.id_aa64dfr0_el1 = ~0ULL;
 	vm->arch.tid3_masks.id_aa64isar1_el1 = ~0ULL;
 
@@ -173,6 +179,16 @@ void feature_set_traps(struct vm *vm, struct arch_regs *regs)
 	 */
 	vm->arch.tid3_masks.id_aa64mmfr1_el1 &=
 		~(ID_AA64MMFR1_EL1_VH_MASK << ID_AA64MMFR1_EL1_VH_SHIFT);
+
+	if (features & HF_FEATURE_SVE) {
+		vm->arch.tid3_masks.id_aa64pfr0_el1 &= ~(
+			ID_AA64PFR0_EL1_SVE_MASK << ID_AA64PFR0_EL1_SVE_SHIFT);
+	}
+
+	if (features & HF_FEATURE_SME) {
+		vm->arch.tid3_masks.id_aa64pfr1_el1 &= ~(
+			ID_AA64PFR1_EL1_SME_MASK << ID_AA64PFR1_EL1_SME_SHIFT);
+	}
 
 	if (features & HF_FEATURE_RAS) {
 		regs->hyp_state.hcr_el2 |= HCR_EL2_TERR;
@@ -235,6 +251,10 @@ void feature_set_traps(struct vm *vm, struct arch_regs *regs)
 		vm->arch.tid3_masks.id_aa64isar1_el1 &= ~ID_AA64ISAR1_EL1_API;
 		vm->arch.tid3_masks.id_aa64isar1_el1 &= ~ID_AA64ISAR1_EL1_APA;
 	}
+
+	if (features & HF_FEATURE_AMU) {
+		vm->arch.tid3_masks.id_aa64pfr0_el1 &= ~ID_AA64PFR0_EL1_AMU;
+	}
 }
 
 /**
@@ -254,7 +274,8 @@ bool feature_id_process_access(struct vcpu *vcpu, uintreg_t esr)
 	if (!ISS_IS_READ(esr)) {
 		dlog_notice(
 			"Unsupported feature ID register write: "
-			"op0=%d, op1=%d, crn=%d, crm=%d, op2=%d, rt=%d.\n",
+			"op0=%lu, op1=%lu, crn=%lu, crm=%lu, op2=%lu, "
+			"rt=%lu.\n",
 			GET_ISS_OP0(esr), GET_ISS_OP1(esr), GET_ISS_CRN(esr),
 			GET_ISS_CRM(esr), GET_ISS_OP2(esr), GET_ISS_RT(esr));
 		return true;
@@ -272,7 +293,8 @@ bool feature_id_process_access(struct vcpu *vcpu, uintreg_t esr)
 		value = 0;
 		dlog_notice(
 			"Unsupported feature ID register read: "
-			"op0=%d, op1=%d, crn=%d, crm=%d, op2=%d, rt=%d.\n",
+			"op0=%lu, op1=%lu, crn=%lu, crm=%lu, op2=%lu, "
+			"rt=%lu.\n",
 			GET_ISS_OP0(esr), GET_ISS_OP1(esr), GET_ISS_CRN(esr),
 			GET_ISS_CRM(esr), GET_ISS_OP2(esr), GET_ISS_RT(esr));
 		break;
@@ -285,6 +307,9 @@ bool feature_id_process_access(struct vcpu *vcpu, uintreg_t esr)
 		break;
 	case ID_AA64PFR0_EL1_ENC:
 		value &= vm->arch.tid3_masks.id_aa64pfr0_el1;
+		break;
+	case ID_AA64PFR1_EL1_ENC:
+		value &= vm->arch.tid3_masks.id_aa64pfr1_el1;
 		break;
 	case ID_AA64DFR0_EL1_ENC:
 		value &= vm->arch.tid3_masks.id_aa64dfr0_el1;

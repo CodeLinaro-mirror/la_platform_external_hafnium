@@ -8,22 +8,30 @@
 
 #include "hf/arch/irq.h"
 #include "hf/arch/vm/interrupts.h"
+#include "hf/arch/vm/timer.h"
 
 #include "hf/mm.h"
 
 #include "vmapi/hf/call.h"
 
+#include "ap_refclk_generic_timer.h"
 #include "partition_services.h"
-#include "sp805.h"
 #include "sp_helpers.h"
+#include "test/abort.h"
 #include "test/hftest.h"
 #include "test/vmapi/arch/exception_handler.h"
 #include "test/vmapi/ffa.h"
-
-#define PLAT_ARM_TWDOG_BASE 0x2a490000
-#define PLAT_ARM_TWDOG_SIZE 0x20000
+#include "twdog.h"
 
 bool yield_while_handling_sec_interrupt = false;
+bool initiate_spmc_call_chain = false;
+bool preempt_interrupt_handling = false;
+
+/*
+ * This variable is set by the request that processes the arch timer commands
+ * from the PVM.
+ */
+extern uint32_t periodic_timer_ms;
 
 static void send_managed_exit_response(ffa_id_t dir_req_source_id)
 {
@@ -54,41 +62,103 @@ static void send_managed_exit_response(ffa_id_t dir_req_source_id)
 	HFTEST_LOG("Resuming the suspended command");
 }
 
+static void deactivate_interrupt_and_yield(uint32_t intid)
+{
+	/* Perform secure interrupt de-activation. */
+	ASSERT_EQ(hf_interrupt_deactivate(intid), 0);
+
+	if (yield_while_handling_sec_interrupt) {
+		struct ffa_value ret;
+		HFTEST_LOG("Yield cycles while handling secure interrupt");
+		ret = ffa_yield();
+
+		ASSERT_EQ(ret.func, FFA_SUCCESS_32);
+		HFTEST_LOG("Resuming secure interrupt handling");
+	}
+
+	exception_handler_set_last_interrupt(intid);
+}
+
 static void irq_current(void)
 {
 	uint32_t intid;
+	struct ffa_value ffa_ret;
 	ffa_id_t dir_req_source_id = hftest_get_dir_req_source_id();
+	ffa_id_t own_id = hf_vm_get_id();
 
 	intid = hf_interrupt_get();
 
-	if (intid == HF_MANAGED_EXIT_INTID) {
+	switch (intid) {
+	case HF_MANAGED_EXIT_INTID: {
 		HFTEST_LOG("vIRQ: Sending ME response to %x",
 			   dir_req_source_id);
 		send_managed_exit_response(dir_req_source_id);
-	} else {
-		ASSERT_EQ(intid, IRQ_TWDOG_INTID);
-
+		break;
+	}
+	case IRQ_TWDOG_INTID: {
 		/*
 		 * Interrupt triggered due to Trusted watchdog timer expiry.
 		 * Clear the interrupt and stop the timer.
 		 */
 		HFTEST_LOG("Trusted WatchDog timer stopped: %u", intid);
-		sp805_twdog_stop();
+		twdog_stop();
 
-		/* Perform secure interrupt de-activation. */
-		ASSERT_EQ(hf_interrupt_deactivate(intid), 0);
-
-		if (yield_while_handling_sec_interrupt) {
-			struct ffa_value ret;
+		if (initiate_spmc_call_chain) {
 			HFTEST_LOG(
-				"Yield cycles while handling secure interrupt");
-			ret = ffa_yield();
+				"Initiating call chain in SPMC scheduled mode");
+			/*
+			 * The current SP sends a direct request message to
+			 * another SP to mimic a long SPMC scheduled call
+			 * chain.
+			 */
+			ffa_ret = sp_sleep_cmd_send(
+				own_id, sp_find_next_endpoint(own_id), 50, 0);
+			ASSERT_EQ(ffa_ret.func, FFA_MSG_SEND_DIRECT_RESP_32);
+		} else if (preempt_interrupt_handling) {
+			/*
+			 * Trigger the timer interrupt to mimic a physical
+			 * interrupt preempting the current virtual interrupt
+			 * handling.
+			 */
+			program_ap_refclk_timer(1);
 
-			ASSERT_EQ(ret.func, FFA_SUCCESS_32);
-			HFTEST_LOG("Resuming secure interrupt handling");
+			/* Wait to make sure the generic timer interrupt
+			 * triggers. */
+			sp_sleep_active_wait(5);
 		}
 
+		deactivate_interrupt_and_yield(intid);
+		break;
+	}
+	case IRQ_AP_REFCLK_BASE1_INTID: {
+		/*
+		 * Interrupt triggered due to AP_REFCLK Generic timer expiry.
+		 * Clear the interrupt and stop the timer.
+		 */
+		HFTEST_LOG("AP_REFCLK timer stopped: %u", intid);
+		cancel_ap_refclk_timer();
+
+		deactivate_interrupt_and_yield(intid);
+		break;
+	}
+	case HF_VIRTUAL_TIMER_INTID: {
+		/* Disable the EL1 physical arch timer. */
+		timer_disable();
+		ASSERT_EQ(hf_interrupt_deactivate(intid), 0);
+
 		exception_handler_set_last_interrupt(intid);
+
+		/* Configure timer to expire periodically. */
+		timer_set(periodic_timer_ms);
+		timer_start();
+		HFTEST_LOG("EL1 Physical timer stopped and restarted");
+		break;
+	}
+	default:
+		HFTEST_LOG_FAILURE();
+		HFTEST_LOG(HFTEST_LOG_INDENT "Unsupported interrupt id: %u\n",
+			   intid);
+		abort();
 	}
 }
 
@@ -113,6 +183,11 @@ struct ffa_value sp_virtual_interrupt_cmd(ffa_id_t test_source,
 	exception_setup(irq_current, NULL);
 	sp_enable_irq();
 
+	/* Initialize the AP REFCLK Generic timer. */
+	if (interrupt_id == IRQ_AP_REFCLK_BASE1_INTID) {
+		init_ap_refclk_timer();
+	}
+
 	return sp_success(own_id, test_source, 0);
 }
 
@@ -120,22 +195,21 @@ struct ffa_value sp_twdog_cmd(ffa_id_t test_source, uint64_t time)
 {
 	ffa_id_t own_id = hf_vm_get_id();
 
-	HFTEST_LOG("Starting TWDOG: %u ms", time);
-	sp805_twdog_refresh();
-	sp805_twdog_start((time * ARM_SP805_TWDG_CLK_HZ) / 1000);
+	HFTEST_LOG("Starting TWDOG: %lu ms", time);
+	twdog_refresh();
+	twdog_start((time * ARM_SP805_TWDG_CLK_HZ) / 1000);
 
 	return sp_success(own_id, test_source, time);
 }
 
-struct ffa_value sp_twdog_map_cmd(ffa_id_t test_source)
+struct ffa_value sp_generic_timer_cmd(ffa_id_t test_source, uint64_t time_ms)
 {
 	ffa_id_t own_id = hf_vm_get_id();
 
-	/* Map peripheral(such as secure watchdog timer) address space. */
-	hftest_mm_identity_map((void*)PLAT_ARM_TWDOG_BASE, PLAT_ARM_TWDOG_SIZE,
-			       MM_MODE_R | MM_MODE_W | MM_MODE_D);
+	HFTEST_LOG("Starting Generic Timer: %lu ms", time_ms);
+	program_ap_refclk_timer(time_ms);
 
-	return sp_success(own_id, test_source, 0);
+	return sp_success(own_id, test_source, time_ms);
 }
 
 struct ffa_value sp_get_last_interrupt_cmd(ffa_id_t test_source)
@@ -161,44 +235,77 @@ static bool is_expected_sp_response(struct ffa_value ret,
 		return false;
 	}
 
-	if (sp_resp_value(ret) != expected_resp || (uint32_t)ret.arg4 != arg) {
-		HFTEST_LOG(
-			"Expected response %x and %x; "
-			"Obtained %x and %x",
-			expected_resp, arg, sp_resp_value(ret),
-			(int32_t)ret.arg4);
+	if (sp_resp_value(ret) != expected_resp || ret.arg4 != arg) {
+		HFTEST_LOG("Expected response %x and %x; Obtained %x and %lx",
+			   expected_resp, arg, sp_resp_value(ret), ret.arg4);
 		return false;
 	}
 
 	return true;
 }
 
-struct ffa_value sp_sleep_cmd(ffa_id_t source, uint32_t sleep_ms)
+static inline bool mask_interrupts(uint32_t options)
+{
+	return ((options & OPTIONS_MASK_INTERRUPTS) != 0);
+}
+
+static inline bool yield_direct_request(uint32_t options)
+{
+	return ((options & OPTIONS_YIELD_DIR_REQ) != 0);
+}
+
+struct ffa_value sp_sleep_cmd(ffa_id_t source, uint32_t sleep_ms,
+			      uint32_t options, uint64_t func)
 {
 	uint64_t time_lapsed;
 	ffa_id_t own_id = hf_vm_get_id();
+
+	if (mask_interrupts(options)) {
+		/* Mask virtual interrupts. */
+		sp_disable_irq();
+	}
+
+	if (yield_direct_request(options)) {
+		ffa_yield();
+	}
 
 	HFTEST_LOG("Request to sleep %x for %ums", own_id, sleep_ms);
 
 	time_lapsed = sp_sleep_active_wait(sleep_ms);
 
 	/* Lapsed time should be at least equal to sleep time. */
-	HFTEST_LOG("Sleep complete: %u", time_lapsed);
+	HFTEST_LOG("Sleep complete: %lu", time_lapsed);
 
+	if (func == FFA_MSG_SEND_DIRECT_REQ2_64) {
+		uint64_t msg[] = {0, time_lapsed};
+		return ffa_msg_send_direct_resp2(own_id, source,
+						 (const uint64_t *)&msg,
+						 ARRAY_SIZE(msg));
+	}
 	return sp_success(own_id, source, time_lapsed);
 }
 
+static inline bool get_hint_interrupted(uint32_t options)
+{
+	return ((options & OPTIONS_HINT_INTERRUPTED) != 0);
+}
+
 struct ffa_value sp_fwd_sleep_cmd(ffa_id_t source, uint32_t sleep_ms,
-				  ffa_id_t fwd_dest, bool hint_interrupted)
+				  ffa_id_t fwd_dest, uint32_t options)
 {
 	struct ffa_value ffa_ret;
 	ffa_id_t own_id = hf_vm_get_id();
 	bool fwd_dest_interrupted = false;
+	bool hint_interrupted = false;
 
 	HFTEST_LOG("VM%x requested %x to sleep for %ums", source, fwd_dest,
 		   sleep_ms);
 
-	ffa_ret = sp_sleep_cmd_send(own_id, fwd_dest, sleep_ms);
+	ffa_ret = sp_sleep_cmd_send(own_id, fwd_dest, sleep_ms, options);
+
+	if (get_hint_interrupted(options)) {
+		hint_interrupted = true;
+	}
 
 	/*
 	 * The target of the direct request could be pre-empted any number of
@@ -272,4 +379,21 @@ struct ffa_value sp_route_interrupt_to_target_vcpu_cmd(
 		"Request to route trusted wdog interrupt to target vCPU "
 		"denied\n");
 	return sp_error(own_id, source, 0);
+}
+
+struct ffa_value sp_prepare_spmc_call_chain_cmd(ffa_id_t source, bool initiate)
+{
+	ffa_id_t own_id = hf_vm_get_id();
+
+	initiate_spmc_call_chain = initiate;
+	return sp_success(own_id, source, 0);
+}
+
+struct ffa_value sp_prepare_preempt_interrupt_handling_cmd(ffa_id_t source,
+							   bool preempt)
+{
+	ffa_id_t own_id = hf_vm_get_id();
+
+	preempt_interrupt_handling = preempt;
+	return sp_success(own_id, source, 0);
 }

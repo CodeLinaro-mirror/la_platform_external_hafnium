@@ -10,18 +10,61 @@
 
 #include "hf/types.h"
 
-#define FFA_VERSION_MAJOR 0x1
-#define FFA_VERSION_MAJOR_OFFSET 16
-#define FFA_VERSION_MAJOR_MASK 0x7FFF
-#define FFA_VERSION_MINOR 0x1
-#define FFA_VERSION_MINOR_OFFSET 0
-#define FFA_VERSION_MINOR_MASK 0xFFFF
+/**
+ * The version number of a Firmware Framework implementation is a 31-bit
+ * unsigned integer, with the upper 15 bits denoting the major revision,
+ * and the lower 16 bits denoting the minor revision.
+ *
+ * See FF-A specification v1.2 ALP1, section 13.2.1.
+ */
+enum ffa_version {
+	FFA_VERSION_1_0 = 0x10000,
+	FFA_VERSION_1_1 = 0x10001,
+	FFA_VERSION_1_2 = 0x10002,
+	FFA_VERSION_COMPILED = FFA_VERSION_1_2,
+};
 
-#define MAKE_FFA_VERSION(major, minor)                                    \
-	((((major)&FFA_VERSION_MAJOR_MASK) << FFA_VERSION_MAJOR_OFFSET) | \
-	 (((minor)&FFA_VERSION_MINOR_MASK) << FFA_VERSION_MINOR_OFFSET))
-#define FFA_VERSION_COMPILED \
-	MAKE_FFA_VERSION(FFA_VERSION_MAJOR, FFA_VERSION_MINOR)
+#define FFA_VERSION_MBZ_BIT (1U << 31U)
+#define FFA_VERSION_MAJOR_SHIFT (16U)
+#define FFA_VERSION_MAJOR_MASK (0x7FFFU)
+#define FFA_VERSION_MINOR_SHIFT (0U)
+#define FFA_VERSION_MINOR_MASK (0xFFFFU)
+
+/** Return true if the version is valid (i.e. bit 31 is 0). */
+static inline bool ffa_version_is_valid(uint32_t version)
+{
+	return (version & FFA_VERSION_MBZ_BIT) == 0;
+}
+
+/** Construct a version from a pair of major and minor components. */
+static inline enum ffa_version make_ffa_version(uint16_t major, uint16_t minor)
+{
+	return (enum ffa_version)((major << FFA_VERSION_MAJOR_SHIFT) |
+				  (minor << FFA_VERSION_MINOR_SHIFT));
+}
+
+/** Get the major component of the version. */
+static inline uint16_t ffa_version_get_major(enum ffa_version version)
+{
+	return (version >> FFA_VERSION_MAJOR_SHIFT) & FFA_VERSION_MAJOR_MASK;
+}
+
+/** Get the minor component of the version. */
+static inline uint16_t ffa_version_get_minor(enum ffa_version version)
+{
+	return (version >> FFA_VERSION_MINOR_SHIFT) & FFA_VERSION_MINOR_MASK;
+}
+
+/**
+ * Check major versions are equal and the minor version of the caller is
+ * less than or equal to the minor version of the callee.
+ */
+static inline bool ffa_versions_are_compatible(enum ffa_version caller,
+					       enum ffa_version callee)
+{
+	return ffa_version_get_major(caller) == ffa_version_get_major(callee) &&
+	       ffa_version_get_minor(caller) <= ffa_version_get_minor(callee);
+}
 
 /* clang-format off */
 
@@ -56,9 +99,13 @@
 #define FFA_MSG_SEND_DIRECT_RESP_32         0x84000070
 #define FFA_MSG_SEND_DIRECT_RESP_64         0xC4000070
 #define FFA_MEM_DONATE_32                   0x84000071
+#define FFA_MEM_DONATE_64                   0xC4000071
 #define FFA_MEM_LEND_32                     0x84000072
+#define FFA_MEM_LEND_64                     0xC4000072
 #define FFA_MEM_SHARE_32                    0x84000073
+#define FFA_MEM_SHARE_64                    0xC4000073
 #define FFA_MEM_RETRIEVE_REQ_32             0x84000074
+#define FFA_MEM_RETRIEVE_REQ_64             0xC4000074
 #define FFA_MEM_RETRIEVE_RESP_32            0x84000075
 #define FFA_MEM_RELINQUISH_32               0x84000076
 #define FFA_MEM_RECLAIM_32                  0x84000077
@@ -83,25 +130,30 @@
 #define FFA_MEM_PERM_GET_64                 0xC4000088
 #define FFA_MEM_PERM_SET_64                 0xC4000089
 
-/* Implementation-defined ABIs. */
+/* FF-A v1.2 */
 #define FFA_CONSOLE_LOG_32                  0x8400008A
 #define FFA_CONSOLE_LOG_64                  0xC400008A
 #define FFA_PARTITION_INFO_GET_REGS_64      0xC400008B
 #define FFA_EL3_INTR_HANDLE_32              0x8400008C
+#define FFA_MSG_SEND_DIRECT_REQ2_64	    0xC400008D
+#define FFA_MSG_SEND_DIRECT_RESP2_64        0xC400008E
 
 /**
  * FF-A error codes.
  * Don't forget to update `ffa_error_name` if you add a new one.
  */
-#define FFA_NOT_SUPPORTED      INT32_C(-1)
-#define FFA_INVALID_PARAMETERS INT32_C(-2)
-#define FFA_NO_MEMORY          INT32_C(-3)
-#define FFA_BUSY               INT32_C(-4)
-#define FFA_INTERRUPTED        INT32_C(-5)
-#define FFA_DENIED             INT32_C(-6)
-#define FFA_RETRY              INT32_C(-7)
-#define FFA_ABORTED            INT32_C(-8)
-#define FFA_NO_DATA            INT32_C(-9)
+enum ffa_error {
+	FFA_NOT_SUPPORTED      = -1,
+	FFA_INVALID_PARAMETERS = -2,
+	FFA_NO_MEMORY          = -3,
+	FFA_BUSY               = -4,
+	FFA_INTERRUPTED        = -5,
+	FFA_DENIED             = -6,
+	FFA_RETRY              = -7,
+	FFA_ABORTED            = -8,
+	FFA_NO_DATA            = -9,
+	FFA_NOT_READY          = -10,
+};
 
 /* clang-format on */
 
@@ -159,6 +211,14 @@ static inline const char *ffa_func_name(uint32_t func)
 		return "FFA_MEM_SHARE_32";
 	case FFA_MEM_RETRIEVE_REQ_32:
 		return "FFA_MEM_RETRIEVE_REQ_32";
+	case FFA_MEM_DONATE_64:
+		return "FFA_MEM_DONATE_64";
+	case FFA_MEM_LEND_64:
+		return "FFA_MEM_LEND_64";
+	case FFA_MEM_SHARE_64:
+		return "FFA_MEM_SHARE_64";
+	case FFA_MEM_RETRIEVE_REQ_64:
+		return "FFA_MEM_RETRIEVE_REQ_64";
 	case FFA_MEM_RETRIEVE_RESP_32:
 		return "FFA_MEM_RETRIEVE_RESP_32";
 	case FFA_MEM_RELINQUISH_32:
@@ -220,7 +280,7 @@ static inline const char *ffa_func_name(uint32_t func)
 }
 
 /* Return the name of the error code. */
-static inline const char *ffa_error_name(int32_t error)
+static inline const char *ffa_error_name(enum ffa_error error)
 {
 	switch (error) {
 	case FFA_NOT_SUPPORTED:
@@ -241,43 +301,47 @@ static inline const char *ffa_error_name(int32_t error)
 		return "FFA_ABORTED";
 	case FFA_NO_DATA:
 		return "FFA_NO_DATA";
-	default:
-		return "UNKNOWN";
+	case FFA_NOT_READY:
+		return "FFA_NOT_READY";
 	}
+	return "UNKNOWN";
 }
 
 /**
- * FF-A Feature ID, to be used with interface FFA_FEATURES.
- * As defined in the FF-A v1.1 Beta specification, table 13.10, in section
- * 13.2.
+ * Defined in Table 3.1 in the FF-A v.1.2 memory management supplement.
+ * Input properties:
+ * - Bits[31:2] and Bit[0] are reserved (SBZ).
+ * Output properties:
+ * - Bit[0]: dynamically allocated buffer support.
+ * - Bit[1]: NS bit handling.
+ * - Bit[2]: support for retrieval by hypervisor.
+ * - Bits[31:3] are reserved (MBZ).
  */
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_BUFFER_SUPPORT (0U << 0U)
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT (1U << 1U)
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_HYPERVISOR_SUPPORT (1U << 2U)
 
-#define FFA_FEATURES_FUNC_ID_MASK (UINT32_C(1) << 31)
-#define FFA_FEATURES_FEATURE_ID_MASK UINT32_C(0x7F)
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_HI_BIT (31U)
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_LO_BIT (2U)
+#define FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_BIT (0U)
 
-/**
- * Defined in Table 13.14 in the FF-A v.1.1 REL0 specification.
- * Bits[31:2] and Bit[0] of input are reserved (must be zero).
- * Bit[0]: dynamically allocated buffer support.
- * Bit[1]: NS bit handling.
- * Bit[2]: support for retrieval by hypervisor.
- */
-#define FFA_FEATURES_MEM_RETRIEVE_REQ_BUFFER_SUPPORT 0
-#define FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT (UINT32_C(1) << 1)
-#define FFA_FEATURES_MEM_RETRIEVE_REQ_HYPERVISOR_SUPPORT (UINT32_C(1) << 2)
-#define FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_MASK            \
-	(~(FFA_FEATURES_MEM_RETRIEVE_REQ_BUFFER_SUPPORT | \
-	   FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT |     \
-	   FFA_FEATURES_MEM_RETRIEVE_REQ_HYPERVISOR_SUPPORT))
+enum ffa_feature_id {
+	/* Query interrupt ID of Notification Pending Interrupt. */
+	FFA_FEATURE_NPI = 1,
 
-/* Query interrupt ID of Notification Pending Interrupt. */
-#define FFA_FEATURE_NPI 0x1U
+	/* Query interrupt ID of Schedule Receiver Interrupt. */
+	FFA_FEATURE_SRI = 2,
 
-/* Query interrupt ID of Schedule Receiver Interrupt. */
-#define FFA_FEATURE_SRI 0x2U
+	/* Query interrupt ID of the Managed Exit Interrupt. */
+	FFA_FEATURE_MEI = 3,
+};
 
-/* Query interrupt ID of the Managed Exit Interrupt. */
-#define FFA_FEATURE_MEI 0x3U
+/** Constants for bitmasks used in FFA_FEATURES. */
+#define FFA_FEATURES_FEATURE_BIT (31U)
+#define FFA_FEATURES_FEATURE_MBZ_HI_BIT (30U)
+#define FFA_FEATURES_FEATURE_MBZ_LO_BIT (8U)
+
+#define FFA_FEATURES_NS_SUPPORT_BIT (1U)
 
 /* FF-A function specific constants. */
 #define FFA_MSG_RECV_BLOCK 0x1
@@ -294,6 +358,7 @@ static inline const char *ffa_error_name(int32_t error)
 #define FFA_MEM_PERM_RW UINT32_C(0x5)
 #define FFA_MEM_PERM_RX UINT32_C(0x3)
 
+#define FFA_MSG_WAIT_FLAG_RETAIN_RX UINT32_C(0x1)
 /*
  * Defined in Table 13.34 in the FF-A v1.1 EAC0 specification.
  * The Partition count flag is used by FFA_PARTITION_INFO_GET to specify
@@ -391,6 +456,20 @@ enum ffa_data_access {
 	FFA_DATA_ACCESS_RESERVED,
 };
 
+static inline const char *ffa_data_access_name(enum ffa_data_access data_access)
+{
+	switch (data_access) {
+	case FFA_DATA_ACCESS_NOT_SPECIFIED:
+		return "FFA_DATA_ACCESS_NOT_SPECIFIED";
+	case FFA_DATA_ACCESS_RO:
+		return "FFA_DATA_ACCESS_RO";
+	case FFA_DATA_ACCESS_RW:
+		return "FFA_DATA_ACCESS_RW";
+	case FFA_DATA_ACCESS_RESERVED:
+		return "FFA_DATA_ACCESS_RESERVED";
+	}
+}
+
 enum ffa_instruction_access {
 	FFA_INSTRUCTION_ACCESS_NOT_SPECIFIED,
 	FFA_INSTRUCTION_ACCESS_NX,
@@ -398,11 +477,38 @@ enum ffa_instruction_access {
 	FFA_INSTRUCTION_ACCESS_RESERVED,
 };
 
+static inline const char *ffa_instruction_access_name(
+	enum ffa_instruction_access instruction_access)
+{
+	switch (instruction_access) {
+	case FFA_INSTRUCTION_ACCESS_NOT_SPECIFIED:
+		return "FFA_INSTRUCTION_ACCESS_NOT_SPECIFIED";
+	case FFA_INSTRUCTION_ACCESS_NX:
+		return "FFA_INSTRUCTION_ACCESS_NX";
+	case FFA_INSTRUCTION_ACCESS_X:
+		return "FFA_INSTRUCTION_ACCESS_X";
+	case FFA_INSTRUCTION_ACCESS_RESERVED:
+		return "FFA_INSTRUCTION_ACCESS_RESERVED";
+	}
+}
+
 enum ffa_memory_type {
 	FFA_MEMORY_NOT_SPECIFIED_MEM,
 	FFA_MEMORY_DEVICE_MEM,
 	FFA_MEMORY_NORMAL_MEM,
 };
+
+static inline const char *ffa_memory_type_name(enum ffa_memory_type type)
+{
+	switch (type) {
+	case FFA_MEMORY_NOT_SPECIFIED_MEM:
+		return "FFA_MEMORY_NOT_SPECIFIED_MEM";
+	case FFA_MEMORY_DEVICE_MEM:
+		return "FFA_MEMORY_DEVICE_MEM";
+	case FFA_MEMORY_NORMAL_MEM:
+		return "FFA_MEMORY_NORMAL_MEM";
+	}
+}
 
 enum ffa_memory_cacheability {
 	FFA_MEMORY_CACHE_RESERVED = 0x0,
@@ -415,12 +521,57 @@ enum ffa_memory_cacheability {
 	FFA_MEMORY_DEV_GRE = 0x3,
 };
 
+static inline const char *ffa_memory_cacheability_name(
+	enum ffa_memory_cacheability cacheability)
+{
+	switch (cacheability) {
+	case FFA_MEMORY_CACHE_RESERVED:
+		return "FFA_MEMORY_CACHE_RESERVED";
+	case FFA_MEMORY_CACHE_NON_CACHEABLE:
+		return "FFA_MEMORY_CACHE_NON_CACHEABLE";
+	case FFA_MEMORY_CACHE_RESERVED_1:
+		return "FFA_MEMORY_CACHE_RESERVED_1";
+	case FFA_MEMORY_CACHE_WRITE_BACK:
+		return "FFA_MEMORY_CACHE_WRITE_BACK";
+	}
+}
+
+static inline const char *ffa_device_memory_cacheability_name(
+	enum ffa_memory_cacheability cacheability)
+{
+	switch (cacheability) {
+	case FFA_MEMORY_DEV_NGNRNE:
+		return "FFA_MEMORY_DEV_NGNRNE";
+	case FFA_MEMORY_DEV_NGNRE:
+		return "FFA_MEMORY_DEV_NGNRE";
+	case FFA_MEMORY_DEV_NGRE:
+		return "FFA_MEMORY_DEV_NGRE";
+	case FFA_MEMORY_DEV_GRE:
+		return "FFA_MEMORY_DEV_GRE";
+	}
+}
+
 enum ffa_memory_shareability {
 	FFA_MEMORY_SHARE_NON_SHAREABLE,
 	FFA_MEMORY_SHARE_RESERVED,
 	FFA_MEMORY_OUTER_SHAREABLE,
 	FFA_MEMORY_INNER_SHAREABLE,
 };
+
+static inline const char *ffa_memory_shareability_name(
+	enum ffa_memory_shareability shareability)
+{
+	switch (shareability) {
+	case FFA_MEMORY_SHARE_NON_SHAREABLE:
+		return "FFA_MEMORY_SHARE_NON_SHAREABLE";
+	case FFA_MEMORY_SHARE_RESERVED:
+		return "FFA_MEMORY_SHARE_RESERVED";
+	case FFA_MEMORY_OUTER_SHAREABLE:
+		return "FFA_MEMORY_OUTER_SHAREABLE";
+	case FFA_MEMORY_INNER_SHAREABLE:
+		return "FFA_MEMORY_INNER_SHAREABLE";
+	}
+}
 
 /**
  * FF-A v1.1 REL0 Table 10.18 memory region attributes descriptor NS Bit 6.
@@ -433,78 +584,36 @@ enum ffa_memory_security {
 	FFA_MEMORY_SECURITY_NON_SECURE,
 };
 
-typedef uint8_t ffa_memory_access_permissions_t;
+static inline const char *ffa_memory_security_name(
+	enum ffa_memory_security security)
+{
+	switch (security) {
+	case FFA_MEMORY_SECURITY_UNSPECIFIED:
+		return "FFA_MEMORY_SECURITY_UNSPECIFIED";
+	case FFA_MEMORY_SECURITY_NON_SECURE:
+		return "FFA_MEMORY_SECURITY_NON_SECURE";
+	}
+}
+
+typedef struct {
+	uint8_t data_access : 2;
+	uint8_t instruction_access : 2;
+} ffa_memory_access_permissions_t;
 
 /**
  * This corresponds to table 10.18 of the FF-A v1.1 EAC0 specification, "Memory
  * region attributes descriptor".
  */
-typedef uint16_t ffa_memory_attributes_t;
+typedef struct {
+	uint8_t shareability : 2;
+	uint8_t cacheability : 2;
+	uint8_t type : 2;
+	uint8_t security : 2;
+	uint8_t : 8;
+} ffa_memory_attributes_t;
 
 /* FF-A v1.1 EAC0 states bit [15:7] Must Be Zero. */
 #define FFA_MEMORY_ATTRIBUTES_MBZ_MASK 0xFF80U
-
-#define FFA_DATA_ACCESS_OFFSET (0x0U)
-#define FFA_DATA_ACCESS_MASK ((0x3U) << FFA_DATA_ACCESS_OFFSET)
-
-#define FFA_INSTRUCTION_ACCESS_OFFSET (0x2U)
-#define FFA_INSTRUCTION_ACCESS_MASK ((0x3U) << FFA_INSTRUCTION_ACCESS_OFFSET)
-
-#define FFA_MEMORY_TYPE_OFFSET (0x4U)
-#define FFA_MEMORY_TYPE_MASK ((0x3U) << FFA_MEMORY_TYPE_OFFSET)
-
-#define FFA_MEMORY_SECURITY_OFFSET (0x6U)
-#define FFA_MEMORY_SECURITY_MASK ((0x1U) << FFA_MEMORY_SECURITY_OFFSET)
-
-#define FFA_MEMORY_CACHEABILITY_OFFSET (0x2U)
-#define FFA_MEMORY_CACHEABILITY_MASK ((0x3U) << FFA_MEMORY_CACHEABILITY_OFFSET)
-
-#define FFA_MEMORY_SHAREABILITY_OFFSET (0x0U)
-#define FFA_MEMORY_SHAREABILITY_MASK ((0x3U) << FFA_MEMORY_SHAREABILITY_OFFSET)
-
-#define ATTR_FUNCTION_SET(name, container_type, offset, mask)                \
-	static inline void ffa_set_##name##_attr(container_type *attr,       \
-						 const enum ffa_##name perm) \
-	{                                                                    \
-		*attr = (*attr & ~(mask)) | ((perm << offset) & mask);       \
-	}
-
-#define ATTR_FUNCTION_GET(name, container_type, offset, mask)      \
-	static inline enum ffa_##name ffa_get_##name##_attr(       \
-		container_type attr)                               \
-	{                                                          \
-		return (enum ffa_##name)((attr & mask) >> offset); \
-	}
-
-ATTR_FUNCTION_SET(data_access, ffa_memory_access_permissions_t,
-		  FFA_DATA_ACCESS_OFFSET, FFA_DATA_ACCESS_MASK)
-ATTR_FUNCTION_GET(data_access, ffa_memory_access_permissions_t,
-		  FFA_DATA_ACCESS_OFFSET, FFA_DATA_ACCESS_MASK)
-
-ATTR_FUNCTION_SET(instruction_access, ffa_memory_access_permissions_t,
-		  FFA_INSTRUCTION_ACCESS_OFFSET, FFA_INSTRUCTION_ACCESS_MASK)
-ATTR_FUNCTION_GET(instruction_access, ffa_memory_access_permissions_t,
-		  FFA_INSTRUCTION_ACCESS_OFFSET, FFA_INSTRUCTION_ACCESS_MASK)
-
-ATTR_FUNCTION_SET(memory_type, ffa_memory_attributes_t, FFA_MEMORY_TYPE_OFFSET,
-		  FFA_MEMORY_TYPE_MASK)
-ATTR_FUNCTION_GET(memory_type, ffa_memory_attributes_t, FFA_MEMORY_TYPE_OFFSET,
-		  FFA_MEMORY_TYPE_MASK)
-
-ATTR_FUNCTION_SET(memory_cacheability, ffa_memory_attributes_t,
-		  FFA_MEMORY_CACHEABILITY_OFFSET, FFA_MEMORY_CACHEABILITY_MASK)
-ATTR_FUNCTION_GET(memory_cacheability, ffa_memory_attributes_t,
-		  FFA_MEMORY_CACHEABILITY_OFFSET, FFA_MEMORY_CACHEABILITY_MASK)
-
-ATTR_FUNCTION_SET(memory_shareability, ffa_memory_attributes_t,
-		  FFA_MEMORY_SHAREABILITY_OFFSET, FFA_MEMORY_SHAREABILITY_MASK)
-ATTR_FUNCTION_GET(memory_shareability, ffa_memory_attributes_t,
-		  FFA_MEMORY_SHAREABILITY_OFFSET, FFA_MEMORY_SHAREABILITY_MASK)
-
-ATTR_FUNCTION_SET(memory_security, ffa_memory_attributes_t,
-		  FFA_MEMORY_SECURITY_OFFSET, FFA_MEMORY_SECURITY_MASK)
-ATTR_FUNCTION_GET(memory_security, ffa_memory_attributes_t,
-		  FFA_MEMORY_SECURITY_OFFSET, FFA_MEMORY_SECURITY_MASK)
 
 /**
  * A globally-unique ID assigned by the hypervisor for a region of memory being
@@ -566,9 +675,10 @@ static inline uint32_t ffa_func_id(struct ffa_value args)
 	return args.func;
 }
 
-static inline int32_t ffa_error_code(struct ffa_value val)
+static inline enum ffa_error ffa_error_code(struct ffa_value val)
 {
-	return (int32_t)val.arg2;
+	/* NOLINTNEXTLINE(EnumCastOutOfRange) */
+	return (enum ffa_error)val.arg2;
 }
 
 static inline ffa_id_t ffa_sender(struct ffa_value args)
@@ -666,9 +776,51 @@ static inline uint32_t ffa_feature_intid(struct ffa_value args)
 	return (uint32_t)args.arg2;
 }
 
-static inline uint32_t ffa_fwk_msg(struct ffa_value args)
+#define FFA_FRAMEWORK_MSG_BIT (UINT64_C(1) << 31)
+#define FFA_FRAMEWORK_MSG_FUNC_MASK UINT64_C(0xFF)
+
+/**
+ * Identifies the VM availability message. See section 18.3 of v1.2 FF-A
+ * specification.
+ */
+enum ffa_framework_msg_func {
+	FFA_FRAMEWORK_MSG_VM_CREATION_REQ = 4,
+	FFA_FRAMEWORK_MSG_VM_CREATION_RESP = 5,
+
+	FFA_FRAMEWORK_MSG_VM_DESTRUCTION_REQ = 6,
+	FFA_FRAMEWORK_MSG_VM_DESTRUCTION_RESP = 7,
+};
+
+#define FFA_VM_AVAILABILITY_MESSAGE_SBZ_LO 16
+#define FFA_VM_AVAILABILITY_MESSAGE_SBZ_HI 31
+
+/** Get the `flags` field of a framework message */
+static inline uint32_t ffa_framework_msg_flags(struct ffa_value args)
 {
 	return (uint32_t)args.arg2;
+}
+
+/** Is `args` a framework message? */
+static inline bool ffa_is_framework_msg(struct ffa_value args)
+{
+	return (args.func != FFA_MSG_SEND_DIRECT_REQ2_64) &&
+	       (args.func != FFA_MSG_SEND_DIRECT_RESP2_64) &&
+	       ((ffa_framework_msg_flags(args) & FFA_FRAMEWORK_MSG_BIT) != 0);
+}
+
+/**
+ * Get the ID of the VM that has been created/destroyed from VM availability
+ * message
+ */
+static inline ffa_id_t ffa_vm_availability_message_vm_id(struct ffa_value args)
+{
+	return args.arg5 & 0xFFFF;
+}
+
+/** Get the function ID from a framework message */
+static inline uint32_t ffa_framework_msg_func(struct ffa_value args)
+{
+	return ffa_framework_msg_flags(args) & FFA_FRAMEWORK_MSG_FUNC_MASK;
 }
 
 /**
@@ -702,23 +854,51 @@ static inline bool ffa_uuid_equal(const struct ffa_uuid *uuid1,
 
 static inline bool ffa_uuid_is_null(const struct ffa_uuid *uuid)
 {
-	return (uuid->uuid[0] == 0) && (uuid->uuid[1] == 0) &&
-	       (uuid->uuid[2] == 0) && (uuid->uuid[3] == 0);
+	struct ffa_uuid null = {0};
+
+	return ffa_uuid_equal(uuid, &null);
+}
+
+static inline void ffa_uuid_from_u64x2(uint64_t uuid_lo, uint64_t uuid_hi,
+				       struct ffa_uuid *uuid)
+{
+	ffa_uuid_init((uint32_t)(uuid_lo & 0xFFFFFFFFU),
+		      (uint32_t)(uuid_lo >> 32),
+		      (uint32_t)(uuid_hi & 0xFFFFFFFFU),
+		      (uint32_t)(uuid_hi >> 32), uuid);
+}
+
+/**
+ * Split `uuid` into two u64s.
+ * This function writes to pointer parameters because C does not allow returning
+ * arrays from functions.
+ */
+static inline void ffa_uuid_to_u64x2(uint64_t *lo, uint64_t *hi,
+				     const struct ffa_uuid *uuid)
+{
+	*lo = (uint64_t)uuid->uuid[1] << 32 | uuid->uuid[0];
+	*hi = (uint64_t)uuid->uuid[3] << 32 | uuid->uuid[2];
 }
 
 /**
  * Flags to determine the partition properties, as required by
  * FFA_PARTITION_INFO_GET.
  *
- * The values of the flags are specified in table 8.25 of DEN0077A FF-A 1.0 REL
+ * The values of the flags are specified in table 6.2 of DEN0077A FF-A 1.2 ALP0
  * specification, "Partition information descriptor, partition properties".
  */
 typedef uint32_t ffa_partition_properties_t;
 
-/** Partition property: partition supports receipt of direct requests. */
+/**
+ * Partition property: partition supports receipt of direct requests via the
+ * FFA_MSG_SEND_DIRECT_REQ ABI.
+ */
 #define FFA_PARTITION_DIRECT_REQ_RECV (UINT32_C(1) << 0)
 
-/** Partition property: partition can send direct requests. */
+/**
+ * Partition property: partition can send direct requests via the
+ * FFA_MSG_SEND_DIRECT_REQ ABI.
+ */
 #define FFA_PARTITION_DIRECT_REQ_SEND (UINT32_C(1) << 1)
 
 /** Partition property: partition can send and receive indirect messages. */
@@ -727,8 +907,32 @@ typedef uint32_t ffa_partition_properties_t;
 /** Partition property: partition can receive notifications. */
 #define FFA_PARTITION_NOTIFICATION (UINT32_C(1) << 3)
 
+/**
+ * Partition property: partition must be informed about each VM that is created
+ * by the Hypervisor.
+ */
+#define FFA_PARTITION_VM_CREATED (UINT32_C(1) << 6)
+
+/**
+ * Partition property: partition must be informed about each VM that is
+ * destroyed by the Hypervisor.
+ */
+#define FFA_PARTITION_VM_DESTROYED (UINT32_C(1) << 7)
+
 /** Partition property: partition runs in the AArch64 execution state. */
 #define FFA_PARTITION_AARCH64_EXEC (UINT32_C(1) << 8)
+
+/**
+ * Partition property: partition supports receipt of direct requests via the
+ * FFA_MSG_SEND_DIRECT_REQ2 ABI.
+ */
+#define FFA_PARTITION_DIRECT_REQ2_RECV (UINT32_C(1) << 9)
+
+/**
+ * Partition property: partition can send direct requests via the
+ * FFA_MSG_SEND_DIRECT_REQ2 ABI.
+ */
+#define FFA_PARTITION_DIRECT_REQ2_SEND (UINT32_C(1) << 10)
 
 /**
  * Holds information returned for each partition by the FFA_PARTITION_INFO_GET
@@ -834,7 +1038,7 @@ struct ffa_boot_info_header {
  * FF-A v1.1 specification restricts the number of notifications to a maximum
  * of 64. Following all possible bitmaps.
  */
-#define FFA_NOTIFICATION_MASK(ID) (UINT64_C(1) << ID)
+#define FFA_NOTIFICATION_MASK(ID) (UINT64_C(1) << (ID))
 
 typedef uint64_t ffa_notifications_bitmap_t;
 
@@ -935,8 +1139,9 @@ static inline ffa_vcpu_index_t ffa_notifications_get_vcpu(struct ffa_value args)
  */
 #define FFA_NOTIFICATIONS_LISTS_COUNT_SHIFT 0x7U
 #define FFA_NOTIFICATIONS_LISTS_COUNT_MASK 0x1fU
-#define FFA_NOTIFICATIONS_LIST_SHIFT(l) (2 * (l - 1) + 12)
+#define FFA_NOTIFICATIONS_LIST_SHIFT(l) (2 * ((l) - 1) + 12)
 #define FFA_NOTIFICATIONS_LIST_SIZE_MASK 0x3U
+#define FFA_NOTIFICATIONS_LIST_MAX_SIZE 0x4U
 
 static inline uint32_t ffa_notification_info_get_lists_count(
 	struct ffa_value args)
@@ -956,6 +1161,11 @@ static inline bool ffa_notification_info_get_more_pending(struct ffa_value args)
 {
 	return (args.arg2 & FFA_NOTIFICATIONS_INFO_GET_FLAG_MORE_PENDING) != 0U;
 }
+
+void ffa_notification_info_get_and_check(
+	const uint32_t expected_lists_count,
+	const uint32_t *const expected_lists_sizes,
+	const uint16_t *const expected_ids);
 
 /**
  * A set of contiguous pages which is part of a memory region. This corresponds
@@ -1054,6 +1264,20 @@ typedef uint32_t ffa_memory_region_flags_t;
 #define FFA_MEMORY_REGION_ADDRESS_RANGE_HINT_MASK ((0xFU) << 5)
 
 /**
+ * Struct to store the impdef value seen in Table 11.16 of the
+ * FF-A v1.2 ALP0 specification "Endpoint memory access descriptor".
+ */
+struct ffa_memory_access_impdef {
+	uint64_t val[2];
+};
+
+static inline struct ffa_memory_access_impdef ffa_memory_access_impdef_init(
+	uint64_t impdef_hi, uint64_t impdef_lo)
+{
+	return (struct ffa_memory_access_impdef){{impdef_hi, impdef_lo}};
+}
+
+/**
  * This corresponds to table 10.16 of the FF-A v1.1 EAC0 specification,
  * "Endpoint memory access descriptor".
  */
@@ -1064,6 +1288,7 @@ struct ffa_memory_access {
 	 * an `ffa_composite_memory_region` struct.
 	 */
 	uint32_t composite_memory_region_offset;
+	struct ffa_memory_access_impdef impdef;
 	uint64_t reserved_0;
 };
 
@@ -1105,13 +1330,6 @@ struct ffa_memory_region {
 	uint32_t receivers_offset;
 	/** Reserved field (12 bytes) must be 0. */
 	uint32_t reserved[3];
-	/**
-	 * An array of `receiver_count` endpoint memory access descriptors.
-	 * Each one specifies a memory region offset, an endpoint and the
-	 * attributes with which this memory region should be mapped in that
-	 * endpoint's page table.
-	 */
-	struct ffa_memory_access receivers[];
 };
 
 /**
@@ -1127,6 +1345,71 @@ struct ffa_mem_relinquish {
 };
 
 /**
+ * Returns the first FF-A version that matches the memory access descriptor
+ * size.
+ */
+enum ffa_version ffa_version_from_memory_access_desc_size(
+	uint32_t memory_access_desc_size);
+
+/**
+ * To maintain forwards compatability we can't make assumptions about the size
+ * of the endpoint memory access descriptor so provide a helper function
+ * to get a receiver from the receiver array using the memory access descriptor
+ * size field from the memory region descriptor struct.
+ * Returns NULL if we cannot return the receiver.
+ */
+static inline struct ffa_memory_access *ffa_memory_region_get_receiver(
+	struct ffa_memory_region *memory_region, uint32_t receiver_index)
+{
+	uint32_t memory_access_desc_size =
+		memory_region->memory_access_desc_size;
+
+	if (receiver_index >= memory_region->receiver_count) {
+		return NULL;
+	}
+
+	/*
+	 * Memory access descriptor size cannot be greater than the size of
+	 * the memory access descriptor defined by the current FF-A version.
+	 */
+	if (memory_access_desc_size > sizeof(struct ffa_memory_access)) {
+		return NULL;
+	}
+
+	/* Check we cannot use receivers offset to cause overflow. */
+	if (memory_region->receivers_offset !=
+	    sizeof(struct ffa_memory_region)) {
+		return NULL;
+	}
+
+	return (struct ffa_memory_access
+			*)((uint8_t *)memory_region +
+			   (size_t)memory_region->receivers_offset +
+			   (size_t)(receiver_index * memory_access_desc_size));
+}
+
+/**
+ * Gets the receiver's access permissions from 'struct ffa_memory_region' and
+ * returns its index in the receiver's array. If receiver's ID doesn't exist
+ * in the array, return the region's 'receivers_count'.
+ */
+static inline uint32_t ffa_memory_region_get_receiver_index(
+	struct ffa_memory_region *memory_region, ffa_id_t receiver_id)
+{
+	uint32_t i;
+
+	for (i = 0U; i < memory_region->receiver_count; i++) {
+		struct ffa_memory_access *receiver =
+			ffa_memory_region_get_receiver(memory_region, i);
+		if (receiver->receiver_permissions.receiver == receiver_id) {
+			break;
+		}
+	}
+
+	return i;
+}
+
+/**
  * Gets the `ffa_composite_memory_region` for the given receiver from an
  * `ffa_memory_region`, or NULL if it is not valid.
  */
@@ -1134,9 +1417,15 @@ static inline struct ffa_composite_memory_region *
 ffa_memory_region_get_composite(struct ffa_memory_region *memory_region,
 				uint32_t receiver_index)
 {
-	uint32_t offset = memory_region->receivers[receiver_index]
-				  .composite_memory_region_offset;
+	struct ffa_memory_access *receiver =
+		ffa_memory_region_get_receiver(memory_region, receiver_index);
+	uint32_t offset;
 
+	if (receiver == NULL) {
+		return NULL;
+	}
+
+	offset = receiver->composite_memory_region_offset;
 	if (offset == 0) {
 		return NULL;
 	}
@@ -1160,6 +1449,45 @@ static inline uint32_t ffa_mem_relinquish_init(
 void ffa_copy_memory_region_constituents(
 	struct ffa_memory_region_constituent *dest,
 	const struct ffa_memory_region_constituent *src);
+
+struct ffa_features_rxtx_map_params {
+	/*
+	 * Bit[0:1]:
+	 * Minimum buffer size and alignment boundary:
+	 * 0b00: 4K
+	 * 0b01: 64K
+	 * 0b10: 16K
+	 * 0b11: Reserved
+	 */
+	uint8_t min_buf_size : 2;
+	/*
+	 * Bit[2:15]:
+	 * Reserved (MBZ)
+	 */
+	uint16_t mbz : 14;
+	/*
+	 * Bit[16:32]:
+	 * Maximum buffer size in number of pages
+	 * Only present on version 1.2 or later
+	 */
+	uint16_t max_buf_size : 16;
+};
+
+enum ffa_features_rxtx_map_buf_size {
+	FFA_RXTX_MAP_MIN_BUF_4K = 0,
+	FFA_RXTX_MAP_MAX_BUF_PAGE_COUNT = 1,
+};
+
+static inline struct ffa_features_rxtx_map_params ffa_features_rxtx_map_params(
+	struct ffa_value args)
+{
+	struct ffa_features_rxtx_map_params params;
+	uint32_t arg2 = args.arg2;
+
+	params = *(struct ffa_features_rxtx_map_params *)(&arg2);
+
+	return params;
+}
 
 /**
  * Endpoint RX/TX descriptor, as defined by Table 13.27 in FF-A v1.1 EAC0.
@@ -1187,16 +1515,16 @@ struct ffa_endpoint_rx_tx_descriptor {
 };
 
 static inline struct ffa_composite_memory_region *
-ffa_enpoint_get_rx_memory_region(struct ffa_endpoint_rx_tx_descriptor *desc)
+ffa_endpoint_get_rx_memory_region(struct ffa_endpoint_rx_tx_descriptor *desc)
 {
-	return (struct ffa_composite_memory_region *)((uintptr_t)desc +
+	return (struct ffa_composite_memory_region *)((char *)desc +
 						      desc->rx_offset);
 }
 
 static inline struct ffa_composite_memory_region *
-ffa_enpoint_get_tx_memory_region(struct ffa_endpoint_rx_tx_descriptor *desc)
+ffa_endpoint_get_tx_memory_region(struct ffa_endpoint_rx_tx_descriptor *desc)
 {
-	return (struct ffa_composite_memory_region *)((uintptr_t)desc +
+	return (struct ffa_composite_memory_region *)((char *)desc +
 						      desc->tx_offset);
 }
 
@@ -1205,12 +1533,14 @@ void ffa_memory_region_init_header(struct ffa_memory_region *memory_region,
 				   ffa_memory_attributes_t attributes,
 				   ffa_memory_region_flags_t flags,
 				   ffa_memory_handle_t handle, uint32_t tag,
-				   uint32_t receiver_count);
-void ffa_memory_access_init_permissions(
-	struct ffa_memory_access *receiver, ffa_id_t receiver_id,
-	enum ffa_data_access data_access,
-	enum ffa_instruction_access instruction_access,
-	ffa_memory_receiver_flags_t flags);
+				   uint32_t receiver_count,
+				   uint32_t receiver_desc_size);
+void ffa_memory_access_init(struct ffa_memory_access *receiver,
+			    ffa_id_t receiver_id,
+			    enum ffa_data_access data_access,
+			    enum ffa_instruction_access instruction_access,
+			    ffa_memory_receiver_flags_t flags,
+			    struct ffa_memory_access_impdef *impdef_val);
 uint32_t ffa_memory_region_init_single_receiver(
 	struct ffa_memory_region *memory_region, size_t memory_region_max_size,
 	ffa_id_t sender, ffa_id_t receiver,
@@ -1219,12 +1549,13 @@ uint32_t ffa_memory_region_init_single_receiver(
 	ffa_memory_region_flags_t flags, enum ffa_data_access data_access,
 	enum ffa_instruction_access instruction_access,
 	enum ffa_memory_type type, enum ffa_memory_cacheability cacheability,
-	enum ffa_memory_shareability shareability, uint32_t *fragment_length,
+	enum ffa_memory_shareability shareability,
+	struct ffa_memory_access_impdef *impdef_val, uint32_t *fragment_length,
 	uint32_t *total_length);
 uint32_t ffa_memory_region_init(
 	struct ffa_memory_region *memory_region, size_t memory_region_max_size,
 	ffa_id_t sender, struct ffa_memory_access receivers[],
-	uint32_t receiver_count,
+	uint32_t receiver_count, uint32_t receiver_desc_size,
 	const struct ffa_memory_region_constituent constituents[],
 	uint32_t constituent_count, uint32_t tag,
 	ffa_memory_region_flags_t flags, enum ffa_memory_type type,
@@ -1234,8 +1565,9 @@ uint32_t ffa_memory_region_init(
 uint32_t ffa_memory_retrieve_request_init(
 	struct ffa_memory_region *memory_region, ffa_memory_handle_t handle,
 	ffa_id_t sender, struct ffa_memory_access receivers[],
-	uint32_t receiver_count, uint32_t tag, ffa_memory_region_flags_t flags,
-	enum ffa_memory_type type, enum ffa_memory_cacheability cacheability,
+	uint32_t receiver_count, uint32_t receiver_desc_size, uint32_t tag,
+	ffa_memory_region_flags_t flags, enum ffa_memory_type type,
+	enum ffa_memory_cacheability cacheability,
 	enum ffa_memory_shareability shareability);
 uint32_t ffa_memory_retrieve_request_init_single_receiver(
 	struct ffa_memory_region *memory_region, ffa_memory_handle_t handle,
@@ -1243,7 +1575,8 @@ uint32_t ffa_memory_retrieve_request_init_single_receiver(
 	ffa_memory_region_flags_t flags, enum ffa_data_access data_access,
 	enum ffa_instruction_access instruction_access,
 	enum ffa_memory_type type, enum ffa_memory_cacheability cacheability,
-	enum ffa_memory_shareability shareability);
+	enum ffa_memory_shareability shareability,
+	struct ffa_memory_access_impdef *impdef_val);
 uint32_t ffa_memory_lender_retrieve_request_init(
 	struct ffa_memory_region *memory_region, ffa_memory_handle_t handle,
 	ffa_id_t sender);

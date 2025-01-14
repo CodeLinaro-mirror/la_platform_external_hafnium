@@ -633,7 +633,7 @@ uint64_t arch_mm_mode_to_stage2_attrs(uint32_t mode)
 	 */
 	if (mode & MM_MODE_D) {
 		attrs |= STAGE2_MEMATTR(STAGE2_DEVICE_MEMORY,
-					STAGE2_MEMATTR_DEVICE_GRE);
+					STAGE2_MEMATTR_DEVICE_nGnRnE);
 	} else {
 		attrs |= STAGE2_MEMATTR(STAGE2_WRITEBACK, STAGE2_WRITEBACK);
 	}
@@ -791,7 +791,7 @@ bool arch_mm_init(paddr_t table)
 	/* Check the physical address range. */
 	if (!pa_bits) {
 		dlog_error(
-			"Unsupported value of id_aa64mmfr0_el1.PARange: %x\n",
+			"Unsupported value of id_aa64mmfr0_el1.PARange: %lx\n",
 			pa_range);
 		return false;
 	}
@@ -857,8 +857,7 @@ bool arch_mm_init(paddr_t table)
 		nsa_nsw = 0;
 	}
 
-	arch_mm_config = (struct arch_mm_config)
-	{
+	arch_mm_config = (struct arch_mm_config){
 		.ttbr0_el2 = pa_addr(table),
 
 		.vtcr_el2 = (1U << 31) |       /* RES1. */
@@ -879,11 +878,11 @@ bool arch_mm_init(paddr_t table)
 		 * 0xf0 -> Tagged Normal, Inner/Outer Write-Back,
 		 *         Read/Write-Alloc non-transient memory.
 		 */
-			.mair_el2 = (0 << (8 * STAGE1_DEVICEINDX)) |
+		.mair_el2 = (0 << (8 * STAGE1_DEVICEINDX)) |
 #if ENABLE_MTE
-				    (0xf0 << (8 * STAGE1_STACKINDX)) |
+			    (0xf0 << (8 * STAGE1_STACKINDX)) |
 #endif
-				    (0xff << (8 * STAGE1_NORMALINDX)),
+			    (0xff << (8 * STAGE1_NORMALINDX)),
 
 		.sctlr_el2 = get_sctlr_el2_value(false),
 		.vstcr_el2 = (1U << 31) |	    /* RES1. */
@@ -960,9 +959,6 @@ uint64_t arch_mm_get_pa_range(void)
 
 	/* Downgrade PA size from 52 to 48 bits (FEAT_LPA workaround). */
 	if (pa_range == 6) {
-		dlog_verbose(
-			"52-bit PA size not supported,"
-			" falling back to 48-bit\n");
 		pa_range = 5;
 	}
 

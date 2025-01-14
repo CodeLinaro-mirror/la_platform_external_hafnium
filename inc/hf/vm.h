@@ -13,6 +13,7 @@
 #include "hf/arch/vm/vm.h"
 
 #include "hf/cpu.h"
+#include "hf/ffa_partition_manifest.h"
 #include "hf/interrupt_desc.h"
 #include "hf/list.h"
 #include "hf/mm.h"
@@ -21,7 +22,6 @@
 #include "vmapi/hf/ffa.h"
 
 #define MAX_SMCS 32
-#define LOG_BUFFER_SIZE 256
 #define VM_MANIFEST_MAX_INTERRUPTS 32
 
 /** Action for Other-Secure interrupts by SPMC. */
@@ -75,23 +75,6 @@ enum mailbox_state {
 	MAILBOX_STATE_OTHER_WORLD_OWNED,
 };
 
-struct wait_entry {
-	/** The VM that is waiting for a mailbox to become writable. */
-	struct vm *waiting_vm;
-
-	/**
-	 * Links used to add entry to a VM's waiter_list. This is protected by
-	 * the notifying VM's lock.
-	 */
-	struct list_entry wait_links;
-
-	/**
-	 * Links used to add entry to a VM's ready_list. This is protected by
-	 * the waiting VM's lock.
-	 */
-	struct list_entry ready_links;
-};
-
 struct mailbox {
 	enum mailbox_state state;
 	void *recv;
@@ -108,20 +91,6 @@ struct mailbox {
 	 * `recv`.
 	 */
 	uint32_t recv_func;
-
-	/**
-	 * List of wait_entry structs representing VMs that want to be notified
-	 * when the mailbox becomes writable. Once the mailbox does become
-	 * writable, the entry is removed from this list and added to the
-	 * waiting VM's ready_list.
-	 */
-	struct list_entry waiter_list;
-
-	/**
-	 * List of wait_entry structs representing VMs whose mailboxes became
-	 * writable since the owner of the mailbox registers for notification.
-	 */
-	struct list_entry ready_list;
 };
 
 struct notifications_state {
@@ -198,10 +167,19 @@ struct smc_whitelist {
 	bool permissive;
 };
 
+/* NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding) */
 struct vm {
 	ffa_id_t id;
-	struct ffa_uuid uuid;
-	uint32_t ffa_version;
+	struct ffa_uuid uuids[PARTITION_MAX_UUIDS];
+	enum ffa_version ffa_version;
+
+	/*
+	 * Whether this FF-A instance has negotiated an FF-A version through a
+	 * call to FFA_VERSION. Once the version has been negotiated, it is an
+	 * error to attempt to change it through another call to FFA_VERSION.
+	 */
+	bool ffa_version_negotiated;
+
 	struct smc_whitelist smc_whitelist;
 
 	/** See api.c for the partial ordering on locks. */
@@ -209,6 +187,14 @@ struct vm {
 	ffa_vcpu_count_t vcpu_count;
 	struct vcpu *vcpus;
 	struct mm_ptable ptable;
+
+	/**
+	 * Set of page tables used for defining the peripheral's secure
+	 * IPA space, in the context of SPMC.
+	 */
+	struct mm_ptable iommu_ptables[PARTITION_MAX_DMA_DEVICES];
+	/** Count of DMA devices assigned to this VM. */
+	uint8_t dma_device_count;
 	struct mailbox mailbox;
 
 	struct {
@@ -225,14 +211,14 @@ struct vm {
 		bool npi_injected;
 	} notifications;
 
-	char log_buffer[LOG_BUFFER_SIZE];
-	uint16_t log_buffer_length;
-
 	/**
-	 * Wait entries to be used when waiting on other VM mailboxes. See
-	 * comments on `struct wait_entry` for the lock discipline of these.
+	 * Whether this partition is subscribed to receiving VM created/VM
+	 * destroyed messages.
 	 */
-	struct wait_entry wait_entries[MAX_VMS];
+	struct {
+		bool vm_created;
+		bool vm_destroyed;
+	} vm_availability_messages;
 
 	atomic_bool aborting;
 
@@ -247,7 +233,7 @@ struct vm {
 		ipaddr_t blob_addr;
 	} boot_info;
 
-	uint8_t messaging_method;
+	uint16_t messaging_method;
 
 	/**
 	 * Action specified by a Partition through the manifest in response to
@@ -294,9 +280,11 @@ struct two_vm_locked {
 };
 
 struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
-		   struct mpool *ppool, bool el0_partition);
+		   struct mpool *ppool, bool el0_partition,
+		   uint8_t dma_device_count);
 bool vm_init_next(ffa_vcpu_count_t vcpu_count, struct mpool *ppool,
-		  struct vm **new_vm, bool el0_partition);
+		  struct vm **new_vm, bool el0_partition,
+		  uint8_t dma_device_count);
 ffa_vm_count_t vm_get_count(void);
 struct vm *vm_find(ffa_id_t id);
 struct vm_locked vm_find_locked(ffa_id_t id);
@@ -304,9 +292,9 @@ struct vm *vm_find_index(uint16_t index);
 struct vm_locked vm_lock(struct vm *vm);
 struct two_vm_locked vm_lock_both(struct vm *vm1, struct vm *vm2);
 void vm_unlock(struct vm_locked *locked);
+struct two_vm_locked vm_lock_both_in_order(struct vm_locked vm1,
+					   struct vm *vm2);
 struct vcpu *vm_get_vcpu(struct vm *vm, ffa_vcpu_index_t vcpu_index);
-struct wait_entry *vm_get_wait_entry(struct vm *vm, ffa_id_t for_vm);
-ffa_id_t vm_id_for_wait_entry(struct vm *vm, struct wait_entry *entry);
 bool vm_id_is_current_world(ffa_id_t vm_id);
 bool vm_is_mailbox_busy(struct vm_locked to);
 bool vm_is_mailbox_other_world_owned(struct vm_locked to);
@@ -323,6 +311,10 @@ bool vm_unmap_hypervisor(struct vm_locked vm_locked, struct mpool *ppool);
 
 bool vm_mem_get_mode(struct vm_locked vm_locked, ipaddr_t begin, ipaddr_t end,
 		     uint32_t *mode);
+bool vm_iommu_mm_identity_map(struct vm_locked vm_locked, paddr_t begin,
+			      paddr_t end, uint32_t mode, struct mpool *ppool,
+			      ipaddr_t *ipa, uint8_t dma_device_id);
+
 void vm_notifications_init(struct vm *vm, ffa_vcpu_count_t vcpu_count,
 			   struct mpool *ppool);
 bool vm_mailbox_state_busy(struct vm_locked vm_locked);
@@ -361,15 +353,14 @@ ffa_notifications_bitmap_t vm_notifications_framework_get_pending(
 void vm_notifications_info_get_pending(
 	struct vm_locked vm_locked, bool is_from_vm, uint16_t *ids,
 	uint32_t *ids_count, uint32_t *lists_sizes, uint32_t *lists_count,
-	const uint32_t ids_max_count,
+	uint32_t ids_max_count,
 	enum notifications_info_get_state *info_get_state);
 bool vm_notifications_pending_not_retrieved_by_scheduler(void);
 bool vm_is_notifications_pending_count_zero(void);
 bool vm_notifications_info_get(struct vm_locked vm_locked, uint16_t *ids,
 			       uint32_t *ids_count, uint32_t *lists_sizes,
-			       uint32_t *lists_count,
-			       const uint32_t ids_max_count);
-bool vm_supports_messaging_method(struct vm *vm, uint8_t messaging_method);
+			       uint32_t *lists_count, uint32_t ids_max_count);
+bool vm_supports_messaging_method(struct vm *vm, uint16_t messaging_method);
 void vm_notifications_set_npi_injected(struct vm_locked vm_locked,
 				       bool npi_injected);
 bool vm_notifications_is_npi_injected(struct vm_locked vm_locked);
@@ -393,6 +384,33 @@ static inline bool vm_power_management_cpu_off_requested(struct vm *vm)
 {
 	return (vm->power_management &
 		(UINT32_C(1) << VM_POWER_MANAGEMENT_CPU_OFF_SHIFT)) != 0;
+}
+
+/* Return true if `vm` is a UP. */
+static inline bool vm_is_up(const struct vm *vm)
+{
+	return vm->vcpu_count == 1;
+}
+
+/* Return true if `vm` is a MP. */
+static inline bool vm_is_mp(const struct vm *vm)
+{
+	return vm->vcpu_count > 1;
+}
+
+/* Return true if `vm` is the primary VM. */
+static inline bool vm_is_primary(const struct vm *vm)
+{
+	return vm->id == HF_PRIMARY_VM_ID;
+}
+
+/**
+ * Convert a CPU ID for a secondary VM to the corresponding vCPU index.
+ */
+static inline ffa_vcpu_index_t vcpu_id_to_index(cpu_id_t vcpu_id)
+{
+	/* For now we use indices as IDs. */
+	return vcpu_id;
 }
 
 struct interrupt_descriptor *vm_interrupt_set_target_mpidr(

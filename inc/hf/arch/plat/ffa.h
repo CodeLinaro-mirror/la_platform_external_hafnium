@@ -8,59 +8,21 @@
 
 #pragma once
 
+#include "hf/addr.h"
 #include "hf/ffa.h"
+#include "hf/ffa_memory_internal.h"
 #include "hf/manifest.h"
 #include "hf/vcpu.h"
 #include "hf/vm.h"
 
-/**
- * The following enum relates to a state machine to guide the handling of the
- * Scheduler Receiver Interrupt.
- * The SRI is used to signal the receiver scheduler that there are pending
- * notifications for the receiver, and it is sent when there is a valid call to
- * FFA_NOTIFICATION_SET.
- * The FFA_NOTIFICATION_INFO_GET interface must be called in the SRI handler,
- * after which the FF-A driver should process the returned list, and request
- * the receiver scheduler to give the receiver CPU cycles to process the
- * notification.
- * The use of the following state machine allows for synchronized sending
- * and handling of the SRI, as well as avoiding the occurrence of spurious
- * SRI. A spurious SRI would be one such that upon handling a call to
- * FFA_NOTIFICATION_INFO_GET would return error FFA_NO_DATA, which is plausible
- * in an MP system.
- * The state machine also aims at resolving the delay of the SRI by setting
- * flag FFA_NOTIFICATIONS_FLAG_DELAY_SRI in the arguments of the set call. By
- * delaying, the SRI is sent in context switching to the primary endpoint.
- * The SPMC is implemented under the assumption the receiver scheduler is a
- * NWd endpoint, hence the SRI is triggered at the world switch.
- * If concurrently another notification is set that requires immediate action,
- * the SRI is triggered immediately within that same execution context.
- *
- * HANDLED is the initial state, and means a new SRI can be sent. The following
- * state transitions are possible:
- * * HANDLED => DELAYED: Setting notification, and requesting SRI delay.
- * * HANDLED => TRIGGERED: Setting notification, and not requesting SRI delay.
- * * DELAYED => TRIGGERED: SRI was delayed, and the context switch to the
- * receiver scheduler is being done.
- * * DELAYED => HANDLED: the scheduler called FFA_NOTIFICATION_INFO_GET.
- * * TRIGGERED => HANDLED: the scheduler called FFA_NOTIFICATION_INFO_GET.
- */
-enum plat_ffa_sri_state {
-	HANDLED = 0,
-	DELAYED,
-	TRIGGERED,
-};
-
-/** Returns information on features that are specific to the platform. */
-struct ffa_value plat_ffa_features(uint32_t function_feature_id);
 /** Returns the SPMC ID. */
 struct ffa_value plat_ffa_spmc_id_get(void);
 
 void plat_ffa_log_init(void);
 void plat_ffa_set_tee_enabled(bool tee_enabled);
 void plat_ffa_init(struct mpool *ppool);
-bool plat_ffa_is_memory_send_valid(ffa_id_t receiver_vm_id,
-				   uint32_t share_func);
+bool plat_ffa_is_memory_send_valid(ffa_id_t receiver, ffa_id_t sender,
+				   uint32_t share_func, bool multiple_borrower);
 
 bool plat_ffa_is_direct_request_valid(struct vcpu *current,
 				      ffa_id_t sender_vm_id,
@@ -69,7 +31,8 @@ bool plat_ffa_is_direct_response_valid(struct vcpu *current,
 				       ffa_id_t sender_vm_id,
 				       ffa_id_t receiver_vm_id);
 bool plat_ffa_is_direct_request_supported(struct vm *sender_vm,
-					  struct vm *receiver_vm);
+					  struct vm *receiver_vm,
+					  uint32_t func);
 bool plat_ffa_direct_request_forward(ffa_id_t receiver_vm_id,
 				     struct ffa_value args,
 				     struct ffa_value *ret);
@@ -86,8 +49,8 @@ bool plat_ffa_is_indirect_msg_supported(struct vm_locked sender_locked,
 bool plat_ffa_msg_send2_forward(ffa_id_t receiver_vm_id, ffa_id_t sender_vm_id,
 				struct ffa_value *ret);
 
-bool plat_ffa_is_notifications_create_valid(struct vcpu *current,
-					    ffa_id_t vm_id);
+struct ffa_value plat_ffa_is_notifications_bitmap_access_valid(
+	struct vcpu *current, ffa_id_t vm_id);
 
 bool plat_ffa_is_notifications_bind_valid(struct vcpu *current,
 					  ffa_id_t sender_id,
@@ -151,7 +114,7 @@ uint32_t plat_ffa_other_world_mode(void);
  * Return the FF-A partition info VM/SP properties given the VM id.
  */
 ffa_partition_properties_t plat_ffa_partition_properties(
-	ffa_id_t vm_id, const struct vm *target);
+	ffa_id_t caller_id, const struct vm *target);
 
 /**
  * Get NWd VM's structure.
@@ -196,10 +159,7 @@ bool plat_ffa_notification_info_get_call(struct ffa_value *ret);
 bool plat_ffa_vm_notifications_info_get(uint16_t *ids, uint32_t *ids_count,
 					uint32_t *lists_sizes,
 					uint32_t *lists_count,
-					const uint32_t ids_count_max);
-
-/** Helper to set SRI current state. */
-void plat_ffa_sri_state_set(enum plat_ffa_sri_state state);
+					uint32_t ids_count_max);
 
 /**
  * Helper to send SRI and safely update `ffa_sri_state`, if there has been
@@ -215,6 +175,12 @@ void plat_ffa_sri_trigger_if_delayed(struct cpu *cpu);
 void plat_ffa_sri_trigger_not_delayed(struct cpu *cpu);
 
 /**
+ * Track that in current CPU there was a notification set with delay SRI
+ * flag.
+ */
+void plat_ffa_sri_set_delayed(struct cpu *cpu);
+
+/**
  * Initialize Schedule Receiver Interrupts needed in the context of
  * notifications support.
  */
@@ -223,7 +189,7 @@ void plat_ffa_sri_init(struct cpu *cpu);
 void plat_ffa_notification_info_get_forward(uint16_t *ids, uint32_t *ids_count,
 					    uint32_t *lists_sizes,
 					    uint32_t *lists_count,
-					    const uint32_t ids_count_max);
+					    uint32_t ids_count_max);
 
 bool plat_ffa_is_mem_perm_get_valid(const struct vcpu *current);
 bool plat_ffa_is_mem_perm_set_valid(const struct vcpu *current);
@@ -249,10 +215,14 @@ bool plat_ffa_inject_notification_pending_interrupt(
 	struct vcpu_locked next_locked, struct vcpu_locked current_locked,
 	struct vm_locked receiver_locked);
 
+bool plat_ffa_intercept_call(struct vcpu_locked current_locked,
+			     struct vcpu_locked next_locked,
+			     struct ffa_value *signal_interrupt);
+
 bool plat_ffa_partition_info_get_regs_forward_allowed(void);
 
 void plat_ffa_partition_info_get_forward(const struct ffa_uuid *uuid,
-					 const uint32_t flags,
+					 uint32_t flags,
 					 struct ffa_partition_info *partitions,
 					 ffa_vm_count_t *ret_count);
 
@@ -295,10 +265,6 @@ void plat_ffa_unwind_call_chain_ffa_direct_resp(
 void plat_ffa_enable_virtual_interrupts(struct vcpu_locked current_locked,
 					struct vm_locked vm_locked);
 
-bool plat_ffa_intercept_direct_response(struct vcpu_locked current_locked,
-					struct vcpu **next,
-					struct ffa_value to_ret,
-					struct ffa_value *signal_interrupt);
 /*
  * Handles FF-A memory share calls with recipients from the other world.
  */
@@ -316,22 +282,12 @@ struct ffa_value plat_ffa_other_world_mem_reclaim(
 	ffa_memory_region_flags_t flags, struct mpool *page_pool);
 
 /**
- * Handles the memory retrieve request if the specified memory handle belongs
- * to the other world.
- */
-struct ffa_value plat_ffa_other_world_mem_retrieve(
-	struct vm_locked to_locked, struct ffa_memory_region *retrieve_request,
-	uint32_t length, struct mpool *page_pool);
-
-/**
  * Handles the continuation of the memory send operation in case the memory
  * region descriptor contains multiple segments.
  */
 struct ffa_value plat_ffa_other_world_mem_send_continue(
 	struct vm *from, void *fragment, uint32_t fragment_length,
 	ffa_memory_handle_t handle, struct mpool *page_pool);
-
-bool plat_ffa_is_direct_response_interrupted(struct vcpu_locked current_locked);
 
 /**
  * This FF-A v1.0 FFA_MSG_SEND interface.
@@ -354,7 +310,7 @@ ffa_memory_attributes_t plat_ffa_memory_security_mode(
  * Implemented for SPMC in RTM_SP_INIT runtime model.
  */
 struct ffa_value plat_ffa_error_32(struct vcpu *current, struct vcpu **next,
-				   uint32_t error_code);
+				   enum ffa_error error_code);
 
 bool plat_ffa_is_spmd_lp_id(ffa_id_t vm_id);
 
@@ -376,3 +332,10 @@ int64_t plat_ffa_interrupt_reconfigure(uint32_t int_id, uint32_t command,
  * Reclaim all resources belonging to VM in aborted state.
  */
 void plat_ffa_free_vm_resources(struct vm_locked vm_locked);
+
+void plat_save_ns_simd_context(struct vcpu *vcpu);
+
+uint32_t plat_ffa_interrupt_get(struct vcpu_locked current_locked);
+
+bool plat_ffa_handle_framework_msg(struct ffa_value args,
+				   struct ffa_value *ret);

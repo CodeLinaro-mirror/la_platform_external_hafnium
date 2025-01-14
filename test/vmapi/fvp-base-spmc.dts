@@ -75,6 +75,28 @@
 
 	memory@1 {
 		device_type = "ns-memory";
-		reg = <0x0 0x90010000 0x70000000>;
+		/*
+		 * This node should include only any memory that is NS and expected to
+		 * be handled by the SPMC or any other SP.
+		 *
+		 * Currently the address range below includes also the address space of
+		 * the PVM to simplify the handling of allocation of regions for memory
+		 * sharing tests and rxtx buffers. This, however shouldn't be done in
+		 * the real world.
+		 */
+		reg = <0x0 0x90000000 0x70000000>;
+	};
+
+	memory@2 {
+		device_type = "device-memory";
+		reg = <0x0 0x1c090000 0x20000>, /* UART0-1 */
+		      <0x0 0x2a830000 0x1000>,  /* AP_REFCLK CNTBase1*/
+		      <0x0 0x2a490000 0x10000>, /* Trusted Watchdog */
+		      <0x0 0x1c130000 0x10000>; /* Dummy for boot_fail tests. */
+	};
+
+	memory@3 {
+		device_type = "ns-device-memory";
+		reg = <0x0 0x1c0b0000 0x20000>; /* UART2-3 */
 	};
 };

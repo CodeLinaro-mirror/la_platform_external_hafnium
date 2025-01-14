@@ -137,23 +137,66 @@ TEST(ffa_features, succeeds_ffa_call_ids)
 
 	ret = ffa_features(FFA_NOTIFICATION_INFO_GET_64);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+}
 
-#if (MAKE_FFA_VERSION(1, 1) <= FFA_VERSION_COMPILED)
+static bool v1_1_or_later(void)
+{
+	return FFA_VERSION_COMPILED >= FFA_VERSION_1_1;
+}
+
+static bool v1_2_or_later(void)
+{
+	return FFA_VERSION_COMPILED >= FFA_VERSION_1_2;
+}
+
+TEST_PRECONDITION(ffa_features, succeeds_ffa_call_ids_v1_1, v1_1_or_later)
+{
+	struct ffa_value ret;
+
 	ret = ffa_features(FFA_MEM_PERM_GET_32);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_SET_32);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_GET_64);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_SET_64);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MSG_SEND2_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-#endif
+}
+
+TEST_PRECONDITION(ffa_features, succeeds_ffa_call_ids_v1_2, v1_2_or_later)
+{
+	struct ffa_value ret;
+	struct ffa_features_rxtx_map_params rxtx_map_params;
+
+	ret = ffa_features(FFA_CONSOLE_LOG_32);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_CONSOLE_LOG_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_PARTITION_INFO_GET_REGS_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_MSG_SEND_DIRECT_REQ2_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_MSG_SEND_DIRECT_RESP2_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_RXTX_MAP_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	rxtx_map_params = ffa_features_rxtx_map_params(ret);
+	EXPECT_EQ((uint8_t)rxtx_map_params.min_buf_size,
+		  FFA_RXTX_MAP_MIN_BUF_4K);
+	EXPECT_EQ((uint16_t)rxtx_map_params.mbz, 0);
+	EXPECT_EQ((uint16_t)rxtx_map_params.max_buf_size,
+		  FFA_RXTX_MAP_MAX_BUF_PAGE_COUNT);
 }
 
 /** Validates return for FFA_FEATURES provided a valid feature ID. */
@@ -164,8 +207,7 @@ TEST(ffa_features, succeeds_feature_ids)
 	EXPECT_EQ(ffa_feature_intid(ret), HF_NOTIFICATION_PENDING_INTID);
 
 	ret = ffa_features(FFA_FEATURE_SRI);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-	EXPECT_EQ(ffa_feature_intid(ret), HF_SCHEDULE_RECEIVER_INTID);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_FEATURE_MEI);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
@@ -186,18 +228,18 @@ TEST(ffa_features, fails_if_feature_id_wrong)
  */
 TEST(ffa_features, fails_if_parameter_wrong_and_v_1_1)
 {
-	ffa_version(MAKE_FFA_VERSION(1, 1));
+	EXPECT_EQ(ffa_version(FFA_VERSION_1_1), FFA_VERSION_COMPILED);
 
 	EXPECT_FFA_ERROR(
 		ffa_features_with_input_property(FFA_MEM_RETRIEVE_REQ_32, 0),
-		FFA_INVALID_PARAMETERS);
+		FFA_NOT_SUPPORTED);
 }
 
 TEST(ffa_features, does_not_fail_if_parameter_wrong_and_v_1_0)
 {
 	struct ffa_value ret;
 
-	ffa_version(MAKE_FFA_VERSION(1, 0));
+	EXPECT_EQ(ffa_version(FFA_VERSION_1_0), FFA_VERSION_COMPILED);
 
 	ret = ffa_features_with_input_property(FFA_MEM_RETRIEVE_REQ_32, 0);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
@@ -218,7 +260,7 @@ TEST(ffa_features, fails_func_id_not_supported)
 	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_YIELD_32);
-	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
 
 	ret = ffa_features(FFA_MSG_SEND_32);
 	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
@@ -406,7 +448,7 @@ TEST(ffa_boot_info, parse_fdt)
 
 	ASSERT_TRUE(fdt_info != NULL);
 
-	HFTEST_LOG("FF-A Manifest Address: %x", fdt_info->content);
+	HFTEST_LOG("FF-A Manifest Address: %lx", fdt_info->content);
 	// NOLINTNEXTLINE(performance-no-int-to-ptr)
 	fdt_ptr = (void*)fdt_info->content;
 
@@ -416,8 +458,8 @@ TEST(ffa_boot_info, parse_fdt)
 
 	EXPECT_TRUE(fdt_is_compatible(&root, "arm,ffa-manifest-1.0"));
 	EXPECT_TRUE(fdt_read_number(&root, "ffa-version", &ffa_version));
-	HFTEST_LOG("FF-A Version: %x", ffa_version);
-	ASSERT_EQ(ffa_version, MAKE_FFA_VERSION(1, 1));
+	HFTEST_LOG("FF-A Version: %lx", ffa_version);
+	ASSERT_EQ(ffa_version, FFA_VERSION_1_2);
 }
 
 /*
@@ -458,6 +500,41 @@ TEST(ffa_console_log, invalid_parameters)
 	/* Expecting INVALID_PARAMETERS on length > payload message */
 	req.arg1 = 0xffff;
 	EXPECT_FFA_ERROR(ffa_call(req), FFA_INVALID_PARAMETERS);
+}
+
+/**
+ * Validate FFA_CONSOLE_LOG sends a message.
+ */
+TEST(ffa_console_log_extended_reg, successfull_msg_send)
+{
+	/* This does not fit in 16x32 bits, only 16x64 */
+	char msg_long[] =
+		"aaaaaaaaaaaaaa16"
+		"aaaaaaaaaaaaaa32"
+		"aaaaaaaaaaaaaa48"
+		"aaaaaaaaaaaaaa64"
+		"aaaaaaaaaaaaaa80"
+		"aaaaaaaaaaaaaa96"
+		"aaaaaaaaaaaaa112"
+		"aaaaaaaaaaaa127"; /* plus 1 for the trailing '\0' */
+
+	static_assert(sizeof(msg_long) == 128,
+		      "msg_long should be 128 bytes long");
+
+	EXPECT_EQ(ffa_console_log_64_extended(msg_long, sizeof(msg_long)).func,
+		  FFA_SUCCESS_32);
+}
+
+/**
+ * Validate FFA_CONSOLE_LOG reports invalid parameters on inadequate message.
+ */
+TEST(ffa_console_log_extended_reg, invalid_parameters)
+{
+	/* Expecting INVALID_PARAMETERS on zero-length message */
+	EXPECT_FFA_ERROR(ffa_console_log_64_extended("abc", 0),
+			 FFA_INVALID_PARAMETERS);
+	EXPECT_FFA_ERROR(ffa_console_log_64_extended("abc", 16 * 8 + 1),
+			 FFA_INVALID_PARAMETERS);
 }
 
 /**
@@ -530,9 +607,21 @@ static void pauth_fault_helper(void)
 	FAIL("This should not be called\n");
 }
 
-/*
+/**
  * Trigger a Pointer Authentication Fault and verify that an exception
  * was generated.
+ *
+ * Note that the fault does not occur on the AUTIASP instruction but on the
+ * RET instruction. The AUTIASP instruction adds a PAC to the LR. Since the LR
+ * has been corrupted, the PAC will be faulty and the resulting value of LR will
+ * be an invalid VA causing the RET instruction to result in a translation
+ * fault.
+ *
+ * A PAC authentication instruction directly generating a PAC Fail exception
+ * requires implementation of FEAT_FPAC or FEAT_FPACCOMBINE.
+ *
+ * For more information, see section D8.10.4 `Faulting on pointer
+ * authentication`of ARM ARM DDI0487K.
  */
 TEST(arch_features, pauth_fault)
 {
@@ -880,4 +969,166 @@ TEST(ffa_enum_names, success_and_failure)
 	EXPECT_STREQ(ffa_error_name(FFA_NOT_SUPPORTED), "FFA_NOT_SUPPORTED");
 	EXPECT_STREQ(ffa_error_name(FFA_NO_DATA), "FFA_NO_DATA");
 	EXPECT_STREQ(ffa_error_name(0), "UNKNOWN");
+}
+
+/**
+ * Verify that partition discovery via the FFA_PARTITION_INFO interface
+ * returns the expected information on the VMs in the system, which in this
+ * case is only one primary VM.
+ *
+ * Verify also that calls to the FFA_PARTITION_INFO interface fail when
+ * expected, e.g., if the mailbox isn't setup or the RX buffer is busy.
+ */
+TEST(ffa, ffa_partition_info)
+{
+	struct mailbox_buffers mb;
+	struct ffa_value ret;
+	const struct ffa_partition_info* partitions;
+	struct ffa_uuid uuid;
+
+	/* A Null UUID requests information for all partitions. */
+	ffa_uuid_init(0, 0, 0, 0, &uuid);
+
+	/* Try to get partition information before the RX buffer is setup. */
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_FFA_ERROR(ret, FFA_BUSY);
+
+	/* Only getting the partition count should succeed however. */
+	ret = ffa_partition_info_get(&uuid, FFA_PARTITION_COUNT_FLAG);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_EQ(ret.arg2, 1);
+
+	/* Setup the mailbox (which holds the RX buffer). */
+	mb = set_up_mailbox();
+	partitions = mb.recv;
+
+	/* Check that the expected partition information is returned. */
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	/* There should only be the primary VM in this test. */
+	EXPECT_EQ(ret.arg2, 1);
+	EXPECT_EQ(partitions[0].vm_id, hf_vm_get_id());
+	/* The primary should have at least one vCPU. */
+	EXPECT_GE(partitions[0].vcpu_count, 1);
+
+	/*
+	 * Check that the partition information cannot be requested if the RX
+	 * buffer is busy.
+	 */
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_FFA_ERROR(ret, FFA_BUSY);
+
+	/* Release the buffer and try again. */
+	ret = ffa_rx_release();
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_rx_release();
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+}
+
+SET_UP(ffa_v1_0)
+{
+	EXPECT_EQ(ffa_version(FFA_VERSION_1_0), FFA_VERSION_COMPILED);
+}
+
+TEST(ffa_v1_0, ffa_partition_info_v1_0)
+{
+	struct mailbox_buffers mb;
+	struct ffa_value ret;
+	const struct ffa_partition_info* partitions;
+	struct ffa_uuid uuid;
+
+	/* A Null UUID requests information for all partitions. */
+	ffa_uuid_init(0, 0, 0, 0, &uuid);
+
+	/* Setup the mailbox (which holds the RX buffer). */
+	mb = set_up_mailbox();
+	partitions = mb.recv;
+	/*
+	 * Test the correct descriptor is returned
+	 */
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	/* There should only be the primary VM in this test. */
+	EXPECT_EQ(ret.arg2, 1);
+	EXPECT_EQ(partitions[0].vm_id, hf_vm_get_id());
+	/* The primary should have at least one vCPU. */
+	EXPECT_GE(partitions[0].vcpu_count, 1);
+
+	ret = ffa_rx_release();
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	/* Try to get partition information for an unrecognized UUID. */
+	ffa_uuid_init(0, 0, 0, 1, &uuid);
+
+	ret = ffa_partition_info_get(&uuid, 0);
+	EXPECT_FFA_ERROR(ret, FFA_INVALID_PARAMETERS);
+}
+
+/**
+ * Major and minor versions match exactly, so they are compatible.
+ */
+TEST(ffa_version, succeeds_current_version)
+{
+	EXPECT_EQ(ffa_version(FFA_VERSION_COMPILED), FFA_VERSION_COMPILED);
+}
+
+/**
+ * Major versions are equal, and caller's minor version is < callee's minor
+ * version, so they are compatible.
+ */
+TEST(ffa_version, succeeds_older_compatible_version)
+{
+	EXPECT_EQ(ffa_version(FFA_VERSION_1_1), FFA_VERSION_COMPILED);
+}
+
+/**
+ * Highest bit must be unset.
+ */
+TEST(ffa_version, fails_highest_bit_set)
+{
+	EXPECT_EQ((enum ffa_error)ffa_version(-1), FFA_NOT_SUPPORTED);
+}
+
+/**
+ * Caller's major version is < callee's major version, so they are incompatible.
+ */
+TEST(ffa_version, fails_major_version_too_low)
+{
+	EXPECT_EQ((enum ffa_error)ffa_version(make_ffa_version(0, 1)),
+		  FFA_NOT_SUPPORTED);
+}
+
+/**
+ * Caller's major version is > callee's major version, so they are incompatible.
+ */
+TEST(ffa_version, fails_major_version_too_high)
+{
+	EXPECT_EQ((enum ffa_error)ffa_version(make_ffa_version(2, 0)),
+		  FFA_NOT_SUPPORTED);
+}
+
+/**
+ * Major versions are equal, but caller's minor version is > callee's minor
+ * version, so they are incompatible.
+ */
+TEST(ffa_version, fails_minor_version_too_high)
+{
+	EXPECT_EQ((enum ffa_error)ffa_version(make_ffa_version(1, 3)),
+		  FFA_NOT_SUPPORTED);
+}
+
+/**
+ * Version is compatible, but version has already been negotiated and other ABI
+ * calls have been made, so the version cannot be changed.
+ */
+TEST(ffa_version, fails_change_after_other_abis_used)
+{
+	EXPECT_EQ(ffa_version(FFA_VERSION_COMPILED), FFA_VERSION_COMPILED);
+	EXPECT_EQ(ffa_features(FFA_VERSION_32).func, FFA_SUCCESS_32);
+	EXPECT_EQ((enum ffa_error)ffa_version(FFA_VERSION_1_1),
+		  FFA_NOT_SUPPORTED);
 }

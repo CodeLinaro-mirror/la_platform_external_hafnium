@@ -10,7 +10,7 @@
 
 #include "hf/arch/mmu.h"
 
-#include "hf/plat/iommu.h"
+#include "hf/dlog.h"
 
 #include "hypervisor/feature_id.h"
 
@@ -30,8 +30,17 @@ void arch_vm_features_set(struct vm *vm)
 
 	vm->arch.trapped_features |= HF_FEATURE_DEBUG;
 
-	if (vm->id != HF_PRIMARY_VM_ID) {
-		/* Features to trap only for the secondary VMs. */
+	vm->arch.trapped_features |= HF_FEATURE_SVE;
+
+	vm->arch.trapped_features |= HF_FEATURE_SME;
+
+	if (!vm_is_primary(vm)) {
+		/*
+		 * Features to trap only for the secondary VMs (and Secure
+		 * Partitions).
+		 */
+
+		vm->arch.trapped_features |= HF_FEATURE_AMU;
 
 		vm->arch.trapped_features |= HF_FEATURE_PERFMON;
 
@@ -59,6 +68,48 @@ void arch_vm_features_set(struct vm *vm)
 	}
 }
 
+/*
+ * Allow the partition manager to perform necessary steps to enforce access
+ * control, with the help of IOMMU, for DMA accesses on behalf of a given
+ * partition.
+ */
+bool arch_vm_iommu_init_mm(struct vm *vm, struct mpool *ppool)
+{
+	bool ret = true;
+
+	/*
+	 * No support to enforce access control through (stage 1) address
+	 * translation for memory accesses by DMA device on behalf of an
+	 * EL0/S-EL0 partition.
+	 */
+	if (vm->el0_partition) {
+		return true;
+	}
+
+	for (uint8_t k = 0; k < vm->dma_device_count; k++) {
+		/*
+		 * Hafnium maintains an independent set of page tables for each
+		 * DMA device that is upstream of given VM. This is necessary
+		 * to enforce static DMA isolation.
+		 */
+		ret = ret &&
+		      mm_ptable_init(&vm->iommu_ptables[k], vm->id, 0, ppool);
+#if SECURE_WORLD == 1
+		ret = ret && mm_ptable_init(&vm->arch.iommu_ptables_ns[k],
+					    vm->id, 0, ppool);
+#endif
+		if (!ret) {
+			dlog_error(
+				"Failed to allocate entries for DMA page "
+				"tables. Consider increasing heap page "
+				"count.\n");
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
 bool arch_vm_init_mm(struct vm *vm, struct mpool *ppool)
 {
 	bool ret;
@@ -74,7 +125,7 @@ bool arch_vm_init_mm(struct vm *vm, struct mpool *ppool)
 	ret = ret && mm_vm_init(&vm->arch.ptable_ns, vm->id, ppool);
 #endif
 
-	return ret;
+	return ret && arch_vm_iommu_init_mm(vm, ppool);
 }
 
 bool arch_vm_identity_prepare(struct vm_locked vm_locked, paddr_t begin,
@@ -122,9 +173,6 @@ void arch_vm_identity_commit(struct vm_locked vm_locked, paddr_t begin,
 
 		mm_vm_identity_commit(table, begin, end, mode, ppool, ipa);
 	}
-
-	/* TODO: pass security state to SMMU? */
-	plat_iommu_identity_map(vm_locked, begin, end, mode);
 }
 
 bool arch_vm_unmap(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
@@ -191,4 +239,65 @@ bool arch_vm_mem_get_mode(struct vm_locked vm_locked, ipaddr_t begin,
 #endif
 
 	return ret;
+}
+
+static bool arch_vm_iommu_mm_prepare(struct vm_locked vm_locked, paddr_t begin,
+				     paddr_t end, uint32_t mode,
+				     struct mpool *ppool, uint8_t dma_device_id)
+{
+	struct mm_ptable *table = &vm_locked.vm->iommu_ptables[dma_device_id];
+
+#if SECURE_WORLD == 1
+	if (0 != (mode & MM_MODE_NS)) {
+		table = &vm_locked.vm->arch.iommu_ptables_ns[dma_device_id];
+	}
+#endif
+
+	return mm_vm_identity_prepare(table, begin, end, mode, ppool);
+}
+
+static void arch_vm_iommu_mm_commit(struct vm_locked vm_locked, paddr_t begin,
+				    paddr_t end, uint32_t mode,
+				    struct mpool *ppool, ipaddr_t *ipa,
+				    uint8_t dma_device_id)
+{
+	struct mm_ptable *table = &vm_locked.vm->iommu_ptables[dma_device_id];
+
+#if SECURE_WORLD == 1
+	if (0 != (mode & MM_MODE_NS)) {
+		table = &vm_locked.vm->arch.iommu_ptables_ns[dma_device_id];
+	}
+#endif
+
+	mm_vm_identity_commit(table, begin, end, mode, ppool, ipa);
+}
+
+bool arch_vm_iommu_mm_identity_map(struct vm_locked vm_locked, paddr_t begin,
+				   paddr_t end, uint32_t mode,
+				   struct mpool *ppool, ipaddr_t *ipa,
+				   uint8_t dma_device_id)
+{
+	/*
+	 * No support to enforce access control through (stage 1) address
+	 * translation for memory accesses by DMA device on behalf of an
+	 * EL0/S-EL0 partition.
+	 */
+	if (vm_locked.vm->el0_partition) {
+		return true;
+	}
+
+	if (dma_device_id >= vm_locked.vm->dma_device_count) {
+		dlog_error("Illegal DMA device specified.\n");
+		return false;
+	}
+
+	if (!arch_vm_iommu_mm_prepare(vm_locked, begin, end, mode, ppool,
+				      dma_device_id)) {
+		return false;
+	}
+
+	arch_vm_iommu_mm_commit(vm_locked, begin, end, mode, ppool, ipa,
+				dma_device_id);
+
+	return true;
 }

@@ -27,6 +27,7 @@ source_set("hypervisor") {
   sources = [
     "exceptions.S",
     "hypervisor_entry.S",
+    "memcpy_trapped.S",
     "plat_entry.S",
   ]
 
@@ -34,11 +35,16 @@ source_set("hypervisor") {
     "arch_init.c",
     "cpu.c",
     "debug_el1.c",
+    "el1_physical_timer.c",
     "feature_id.c",
     "ffa.c",
+    "fpu.c",
     "handler.c",
+    "host_timer.c",
     "perfmon.c",
     "psci_handler.c",
+    "sme.c",
+    "sve.c",
     "vm.c",
   ]
 

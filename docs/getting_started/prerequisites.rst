@@ -17,13 +17,13 @@ infrastructure:
 
 .. code:: shell
 
-   https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.6/clang+llvm-15.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+   https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz
 
 - For a AArch64 Ubuntu host,
 
 .. code:: shell
 
-   https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.6/clang+llvm-15.0.6-aarch64-linux-gnu.tar.xz
+   https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-aarch64-linux-gnu.tar.xz
 
 .. note::
 
@@ -39,7 +39,7 @@ The PATH environment variable shall be adjusted to contain the LLVM/clang direct
 
 .. code:: shell
 
-   PATH=<toolchain_dir>/clang+llvm-15.0.6-x86_64-linux-gnu-ubuntu-18.04/bin:$PATH
+   PATH=<toolchain_dir>/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04/bin:$PATH
 
 Dependencies
 ------------
@@ -58,6 +58,20 @@ In addion, install the following python lib using `pip`_:
 .. code:: shell
 
    pip3 install fdt
+
+The file kokoro/static_checks.sh runs a series of static code checks into Hafnium's codebase.
+Hafnium follows the linux kernel coding guidelines. As such, the static code checks using the
+'checkpatch.pl' script from linux source tree. To setup and download 'checkpatch.pl':
+
+.. code:: shell
+
+   ./build/setup_checkpatch.sh
+
+Then test it works with:
+
+.. code:: shell
+
+   make checkpatch
 
 Documentation
 ^^^^^^^^^^^^^
@@ -80,11 +94,11 @@ Ubuntu):
     sudo apt install python3 python3-pip plantuml
     curl -sSL https://install.python-poetry.org | python3 -
 
-To install Python dependencies using Poetry:
+Run the command below to install using Poetry, Python dependencies to build the documentation:
 
 .. code:: shell
 
-    poetry install
+    poetry install --with docs
 
 Poetry will create a new virtual environment and install all dependencies listed
 in ``pyproject.toml``. You can get information about this environment, such as
@@ -101,4 +115,3 @@ its location and the Python version, with the command:
 .. _Sphinx: http://www.sphinx-doc.org/en/master/
 .. _Poetry: https://python-poetry.org/docs/
 .. _pip: https://pip.pypa.io/en/stable/
-

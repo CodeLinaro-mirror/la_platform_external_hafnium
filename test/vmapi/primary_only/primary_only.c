@@ -81,13 +81,19 @@ static void vm_cpu_entry(uintptr_t arg)
 TEST(cpus, start)
 {
 	struct spinlock lock = SPINLOCK_INIT;
-	alignas(4096) static uint8_t other_stack[4096];
 
 	/* Start secondary while holding lock. */
 	sl_lock(&lock);
-	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(1), other_stack,
-				   sizeof(other_stack), vm_cpu_entry,
-				   (uintptr_t)&lock),
+
+	/**
+	 * `hftest_get_cpu_id` function makes the assumption that cpus are
+	 * specified in the FDT in reverse order and does the conversion
+	 * MAX_CPUS - index internally. Since legacy VMs do not follow this
+	 * convention, index 7 is passed into `hftest_cpu_get_id`.
+	 */
+	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(7),
+				   hftest_get_secondary_ec_stack(0),
+				   vm_cpu_entry, (uintptr_t)&lock),
 		  true);
 
 	/* Wait for CPU to release the lock. */
@@ -121,14 +127,21 @@ static void vm_cpu_entry_stop(uintptr_t arg)
 TEST(cpus, stop)
 {
 	struct spinlock lock = SPINLOCK_INIT;
-	alignas(4096) static uint8_t other_stack[4096];
+
+	/**
+	 * `hftest_get_cpu_id` function makes the assumption that cpus are
+	 * specified in the FDT in reverse order and does the conversion
+	 * MAX_CPUS - index internally. Since legacy VMs do not follow this
+	 * convention, index 7 is passed into `hftest_cpu_get_id`.
+	 */
+	size_t secondary_cpu_index = 7;
 
 	/* Start secondary while holding lock. */
 	sl_lock(&lock);
 	dlog("Starting second CPU.\n");
-	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(1), other_stack,
-				   sizeof(other_stack), vm_cpu_entry_stop,
-				   (uintptr_t)&lock),
+	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(secondary_cpu_index),
+				   hftest_get_secondary_ec_stack(0),
+				   vm_cpu_entry_stop, (uintptr_t)&lock),
 		  true);
 
 	/* Wait for CPU to release the lock after starting. */
@@ -136,14 +149,15 @@ TEST(cpus, stop)
 
 	dlog("Waiting for second CPU to stop.\n");
 	/* Wait a while for CPU to stop. */
-	while (arch_cpu_status(hftest_get_cpu_id(1)) != POWER_STATUS_OFF) {
+	while (arch_cpu_status(hftest_get_cpu_id(secondary_cpu_index)) !=
+	       POWER_STATUS_OFF) {
 	}
 	dlog("Second CPU stopped.\n");
 
 	dlog("Starting second CPU again.\n");
-	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(1), other_stack,
-				   sizeof(other_stack), vm_cpu_entry_stop,
-				   (uintptr_t)&lock),
+	EXPECT_EQ(hftest_cpu_start(hftest_get_cpu_id(secondary_cpu_index),
+				   hftest_get_secondary_ec_stack(0),
+				   vm_cpu_entry_stop, (uintptr_t)&lock),
 		  true);
 
 	/* Wait for CPU to release the lock after starting. */
@@ -151,7 +165,8 @@ TEST(cpus, stop)
 
 	dlog("Waiting for second CPU to stop.\n");
 	/* Wait a while for CPU to stop. */
-	while (arch_cpu_status(hftest_get_cpu_id(1)) != POWER_STATUS_OFF) {
+	while (arch_cpu_status(hftest_get_cpu_id(secondary_cpu_index)) !=
+	       POWER_STATUS_OFF) {
 	}
 	dlog("Second CPU stopped.\n");
 }
@@ -164,25 +179,24 @@ TEAR_DOWN(ffa)
 /** Ensures that the Hafnium FF-A version is reported as expected. */
 TEST(ffa, ffa_version)
 {
-	const uint16_t major_revision = 1;
-	const uint16_t minor_revision = 1;
-	const uint32_t current_version =
-		(int32_t)MAKE_FFA_VERSION(major_revision, minor_revision);
-	const int32_t older_compatible_version = MAKE_FFA_VERSION(1, 0);
+	const enum ffa_version current_version = FFA_VERSION_COMPILED;
+	const enum ffa_version older_compatible_version_0 = FFA_VERSION_1_0;
+	const enum ffa_version older_compatible_version_1 = FFA_VERSION_1_1;
 
 	EXPECT_EQ(ffa_version(current_version), current_version);
-	EXPECT_EQ(ffa_version(older_compatible_version), current_version);
-	EXPECT_EQ(ffa_version(0x0), (int32_t)FFA_NOT_SUPPORTED);
-	EXPECT_EQ(ffa_version(0x1), (int32_t)FFA_NOT_SUPPORTED);
-	EXPECT_EQ(ffa_version(0x10003), (int32_t)FFA_NOT_SUPPORTED);
-	EXPECT_EQ(ffa_version(0xffff), (int32_t)FFA_NOT_SUPPORTED);
-	EXPECT_EQ(ffa_version(0xfffffff), (int32_t)FFA_NOT_SUPPORTED);
+	EXPECT_EQ(ffa_version(older_compatible_version_0), current_version);
+	EXPECT_EQ(ffa_version(older_compatible_version_1), current_version);
+	EXPECT_EQ((int32_t)ffa_version(0x0), FFA_NOT_SUPPORTED);
+	EXPECT_EQ((int32_t)ffa_version(0x1), FFA_NOT_SUPPORTED);
+	EXPECT_EQ((int32_t)ffa_version(0x10003), FFA_NOT_SUPPORTED);
+	EXPECT_EQ((int32_t)ffa_version(0xffff), FFA_NOT_SUPPORTED);
+	EXPECT_EQ((int32_t)ffa_version(0xfffffff), FFA_NOT_SUPPORTED);
 }
 
 /** Ensures that an invalid call to FFA_VERSION gets an error back. */
 TEST(ffa, ffa_version_invalid)
 {
-	int32_t ret = ffa_version(0x80000000);
+	int32_t ret = (int32_t)ffa_version(0x80000000);
 
 	EXPECT_EQ(ret, FFA_NOT_SUPPORTED);
 }
@@ -223,7 +237,7 @@ TEST(ffa, ffa_features)
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
 
 	ret = ffa_features(FFA_MSG_POLL_32);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MSG_WAIT_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
@@ -235,7 +249,7 @@ TEST(ffa, ffa_features)
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
 
 	ret = ffa_features(FFA_MSG_SEND_32);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_DONATE_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
@@ -272,22 +286,60 @@ TEST(ffa, ffa_features)
 	ret = ffa_features(FFA_MSG_SEND_DIRECT_RESP_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
 
-#if (MAKE_FFA_VERSION(1, 1) <= FFA_VERSION_COMPILED)
-	ret = ffa_features(FFA_MEM_PERM_GET_32);
+	ret = ffa_features(FFA_YIELD_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_SECONDARY_EP_REGISTER_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+}
+
+static bool v1_1_or_later(void)
+{
+	return FFA_VERSION_COMPILED >= FFA_VERSION_1_1;
+}
+
+static bool v1_2_or_later(void)
+{
+	return FFA_VERSION_COMPILED >= FFA_VERSION_1_2;
+}
+
+TEST_PRECONDITION(ffa, ffa_v_1_1_features, v1_1_or_later)
+{
+	struct ffa_value ret;
+	ret = ffa_features(FFA_MEM_PERM_GET_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_SET_32);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_GET_64);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MEM_PERM_SET_64);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
 
 	ret = ffa_features(FFA_MSG_SEND2_32);
 	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-#endif
+}
+
+TEST_PRECONDITION(ffa, ffa_v_1_2_features, v1_2_or_later)
+{
+	struct ffa_value ret;
+
+	ret = ffa_features(FFA_CONSOLE_LOG_32);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_CONSOLE_LOG_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_PARTITION_INFO_GET_REGS_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_MSG_SEND_DIRECT_REQ2_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
+
+	ret = ffa_features(FFA_MSG_SEND_DIRECT_RESP2_64);
+	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
 }
 
 /**
@@ -303,86 +355,6 @@ TEST(ffa, ffa_features_not_supported)
 
 	ret = ffa_features(0x84000000);
 	EXPECT_FFA_ERROR(ret, FFA_NOT_SUPPORTED);
-}
-
-/**
- * Verify that partition discovery via the FFA_PARTITION_INFO interface
- * returns the expected information on the VMs in the system, which in this
- * case is only one primary VM.
- *
- * Verify also that calls to the FFA_PARTITION_INFO interface fail when
- * expected, e.g., if the mailbox isn't setup or the RX buffer is busy.
- */
-TEST(ffa, ffa_partition_info)
-{
-	struct mailbox_buffers mb;
-	struct ffa_value ret;
-	const struct ffa_partition_info *partitions;
-	struct ffa_uuid uuid;
-
-	/* A Null UUID requests information for all partitions. */
-	ffa_uuid_init(0, 0, 0, 0, &uuid);
-
-	/* Try to get partition information before the RX buffer is setup. */
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_FFA_ERROR(ret, FFA_BUSY);
-
-	/* Only getting the partition count should succeed however. */
-	ret = ffa_partition_info_get(&uuid, FFA_PARTITION_COUNT_FLAG);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-	EXPECT_EQ(ret.arg2, 1);
-
-	/* Setup the mailbox (which holds the RX buffer). */
-	mb = set_up_mailbox();
-	partitions = mb.recv;
-
-	/* Check that the expected partition information is returned. */
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-	/* There should only be the primary VM in this test. */
-	EXPECT_EQ(ret.arg2, 1);
-	EXPECT_EQ(partitions[0].vm_id, hf_vm_get_id());
-	/* The primary should have at least one vCPU. */
-	EXPECT_GE(partitions[0].vcpu_count, 1);
-
-	/*
-	 * Check that the partition information cannot be requested if the RX
-	 * buffer is busy.
-	 */
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_FFA_ERROR(ret, FFA_BUSY);
-
-	/* Release the buffer and try again. */
-	ret = ffa_rx_release();
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-
-	ret = ffa_rx_release();
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-
-	/*
-	 * Set ffa_version to v1.0 and test the correct descriptor is
-	 * returned
-	 */
-	ffa_version(MAKE_FFA_VERSION(1, 0));
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-	/* There should only be the primary VM in this test. */
-	EXPECT_EQ(ret.arg2, 1);
-	EXPECT_EQ(partitions[0].vm_id, hf_vm_get_id());
-	/* The primary should have at least one vCPU. */
-	EXPECT_GE(partitions[0].vcpu_count, 1);
-
-	ret = ffa_rx_release();
-	EXPECT_EQ(ret.func, FFA_SUCCESS_32);
-
-	/* Try to get partition information for an unrecognized UUID. */
-	ffa_uuid_init(0, 0, 0, 1, &uuid);
-
-	ret = ffa_partition_info_get(&uuid, 0);
-	EXPECT_FFA_ERROR(ret, FFA_INVALID_PARAMETERS);
 }
 
 /**

@@ -27,6 +27,8 @@ source_set("src_not_testable_yet") {
   sources = [
     "api.c",
     "cpio.c",
+    "ffa_memory.c",
+    "hf_ipi.c",
     "init.c",
     "load.c",
     "main.c",
@@ -50,9 +52,9 @@ source_set("src_testable") {
   sources = [
     "boot_info.c",
     "cpu.c",
-    "ffa_memory.c",
     "manifest.c",
     "sp_pkg.c",
+    "timer_mgmt.c",
     "vcpu.c",
   ]
 
@@ -73,6 +75,7 @@ source_set("src_testable") {
     plat_boot_flow,
     plat_console,
     plat_iommu,
+    plat_memory_protect,
   ]
 }
 
@@ -168,6 +171,7 @@ source_set("abort") {
 executable("unit_tests") {
   testonly = true
   sources = [
+    "bits_test.cc",
     "cpu_test.cc",
     "fdt_handler_test.cc",
     "fdt_test.cc",

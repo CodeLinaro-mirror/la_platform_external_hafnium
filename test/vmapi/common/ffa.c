@@ -8,11 +8,14 @@
 
 #include "hf/ffa.h"
 
+#include "hf/arch/mmu.h"
+
 #include "hf/check.h"
 #include "hf/mm.h"
 #include "hf/static_assert.h"
 
 #include "vmapi/hf/call.h"
+#include "vmapi/hf/ffa_v1_0.h"
 
 #include "test/hftest.h"
 #include "test/vmapi/ffa.h"
@@ -148,7 +151,11 @@ ffa_memory_handle_t send_memory_and_retrieve_request_multi_receiver(
 	uint32_t receivers_send_count,
 	struct ffa_memory_access receivers_retrieve[],
 	uint32_t receivers_retrieve_count, ffa_memory_region_flags_t send_flags,
-	ffa_memory_region_flags_t retrieve_flags)
+	ffa_memory_region_flags_t retrieve_flags,
+	enum ffa_memory_type send_memory_type,
+	enum ffa_memory_type receive_memory_type,
+	enum ffa_memory_cacheability send_cacheability,
+	enum ffa_memory_cacheability receive_cacheability)
 {
 	uint32_t total_length;
 	uint32_t fragment_length;
@@ -158,20 +165,15 @@ ffa_memory_handle_t send_memory_and_retrieve_request_multi_receiver(
 	uint32_t remaining_constituent_count;
 	uint32_t i;
 	struct ffa_partition_msg *retrieve_message = tx_buffer;
-	bool not_specify_memory_type =
-		share_func == FFA_MEM_DONATE_32 ||
-		(share_func == FFA_MEM_LEND_32 && receivers_send_count == 1);
 	uint64_t allocator_mask;
 	bool contains_secure_receiver = false;
 
 	/* Send the first fragment of the memory. */
 	remaining_constituent_count = ffa_memory_region_init(
 		tx_buffer, HF_MAILBOX_SIZE, sender, receivers_send,
-		receivers_send_count, constituents, constituent_count, 0,
-		send_flags,
-		not_specify_memory_type ? FFA_MEMORY_NOT_SPECIFIED_MEM
-					: FFA_MEMORY_NORMAL_MEM,
-		FFA_MEMORY_CACHE_WRITE_BACK, FFA_MEMORY_INNER_SHAREABLE,
+		receivers_send_count, sizeof(struct ffa_memory_access),
+		constituents, constituent_count, 0, send_flags,
+		send_memory_type, send_cacheability, FFA_MEMORY_INNER_SHAREABLE,
 		&total_length, &fragment_length);
 
 	if (remaining_constituent_count == 0) {
@@ -219,9 +221,10 @@ ffa_memory_handle_t send_memory_and_retrieve_request_multi_receiver(
 
 	msg_size = ffa_memory_retrieve_request_init(
 		(struct ffa_memory_region *)retrieve_message->payload, handle,
-		sender, receivers_retrieve, receivers_retrieve_count, 0,
-		retrieve_flags, FFA_MEMORY_NORMAL_MEM,
-		FFA_MEMORY_CACHE_WRITE_BACK, FFA_MEMORY_INNER_SHAREABLE);
+		sender, receivers_retrieve, receivers_retrieve_count,
+		sizeof(struct ffa_memory_access), 0, retrieve_flags,
+		receive_memory_type, receive_cacheability,
+		FFA_MEMORY_INNER_SHAREABLE);
 
 	for (i = 0; i < receivers_send_count; i++) {
 		struct ffa_memory_region_attributes *receiver =
@@ -256,23 +259,34 @@ ffa_memory_handle_t send_memory_and_retrieve_request(
 	enum ffa_data_access send_data_access,
 	enum ffa_data_access retrieve_data_access,
 	enum ffa_instruction_access send_instruction_access,
-	enum ffa_instruction_access retrieve_instruction_access)
+	enum ffa_instruction_access retrieve_instruction_access,
+	enum ffa_memory_type send_memory_type,
+	enum ffa_memory_type receive_memory_type,
+	enum ffa_memory_cacheability send_cacheability,
+	enum ffa_memory_cacheability receive_cacheability)
 {
 	struct ffa_memory_access receiver_send_permissions;
 	struct ffa_memory_access receiver_retrieve_permissions;
+	/*
+	 * Use the sender id as the impdef value so we can use this in later
+	 * testing.
+	 */
+	struct ffa_memory_access_impdef impdef_val =
+		ffa_memory_access_impdef_init(sender, sender + 1);
 
-	ffa_memory_access_init_permissions(&receiver_send_permissions,
-					   recipient, send_data_access,
-					   send_instruction_access, 0);
+	ffa_memory_access_init(&receiver_send_permissions, recipient,
+			       send_data_access, send_instruction_access, 0,
+			       &impdef_val);
 
-	ffa_memory_access_init_permissions(&receiver_retrieve_permissions,
-					   recipient, retrieve_data_access,
-					   retrieve_instruction_access, 0);
+	ffa_memory_access_init(&receiver_retrieve_permissions, recipient,
+			       retrieve_data_access,
+			       retrieve_instruction_access, 0, &impdef_val);
 
 	return send_memory_and_retrieve_request_multi_receiver(
 		share_func, tx_buffer, sender, constituents, constituent_count,
 		&receiver_send_permissions, 1, &receiver_retrieve_permissions,
-		1, send_flags, retrieve_flags);
+		1, send_flags, retrieve_flags, send_memory_type,
+		receive_memory_type, send_cacheability, receive_cacheability);
 }
 
 /*
@@ -299,6 +313,8 @@ ffa_memory_handle_t send_memory_and_retrieve_request_force_fragmented(
 	struct ffa_partition_msg *retrieve_message;
 	bool not_specify_memory_type = share_func == FFA_MEM_DONATE_32 ||
 				       (share_func == FFA_MEM_LEND_32);
+	struct ffa_memory_access_impdef impdef_val =
+		ffa_memory_access_impdef_init(sender, sender + 1);
 
 	/* Send everything except the last constituent in the first fragment. */
 	remaining_constituent_count = ffa_memory_region_init_single_receiver(
@@ -308,7 +324,7 @@ ffa_memory_handle_t send_memory_and_retrieve_request_force_fragmented(
 		not_specify_memory_type ? FFA_MEMORY_NOT_SPECIFIED_MEM
 					: FFA_MEMORY_NORMAL_MEM,
 		FFA_MEMORY_CACHE_WRITE_BACK, FFA_MEMORY_INNER_SHAREABLE,
-		&total_length, &fragment_length);
+		&impdef_val, &total_length, &fragment_length);
 	EXPECT_EQ(remaining_constituent_count, 0);
 	EXPECT_EQ(total_length, fragment_length);
 	/* Don't include the last constituent in the first fragment. */
@@ -350,7 +366,8 @@ ffa_memory_handle_t send_memory_and_retrieve_request_force_fragmented(
 		(struct ffa_memory_region *)retrieve_message->payload, handle,
 		sender, recipient, 0, flags, retrieve_data_access,
 		retrieve_instruction_access, FFA_MEMORY_NORMAL_MEM,
-		FFA_MEMORY_CACHE_WRITE_BACK, FFA_MEMORY_INNER_SHAREABLE);
+		FFA_MEMORY_CACHE_WRITE_BACK, FFA_MEMORY_INNER_SHAREABLE,
+		&impdef_val);
 	ffa_rxtx_header_init(sender, recipient, msg_size,
 			     &retrieve_message->header);
 	EXPECT_LE(msg_size, HF_MAILBOX_SIZE);
@@ -365,13 +382,13 @@ void send_retrieve_request_single_receiver(
 	enum ffa_data_access data_access,
 	enum ffa_instruction_access instruction_access,
 	enum ffa_memory_type type, enum ffa_memory_cacheability cacheability,
-	enum ffa_memory_shareability shareability)
+	enum ffa_memory_shareability shareability,
+	struct ffa_memory_access_impdef *impdef_val)
 {
 	struct ffa_memory_access receiver_retrieve_permissions;
 
-	ffa_memory_access_init_permissions(&receiver_retrieve_permissions,
-					   receiver, data_access,
-					   instruction_access, 0);
+	ffa_memory_access_init(&receiver_retrieve_permissions, receiver,
+			       data_access, instruction_access, 0, impdef_val);
 
 	send_retrieve_request(send, handle, sender,
 			      &receiver_retrieve_permissions, 1, tag, flags,
@@ -390,7 +407,8 @@ void send_retrieve_request(
 
 	msg_size = ffa_memory_retrieve_request_init(
 		(struct ffa_memory_region *)retrieve_message->payload, handle,
-		sender, receivers, receiver_count, tag, flags, type,
+		sender, receivers, receiver_count,
+		sizeof(struct ffa_memory_access), tag, flags, type,
 		cacheability, shareability);
 
 	EXPECT_LE(msg_size, HF_MAILBOX_SIZE);
@@ -433,6 +451,38 @@ static struct ffa_partition_msg *get_mailbox_message(void *recv)
 	return msg;
 }
 
+/**
+ * Retrieve a memory region descriptor from fragments in the rx buffer.
+ * We keep building the memory region descriptor form the rx buffer until
+ * the fragment offset matches the total length we expect.
+ */
+void memory_region_desc_from_rx_fragments(uint32_t fragment_length,
+					  uint32_t total_length,
+					  ffa_memory_handle_t handle,
+					  void *memory_region, void *recv_buf,
+					  uint32_t memory_region_max_size)
+{
+	struct ffa_value ret;
+	uint32_t fragment_offset = fragment_length;
+
+	while (fragment_offset < total_length) {
+		ret = ffa_mem_frag_rx(handle, fragment_offset);
+		EXPECT_EQ(ret.func, FFA_MEM_FRAG_TX_32);
+		EXPECT_EQ(ffa_frag_handle(ret), handle);
+		fragment_length = ret.arg3;
+		EXPECT_GT(fragment_length, 0);
+		ASSERT_LE(fragment_offset + fragment_length,
+			  memory_region_max_size);
+		/* Copy received fragment. */
+		memcpy_s((uint8_t *)memory_region + fragment_offset,
+			 memory_region_max_size - fragment_offset, recv_buf,
+			 fragment_length);
+		fragment_offset += fragment_length;
+		ASSERT_EQ(ffa_rx_release().func, FFA_SUCCESS_32);
+	}
+	EXPECT_EQ(fragment_offset, total_length);
+}
+
 /*
  * Retrieve a memory region from `recv_buf`. Copies all the fragments into
  * `memory_region_ret` if non-null, and checks that the total length of all
@@ -444,9 +494,9 @@ void retrieve_memory(void *recv_buf, ffa_memory_handle_t handle,
 {
 	struct ffa_value ret;
 	struct ffa_memory_region *memory_region;
+	struct ffa_memory_access *receiver;
 	uint32_t fragment_length;
 	uint32_t total_length;
-	uint32_t fragment_offset;
 	ffa_id_t own_id = hf_vm_get_id();
 
 	ret = ffa_mem_retrieve_req(msg_size, msg_size);
@@ -455,14 +505,15 @@ void retrieve_memory(void *recv_buf, ffa_memory_handle_t handle,
 	fragment_length = ret.arg2;
 	EXPECT_GE(fragment_length,
 		  sizeof(struct ffa_memory_region) +
-			  sizeof(struct ffa_memory_access) +
+			  sizeof(struct ffa_memory_access_v1_0) +
 			  sizeof(struct ffa_composite_memory_region));
 	EXPECT_LE(fragment_length, HF_MAILBOX_SIZE);
 	EXPECT_LE(fragment_length, total_length);
 	memory_region = (struct ffa_memory_region *)recv_buf;
 	EXPECT_EQ(memory_region->receiver_count, 1);
-	EXPECT_EQ(memory_region->receivers[0].receiver_permissions.receiver,
-		  own_id);
+	receiver = ffa_memory_region_get_receiver(memory_region, 0);
+	EXPECT_TRUE(receiver != NULL);
+	EXPECT_EQ(receiver->receiver_permissions.receiver, own_id);
 
 	/* Copy into the return buffer. */
 	if (memory_region_ret != NULL) {
@@ -478,28 +529,9 @@ void retrieve_memory(void *recv_buf, ffa_memory_handle_t handle,
 	ASSERT_EQ(ffa_rx_release().func, FFA_SUCCESS_32);
 
 	/* Retrieve the remaining fragments. */
-	fragment_offset = fragment_length;
-	while (fragment_offset < total_length) {
-		dlog_verbose("Calling again. frag offset: %x; total: %x\n",
-			     fragment_offset, total_length);
-		ret = ffa_mem_frag_rx(handle, fragment_offset);
-		EXPECT_EQ(ret.func, FFA_MEM_FRAG_TX_32);
-		EXPECT_EQ(ffa_frag_handle(ret), handle);
-		/* Sender MBZ at virtual instance. */
-		EXPECT_EQ(ffa_frag_sender(ret), 0);
-		fragment_length = ret.arg3;
-		EXPECT_GT(fragment_length, 0);
-		ASSERT_LE(fragment_offset + fragment_length,
-			  memory_region_max_size);
-		if (memory_region_ret != NULL) {
-			memcpy_s((uint8_t *)memory_region_ret + fragment_offset,
-				 memory_region_max_size - fragment_offset,
-				 recv_buf, fragment_length);
-		}
-		fragment_offset += fragment_length;
-		ASSERT_EQ(ffa_rx_release().func, FFA_SUCCESS_32);
-	}
-	EXPECT_EQ(fragment_offset, total_length);
+	memory_region_desc_from_rx_fragments(fragment_length, total_length,
+					     handle, memory_region_ret,
+					     recv_buf, memory_region_max_size);
 }
 
 /*
@@ -547,8 +579,7 @@ ffa_id_t retrieve_memory_from_message(
 	if (!ffa_is_vm_id(own_id) && ffa_is_vm_id(sender) &&
 	    memory_region_ret != NULL) {
 		enum ffa_memory_security retrieved_security =
-			ffa_get_memory_security_attr(
-				memory_region_ret->attributes);
+			memory_region_ret->attributes.security;
 
 		EXPECT_EQ(retrieved_security, FFA_MEMORY_SECURITY_NON_SECURE);
 	}
@@ -563,7 +594,7 @@ ffa_id_t retrieve_memory_from_message(
  */
 ffa_id_t retrieve_memory_from_message_expect_fail(void *recv_buf,
 						  void *send_buf,
-						  int32_t expected_error)
+						  enum ffa_error expected_error)
 {
 	uint32_t msg_size;
 	struct ffa_value ret;
@@ -588,35 +619,40 @@ ffa_id_t retrieve_memory_from_message_expect_fail(void *recv_buf,
 	return sender;
 }
 
-ffa_vm_count_t get_ffa_partition_info(struct ffa_uuid *uuid,
-				      struct ffa_partition_info *info,
-				      size_t info_size, void *recv)
+/**
+ * Helper wrapper around `ffa_partition_info_get`.
+ * Fills `infos` array with partition information and returns number of
+ * partition infos written.
+ */
+ffa_vm_count_t get_ffa_partition_info(struct ffa_uuid uuid,
+				      struct ffa_partition_info infos[],
+				      size_t info_len, void *recv)
 {
 	struct ffa_value ret;
 	struct ffa_partition_info *ret_info = recv;
+	size_t ret_len;
 
-	CHECK(uuid != NULL);
-	CHECK(info != NULL);
+	CHECK(infos != NULL);
 
-	ffa_version(MAKE_FFA_VERSION(1, 1));
-
-	ret = ffa_partition_info_get(uuid, 0);
+	ret = ffa_partition_info_get(&uuid, 0);
 
 	if (ffa_func_id(ret) != FFA_SUCCESS_32) {
 		return 0;
 	}
 
-	if (ret.arg2 != 0) {
-		size_t src_size = ret.arg2 * sizeof(struct ffa_partition_info);
-		size_t dest_size =
-			info_size * sizeof(struct ffa_partition_info);
+	ret_len = ret.arg2;
+	if (ret_len != 0) {
+		size_t src_size = ret_len * sizeof(struct ffa_partition_info);
+		size_t dest_size = info_len * sizeof(struct ffa_partition_info);
 
-		memcpy_s(info, dest_size, ret_info, src_size);
+		CHECK(info_len >= ret_len);
+
+		memcpy_s(infos, dest_size, ret_info, src_size);
 	}
 
 	ffa_rx_release();
 
-	return ret.arg2;
+	return ret_len;
 }
 
 /**
@@ -631,7 +667,7 @@ void dump_boot_info(struct ffa_boot_info_header *boot_info_header)
 		return;
 	}
 
-	HFTEST_LOG("SP boot info (%x):", (uintptr_t)boot_info_header);
+	HFTEST_LOG("SP boot info (%lx):", (uintptr_t)boot_info_header);
 	HFTEST_LOG("  Signature: %x", boot_info_header->signature);
 	HFTEST_LOG("  Version: %x", boot_info_header->version);
 	HFTEST_LOG("  Blob Size: %u", boot_info_header->info_blob_size);
@@ -653,7 +689,7 @@ void dump_boot_info(struct ffa_boot_info_header *boot_info_header)
 		HFTEST_LOG("        Content Format: %x",
 			   ffa_boot_info_content_format(&boot_info_desc[i]));
 		HFTEST_LOG("      Size: %u", boot_info_desc[i].size);
-		HFTEST_LOG("      Value: %x", boot_info_desc[i].content);
+		HFTEST_LOG("      Value: %lx", boot_info_desc[i].content);
 	}
 }
 
@@ -669,7 +705,7 @@ struct ffa_boot_info_desc *get_boot_info_desc(
 	assert(boot_info_header != NULL);
 
 	ASSERT_EQ(boot_info_header->signature, 0xFFAU);
-	ASSERT_EQ(boot_info_header->version, 0x10001U);
+	ASSERT_GE(boot_info_header->version, 0x10001U);
 	ASSERT_EQ(boot_info_header->desc_size,
 		  sizeof(struct ffa_boot_info_desc));
 	ASSERT_EQ((uintptr_t)boot_info_header + boot_info_header->desc_offset,
@@ -795,10 +831,120 @@ bool ffa_partition_info_regs_get_part_info(
 	partition_info->vm_id = info & 0xFFFF;
 	partition_info->vcpu_count = (info >> 16) & 0xFFFF;
 	partition_info->properties = (info >> 32);
-	partition_info->uuid.uuid[0] = uuid_lo & 0xFFFFFFFF;
-	partition_info->uuid.uuid[1] = (uuid_lo >> 32) & 0xFFFFFFFF;
-	partition_info->uuid.uuid[2] = uuid_high & 0xFFFFFFFF;
-	partition_info->uuid.uuid[3] = (uuid_high >> 32) & 0xFFFFFFFF;
+	ffa_uuid_from_u64x2(uuid_lo, uuid_high, &partition_info->uuid);
 
 	return true;
+}
+
+/*
+ * Update security state on S1 page table based on attributes
+ * set in the memory region structure.
+ */
+void update_mm_security_state(struct ffa_composite_memory_region *composite,
+			      ffa_memory_attributes_t attributes)
+{
+	if (attributes.security == FFA_MEMORY_SECURITY_NON_SECURE &&
+	    !ffa_is_vm_id(hf_vm_get_id())) {
+		for (uint32_t i = 0; i < composite->constituent_count; i++) {
+			uint32_t mode;
+
+			if (!hftest_mm_get_mode(
+				    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+				    (const void *)composite->constituents[i]
+					    .address,
+				    FFA_PAGE_SIZE * composite->constituents[i]
+							    .page_count,
+				    &mode)) {
+				FAIL("Couldn't get the mode of the "
+				     "composite.\n");
+			}
+
+			hftest_mm_identity_map(
+				// NOLINTNEXTLINE(performance-no-int-to-ptr)
+				(const void *)composite->constituents[i]
+					.address,
+				FFA_PAGE_SIZE *
+					composite->constituents[i].page_count,
+				mode | MM_MODE_NS);
+		}
+	}
+}
+
+/**
+ * Call FFA_NOTIFICATION_INFO_GET and check the reponse with the values
+ * expected.
+ */
+void ffa_notification_info_get_and_check(
+	const uint32_t expected_lists_count,
+	const uint32_t *const expected_lists_sizes,
+	const uint16_t *const expected_ids)
+{
+	struct ffa_value ret = ffa_notification_info_get();
+
+	EXPECT_EQ(ret.func, FFA_SUCCESS_64);
+	EXPECT_EQ(ffa_notification_info_get_lists_count(ret),
+		  expected_lists_count);
+
+	for (uint32_t i = 0; i < expected_lists_count; i++) {
+		EXPECT_EQ(ffa_notification_info_get_list_size(ret, i + 1),
+			  expected_lists_sizes[i]);
+	}
+
+	EXPECT_EQ(memcmp(&ret.arg3, expected_ids,
+			 sizeof(expected_ids[0] *
+				FFA_NOTIFICATIONS_INFO_GET_MAX_IDS)),
+		  0);
+}
+
+/**
+ * Various tests rely on shared variables among endpoints for test
+ * coordination. This utility is helpful for an endpoint to obtain
+ * the address of a shared page that holds the common variables.
+ */
+uint64_t get_shared_page_from_message(void *recv_buf, void *send_buf,
+				      void *retrieve_buffer)
+{
+	struct ffa_memory_region *memory_region =
+		(struct ffa_memory_region *)retrieve_buffer;
+	struct ffa_composite_memory_region *composite;
+
+	retrieve_memory_from_message(recv_buf, send_buf, NULL, memory_region,
+				     HF_MAILBOX_SIZE);
+	composite = ffa_memory_region_get_composite(memory_region, 0);
+
+	/* Expect memory is NS and needs to be updated. */
+	update_mm_security_state(composite, memory_region->attributes);
+
+	return composite->constituents[0].address;
+}
+
+/**
+ * Share a normal write-back cacheable page with other endpoints in the test.
+ * This page holds common variables used for test coordination. All receivers
+ * have read write permissions to the shared page.
+ */
+void share_page_with_endpoints(uint64_t page, ffa_id_t receivers_ids[],
+			       size_t receivers_count, void *send_buf)
+{
+	struct ffa_memory_region_constituent constituents[] = {
+		{.address = page, .page_count = 1},
+	};
+	struct ffa_memory_access receivers[2];
+
+	/* Currently tests don't need more than two. */
+	assert(receivers_count <= 2);
+
+	/* Provide same level of access to the receivers. */
+	for (size_t i = 0; i < receivers_count; i++) {
+		ffa_memory_access_init(
+			&receivers[i], receivers_ids[i], FFA_DATA_ACCESS_RW,
+			FFA_INSTRUCTION_ACCESS_NOT_SPECIFIED, 0, NULL);
+	}
+
+	send_memory_and_retrieve_request_multi_receiver(
+		FFA_MEM_SHARE_32, send_buf, HF_PRIMARY_VM_ID, constituents,
+		ARRAY_SIZE(constituents), receivers, receivers_count, receivers,
+		receivers_count, 0, 0, FFA_MEMORY_NORMAL_MEM,
+		FFA_MEMORY_NORMAL_MEM, FFA_MEMORY_CACHE_WRITE_BACK,
+		FFA_MEMORY_CACHE_WRITE_BACK);
 }

@@ -93,7 +93,6 @@ TEAR_DOWN(vcpu_state)
  */
 TEST_LONG_RUNNING(vcpu_state, concurrent_save_restore)
 {
-	alignas(4096) static char stack[4096];
 	static struct mailbox_buffers mb;
 	struct cpu_state state;
 
@@ -105,7 +104,15 @@ TEST_LONG_RUNNING(vcpu_state, concurrent_save_restore)
 	state.mb = &mb;
 	state.run_lock = SPINLOCK_INIT;
 	sl_lock(&state.run_lock);
-	ASSERT_TRUE(hftest_cpu_start(hftest_get_cpu_id(1), stack, sizeof(stack),
+
+	/**
+	 * `hftest_get_cpu_id` function makes the assumption that cpus are
+	 * specified in the FDT in reverse order and does the conversion
+	 * MAX_CPUS - index internally. Since legacy VMs do not follow this
+	 * convention, index 7 is passed into `hftest_cpu_get_id`.
+	 */
+	ASSERT_TRUE(hftest_cpu_start(hftest_get_cpu_id(7),
+				     hftest_get_secondary_ec_stack(0),
 				     vm_cpu_entry, (uintptr_t)&state));
 
 	/* Run on a loop until the secondary VM is done. */

@@ -119,6 +119,29 @@
 .endm
 
 /**
+ * Check if VHE support is enabled, equivalent to has_vhe_support(). If
+ * supported, branch to the label provided.
+ */
+.macro vhe_support_check tmp_reg:req, _lbl:req
+	mrs \tmp_reg, id_aa64mmfr1_el1
+	tst \tmp_reg, #(ID_AA64MMFR1_EL1_VH_MASK << ID_AA64MMFR1_EL1_VH_SHIFT)
+	b.ne \_lbl
+.endm
+
+/**
+ * Restore vCPU MTE state.
+ */
+.macro restore_vcpu_mte_context reg_1:req
+	add	x1, \reg_1, #VCPU_MTE
+	ldp	x2, x3, [x1], #16
+	msr	tfsr_el1, x2
+	msr	gcr_el1, x3
+	ldp	x2, x3, [x1]
+	msr	rgsr_el1, x2
+	msr	tfsre0_el1, x3
+.endm
+
+/**
  * The following is the exception table. A pointer to it will be stored in
  * register vbar_el2.
  */
@@ -127,7 +150,7 @@
 .balign 0x800
 vector_table_el2:
 sync_cur_sp0:
-	noreturn_current_exception_sp0 el2 sync_current_exception_noreturn
+	noreturn_current_exception_sp0 el2 sync_current_exception
 
 .balign 0x80
 irq_cur_sp0:
@@ -143,7 +166,7 @@ serr_cur_sp0:
 
 .balign 0x80
 sync_cur_spx:
-	noreturn_current_exception_spx el2 sync_current_exception_noreturn
+	current_exception_spx el2 sync_current_exception
 
 .balign 0x80
 irq_cur_spx:
@@ -190,6 +213,15 @@ serr_lower_32:
 	lower_exception serr_lower
 
 .balign 0x40
+
+
+/**
+ * Instantiate code path for restoring stack and returning.
+ */
+restore_from_stack_and_return el2
+
+exception_handler_return:
+	eret_with_sb
 
 /**
  * pauth_save_vcpu_and_restore_hyp_key
@@ -256,31 +288,17 @@ system_register_access:
 	b vcpu_restore_nonvolatile_and_run
 
 /**
- * Switch to a new vCPU.
+ * Save system registers of the execution context.
  *
- * All volatile registers from the old vCPU have already been saved. We need
- * to save only non-volatile ones from the old vCPU, and restore all from the
- * new one.
- *
- * x0 is a pointer to the new vCPU.
+ * NOTE: x1 holds pointer to current vCPU or the vCPU tracking the normal world
+ * context in case of SPMC.
  */
-vcpu_switch:
-	/* Save non-volatile registers. */
-	mrs x1, tpidr_el2
-	stp x19, x20, [x1, #VCPU_REGS + 8 * 19]
-	stp x21, x22, [x1, #VCPU_REGS + 8 * 21]
-	stp x23, x24, [x1, #VCPU_REGS + 8 * 23]
-	stp x25, x26, [x1, #VCPU_REGS + 8 * 25]
-	stp x27, x28, [x1, #VCPU_REGS + 8 * 27]
-
-	/* Save lazy state. */
+save_sys_registers:
 	/* Use x28 as the base */
 	add x28, x1, #VCPU_LAZY
 
 	/* Check if VHE support is enabled, equivalent to has_vhe_support(). */
-	mrs x19, id_aa64mmfr1_el1
-	tst x19, #(ID_AA64MMFR1_EL1_VH_MASK << ID_AA64MMFR1_EL1_VH_SHIFT)
-	b.ne vhe_save
+	vhe_support_check x19, vhe_save
 
 	mrs x24, sctlr_el1
 	mrs x25, cpacr_el1
@@ -394,283 +412,19 @@ skip_vhe_save:
 	mrs x11, par_el1
 	stp x10, x11, [x28], #16
 
-#if BRANCH_PROTECTION
-	add x2, x1, #(VCPU_PAC + 16)
-	mrs x10, APIBKEYLO_EL1
-	mrs x11, APIBKEYHI_EL1
-	stp x10, x11, [x2], #16
-	mrs x12, APDAKEYLO_EL1
-	mrs x13, APDAKEYHI_EL1
-	stp x12, x13, [x2], #16
-	mrs x14, APDBKEYLO_EL1
-	mrs x15, APDBKEYHI_EL1
-	stp x14, x15, [x2], #16
-	mrs x16, APGAKEYLO_EL1
-	mrs x17, APGAKEYHI_EL1
-	stp x16, x17, [x2], #16
-#endif
-
-	/* Save GIC registers. */
-#if GIC_VERSION == 3 || GIC_VERSION == 4
-	/* Offset is too large, so start from a new base. */
-	add x2, x1, #VCPU_GIC
-
-	mrs x3, ich_hcr_el2
-	mrs x4, icc_sre_el2
-	stp x3, x4, [x2, #16 * 0]
-#endif
-
-	/* Save floating point registers. */
-	/* Use x28 as the base. */
-	add x28, x1, #VCPU_FREGS
-	simd_op_vectors stp, x28
-	mrs x3, fpsr
-	mrs x4, fpcr
-	stp x3, x4, [x28]
-
-	/* Save new vCPU pointer in non-volatile register. */
-	mov x19, x0
-
-	/*
-	 * Save peripheral registers, and inform the arch-independent sections
-	 * that registers have been saved.
-	 */
-	mov x0, x1
-	bl complete_saving_state
-	mov x0, x19
-
-	/* Intentional fallthrough. */
+	ret
 
 /**
- * vcpu_restore_all_and_run
+ * Restore system registers of the execution context.
  *
- * Called from hypervisor entry after cpu_main has returned in 'x0' the address
- * of a vCPU to be resumed on current PE. Either way, fall through from above,
- * in case of a vCPU switch happens with or without world change.
- * Additionally, for the SPMC case cpu_main can return a vCPU from the 'other
- * world VM' in which case this queries returning to the normal world.
+ * NOTE: x1 holds pointer to target vCPU.
  */
-.global vcpu_restore_all_and_run
-vcpu_restore_all_and_run:
-
-#if SECURE_WORLD == 1
-
-	/* Check if vCPU to switch to is from 'other world' VM. */
-	ldr x1, [x0, #VCPU_VM]
-	ldrh w1, [x1, #VM_ID]
-
-	/* Exit to normal world if VM id is HF_OTHER_WORLD_ID. */
-	cmp w1, #HF_OTHER_WORLD_ID
-	bne 0f
-
-	/*
-	 * The current vCPU state is saved, or SPMC exits after a cold or
-	 * warm boot. It's now safe to switch to the normal world.
-	 */
-
-	/* Update pointer to current vCPU. */
-	msr tpidr_el2, x0
-
-	mov x19, x0
-other_world_loop:
-	/* Restore FP status and control registers. */
-	add x18, x19, #VCPU_FPSR
-	ldp x0, x1, [x18]
-	msr fpsr, x0
-	msr fpcr, x1
-
-	/* Check if SVE is implemented. */
-	bl is_arch_feat_sve_supported
-	cbnz x0, sve_context_restore
-
-	/* Restore the other world SIMD context to the other world VM vCPU. */
-	add x18, x19, #VCPU_FREGS
-	simd_op_vectors ldp, x18
-	b sve_skip_context_restore
-
-	/* Restore the other world SVE context from internal buffer. */
-sve_context_restore:
-	adrp x18, sve_context
-	add x18, x18, :lo12: sve_context
-	ldr x0, [x19, #VCPU_CPU]
-	bl cpu_index
-	mov x20, #SVE_CTX_SIZE
-	madd x18, x0, x20, x18
-
-.arch_extension sve
-	/* Restore FFR register before predicates. */
-	ldr p0, [x18]
-	wrffr p0.b
-
-	/* Restore predicate registers. */
-	add x20, x18, #SVE_CTX_PREDICATES
-	sve_predicate_op ldr, x20
-
-	/* Restore vector registers. */
-	add x20, x18, #SVE_CTX_VECTORS
-	sve_op_vectors ldr, x20
-.arch_extension nosve
-
-sve_skip_context_restore:
-	/*
-	 * Prepare arguments from other world VM vCPU.
-	 * x19 holds the other world VM vCPU pointer.
-	 */
-	ldp x0, x1, [x19, #VCPU_REGS + 8 * 0]
-	ldp x2, x3, [x19, #VCPU_REGS + 8 * 2]
-	ldp x4, x5, [x19, #VCPU_REGS + 8 * 4]
-	ldp x6, x7, [x19, #VCPU_REGS + 8 * 6]
-	ldp x8, x9, [x19, #VCPU_REGS + 8 * 8]
-	ldp x10, x11, [x19, #VCPU_REGS + 8 * 10]
-	ldp x12, x13, [x19, #VCPU_REGS + 8 * 12]
-	ldp x14, x15, [x19, #VCPU_REGS + 8 * 14]
-	ldp x16, x17, [x19, #VCPU_REGS + 8 * 16]
-
-#if BRANCH_PROTECTION
-	/*
-	 * EL3 saves pointer authentication keys when entering by SMC.
-	 * Although prefer clearing the keys to be on the safe side.
-	 */
-	msr APIAKEYLO_EL1, xzr
-	msr APIAKEYHI_EL1, xzr
-	msr APIBKEYLO_EL1, xzr
-	msr APIBKEYHI_EL1, xzr
-	msr APDAKEYLO_EL1, xzr
-	msr APDAKEYHI_EL1, xzr
-	msr APDBKEYLO_EL1, xzr
-	msr APDBKEYHI_EL1, xzr
-	msr APGAKEYLO_EL1, xzr
-	msr APGAKEYHI_EL1, xzr
-	/* Omit ISB as SMC following is a context synchronizing event. */
-#endif
-
-#if ENABLE_MTE
-	/* Clearing MTE context. */
-	msr rgsr_el1, xzr
-	msr tfsr_el1, xzr
-	msr tfsr_el2, xzr
-	msr tfsre0_el1, xzr
-#endif
-
-	smc #0
-
-	/*
-	 * The call to EL3 returned, First eight GP registers contain an FF-A
-	 * call from the physical FF-A instance. Save those arguments to the
-	 * other world VM vCPU.
-	 * x19 is restored with the other world VM vCPU pointer.
-	 */
-	stp x0, x1, [x19, #VCPU_REGS + 8 * 0]
-	stp x2, x3, [x19, #VCPU_REGS + 8 * 2]
-	stp x4, x5, [x19, #VCPU_REGS + 8 * 4]
-	stp x6, x7, [x19, #VCPU_REGS + 8 * 6]
-	stp x8, x9, [x19, #VCPU_REGS + 8 * 8]
-	stp x10, x11, [x19, #VCPU_REGS + 8 * 10]
-	stp x12, x13, [x19, #VCPU_REGS + 8 * 12]
-	stp x14, x15, [x19, #VCPU_REGS + 8 * 14]
-	stp x16, x17, [x19, #VCPU_REGS + 8 * 16]
-
-	/* Save FP status and control registers. */
-	mrs x0, fpsr
-	mrs x1, fpcr
-	add x18, x19, #VCPU_FPSR
-	stp x0, x1, [x18]
-
-	/* Check if SVE is implemented. */
-	bl is_arch_feat_sve_supported
-	cbnz x0, sve_context_save
-
-	/* Save the other world SIMD context to the other world VM vCPU. */
-	add x18, x19, #VCPU_FREGS
-	simd_op_vectors stp, x18
-	b sve_skip_context_save
-
-	/* Save the other world SVE context to internal buffer. */
-sve_context_save:
-	adrp x18, sve_context
-	add x18, x18, :lo12: sve_context
-	ldr x0, [x19, #VCPU_CPU]
-	bl cpu_index
-	mov x20, #SVE_CTX_SIZE
-	madd x18, x0, x20, x18
-
-.arch_extension sve
-	/* Save predicate registers. */
-	add x20, x18, #SVE_CTX_PREDICATES
-	sve_predicate_op str, x20
-
-	/* Save FFR register after predicates. */
-	rdffr p0.b
-	str p0, [x18]
-
-	/* Save vector registers. */
-	add x20, x18, #SVE_CTX_VECTORS
-	sve_op_vectors str, x20
-.arch_extension nosve
-
-sve_skip_context_save:
-
-#if BRANCH_PROTECTION
-	pauth_restore_hypervisor_key x0 x1
-#endif
-
-#if ENABLE_MTE
-	mte_restore_hypervisor_state x0
-#endif
-
-	/*
-	 * Stack is at top and execution can restart straight into C code.
-	 * Handle the FF-A call from other world.
-	 */
-	mov x0, x19
-	bl smc_handler_from_nwd
-
-	/*
-	 * If the smc handler returns null this indicates no vCPU has to be
-	 * resumed and GP registers contain a fresh FF-A response or call
-	 * directed to the normal world. Hence loop back and emit SMC again.
-	 * Otherwise restore the vCPU pointed to by the handler return value.
-	 */
-	cbz x0, other_world_loop
-#endif /* SECURE_WORLD */
-
-	/* Intentional fallthrough. */
-
-	/* Update pointer to current vCPU. */
-0:	msr tpidr_el2, x0
-
-	/* Restore peripheral registers. */
-	mov x19, x0
-	bl begin_restoring_state
-	mov x0, x19
-
-	/*
-	 * Restore floating point registers.
-	 */
-	add x2, x0, #VCPU_FREGS
-	simd_op_vectors ldp, x2
-	ldp x3, x4, [x2]
-	msr fpsr, x3
-
-	/*
-	 * Only restore FPCR if changed, to avoid expensive
-	 * self-synchronising operation where possible.
-	 */
-	mrs x5, fpcr
-	cmp x5, x4
-	b.eq vcpu_restore_lazy_and_run
-	msr fpcr, x4
-	/* Intentional fallthrough. */
-
-vcpu_restore_lazy_and_run:
-	/* Restore lazy registers. */
+restore_sys_registers:
 	/* Use x28 as the base. */
-	add x28, x0, #VCPU_LAZY
+	add x28, x1, #VCPU_LAZY
 
 	/* Check if VHE support is enabled, equivalent to has_vhe_support(). */
-	mrs x19, id_aa64mmfr1_el1
-	tst x19, #(ID_AA64MMFR1_EL1_VH_MASK << ID_AA64MMFR1_EL1_VH_SHIFT)
-	b.ne vhe_restore
+	vhe_support_check x19, vhe_restore
 
 	ldp x24, x25, [x28], #16
 	msr sctlr_el1, x24
@@ -793,6 +547,278 @@ skip_vhe_restore:
 	msr cnthctl_el2, x10
 	msr par_el1, x11
 
+	ret
+
+/**
+ * Switch to a new vCPU.
+ *
+ * All volatile registers from the old vCPU have already been saved. We need
+ * to save only non-volatile ones from the old vCPU, and restore all from the
+ * new one.
+ *
+ * x0 is a pointer to the new vCPU.
+ */
+vcpu_switch:
+	/* Save non-volatile registers. */
+	mrs x1, tpidr_el2
+	stp x19, x20, [x1, #VCPU_REGS + 8 * 19]
+	stp x21, x22, [x1, #VCPU_REGS + 8 * 21]
+	stp x23, x24, [x1, #VCPU_REGS + 8 * 23]
+	stp x25, x26, [x1, #VCPU_REGS + 8 * 25]
+	stp x27, x28, [x1, #VCPU_REGS + 8 * 27]
+
+	/* Save lazy state. */
+	bl save_sys_registers
+
+#if BRANCH_PROTECTION
+	add x2, x1, #(VCPU_PAC + 16)
+	mrs x10, APIBKEYLO_EL1
+	mrs x11, APIBKEYHI_EL1
+	stp x10, x11, [x2], #16
+	mrs x12, APDAKEYLO_EL1
+	mrs x13, APDAKEYHI_EL1
+	stp x12, x13, [x2], #16
+	mrs x14, APDBKEYLO_EL1
+	mrs x15, APDBKEYHI_EL1
+	stp x14, x15, [x2], #16
+	mrs x16, APGAKEYLO_EL1
+	mrs x17, APGAKEYHI_EL1
+	stp x16, x17, [x2], #16
+#endif
+
+	/* Save GIC registers. */
+#if GIC_VERSION == 3 || GIC_VERSION == 4
+	/* Offset is too large, so start from a new base. */
+	add x2, x1, #VCPU_GIC
+
+	mrs x3, ich_hcr_el2
+	mrs x4, icc_sre_el2
+	stp x3, x4, [x2, #16 * 0]
+#endif
+
+	/* Save new/old vCPU pointers to non-volatile registers. */
+	mov x19, x0
+	mov x20, x1
+
+	/* Save floating point registers. */
+	mov x0, x20
+	bl arch_fpu_save_to_vcpu
+
+	/*
+	 * Save peripheral registers, and inform the arch-independent sections
+	 * that registers have been saved.
+	 */
+	mov x0, x20
+	bl complete_saving_state
+
+	mov x0, x19
+
+	/* Intentional fallthrough. */
+
+/**
+ * vcpu_restore_all_and_run
+ *
+ * Called from hypervisor entry after cpu_main has returned in 'x0' the address
+ * of a vCPU to be resumed on current PE. Either way, fall through from above,
+ * in case of a vCPU switch happens with or without world change.
+ * Additionally, for the SPMC case cpu_main can return a vCPU from the 'other
+ * world VM' in which case this queries returning to the normal world.
+ */
+.global vcpu_restore_all_and_run
+vcpu_restore_all_and_run:
+
+#if SECURE_WORLD == 1
+
+	/* Check if vCPU to switch to is from 'other world' VM. */
+	ldr x1, [x0, #VCPU_VM]
+	ldrh w1, [x1, #VM_ID]
+
+	/* Exit to normal world if VM id is HF_OTHER_WORLD_ID. */
+	cmp w1, #HF_OTHER_WORLD_ID
+	bne 0f
+
+	/*
+	 * The current vCPU state is saved, or SPMC exits after a cold or
+	 * warm boot. It's now safe to switch to the normal world.
+	 */
+
+	/* Update pointer to current vCPU. */
+	msr tpidr_el2, x0
+
+	mov x19, x0
+other_world_loop:
+	/* Restore 'other world VM' SIMD context. */
+	mov x0, x19
+	bl plat_restore_ns_simd_context
+
+	/*
+	 * A helper utility that serves as a placeholder for SPMC to take
+	 * necessary actions before relinquishing CPU cycles to normal world
+	 * through SMC call.
+	 */
+	mov x0, x19
+	bl spmc_exit_to_nwd
+
+	/* Restore peripheral registers. */
+	add x2, x19, #VCPU_TIMER
+
+	/* Check if VHE support is enabled, equivalent to has_vhe_support(). */
+	vhe_support_check x1, vhe_timer_restore
+
+	/*
+	 * SPMC traps and emulates access to EL1 Physical timer registers from
+	 * Secure Partitions. Hence, no need to save or restore them when
+	 * entering or leaving from/to normal world.
+	 */
+	ldp x24, x25, [x2]
+	msr cntv_cval_el0, x24
+	msr cntv_ctl_el0, x25
+
+	b restore_sys_regs
+
+vhe_timer_restore:
+	ldp x24, x25, [x2]
+	msr cntv_cval_el02, x24
+	msr cntv_ctl_el02, x25
+
+restore_sys_regs:
+	/* Restore 'other world VM' EL1 registers. */
+	mov x1, x19
+	bl restore_sys_registers
+	mov x19, x1
+
+#if BRANCH_PROTECTION
+	/*
+	 * EL3 saves pointer authentication keys when entering by SMC.
+	 * Although prefer clearing the keys to be on the safe side.
+	 */
+	msr APIAKEYLO_EL1, xzr
+	msr APIAKEYHI_EL1, xzr
+	msr APIBKEYLO_EL1, xzr
+	msr APIBKEYHI_EL1, xzr
+	msr APDAKEYLO_EL1, xzr
+	msr APDAKEYHI_EL1, xzr
+	msr APDBKEYLO_EL1, xzr
+	msr APDBKEYHI_EL1, xzr
+	msr APGAKEYLO_EL1, xzr
+	msr APGAKEYHI_EL1, xzr
+	/* Omit ISB as SMC following is a context synchronizing event. */
+#endif
+
+#if ENABLE_MTE
+	restore_vcpu_mte_context x19
+	/* Omit ISB as SMC following is a context synchronizing event. */
+#endif
+
+	/*
+	 * Prepare arguments from other world VM vCPU.
+	 * x19 holds the other world VM vCPU pointer.
+	 */
+	ldp x0, x1, [x19, #VCPU_REGS + 8 * 0]
+	ldp x2, x3, [x19, #VCPU_REGS + 8 * 2]
+	ldp x4, x5, [x19, #VCPU_REGS + 8 * 4]
+	ldp x6, x7, [x19, #VCPU_REGS + 8 * 6]
+	ldp x8, x9, [x19, #VCPU_REGS + 8 * 8]
+	ldp x10, x11, [x19, #VCPU_REGS + 8 * 10]
+	ldp x12, x13, [x19, #VCPU_REGS + 8 * 12]
+	ldp x14, x15, [x19, #VCPU_REGS + 8 * 14]
+	ldp x16, x17, [x19, #VCPU_REGS + 8 * 16]
+
+	smc #0
+
+	/*
+	 * The call to EL3 returned, First eight GP registers contain an FF-A
+	 * call from the physical FF-A instance. Save those arguments to the
+	 * other world VM vCPU.
+	 * x19 is restored with the other world VM vCPU pointer.
+	 */
+	stp x0, x1, [x19, #VCPU_REGS + 8 * 0]
+	stp x2, x3, [x19, #VCPU_REGS + 8 * 2]
+	stp x4, x5, [x19, #VCPU_REGS + 8 * 4]
+	stp x6, x7, [x19, #VCPU_REGS + 8 * 6]
+	stp x8, x9, [x19, #VCPU_REGS + 8 * 8]
+	stp x10, x11, [x19, #VCPU_REGS + 8 * 10]
+	stp x12, x13, [x19, #VCPU_REGS + 8 * 12]
+	stp x14, x15, [x19, #VCPU_REGS + 8 * 14]
+	stp x16, x17, [x19, #VCPU_REGS + 8 * 16]
+
+#if BRANCH_PROTECTION
+	/*
+	 * Pointer authentication keys need not be saved as EL3 takes care
+	 * of saving them upon context switch.
+	 * Restore Normal World APIA key.
+	 */
+	pauth_restore_hypervisor_key x0 x1
+#endif
+
+#if ENABLE_MTE
+	mov x18, x19
+	bl mte_save_vcpu_and_restore_hyp_state
+#endif
+
+	/* Save 'other world VM' EL1 registers. */
+	mov x1, x19
+	bl save_sys_registers
+	mov x19, x1
+
+	/* Save Peripheral registers. */
+	add x2, x19, #VCPU_TIMER
+
+	/* Check if VHE support is enabled, equivalent to has_vhe_support(). */
+	vhe_support_check x23, vhe_timer_save
+
+	mrs x24, cntv_cval_el0
+	mrs x25, cntv_ctl_el0
+
+	b handle_smc_from_nwd
+
+vhe_timer_save:
+	mrs x24, cntv_cval_el02
+	mrs x25, cntv_ctl_el02
+
+handle_smc_from_nwd:
+	stp x24, x25, [x2]
+	/*
+	 * Stack is at top and execution can restart straight into C code.
+	 * Handle the FF-A call from other world.
+	 */
+	mov x0, x19
+	bl smc_handler_from_nwd
+
+	/*
+	 * If the smc handler returns null this indicates no vCPU has to be
+	 * resumed and GP registers contain a fresh FF-A response or call
+	 * directed to the normal world. Hence loop back and emit SMC again.
+	 * Otherwise restore the vCPU pointed to by the handler return value.
+	 */
+	cbz x0, other_world_loop
+#endif /* SECURE_WORLD */
+
+	/* Intentional fallthrough. */
+
+	/* Update pointer to the next vCPU being resumed. */
+0:	msr tpidr_el2, x0
+
+	/* Restore peripheral registers. */
+	mov x19, x0
+	bl begin_restoring_state
+
+	/*
+	 * Restore floating point registers.
+	 */
+	mov x0, x19
+	bl arch_fpu_restore_from_vcpu
+
+	mov x0, x19
+
+	/* Intentional fallthrough. */
+
+vcpu_restore_lazy_and_run:
+	mov x1, x0
+
+	/* Restore lazy registers. */
+	bl restore_sys_registers
+
 #if BRANCH_PROTECTION
 	add x2, x0, #(VCPU_PAC + 16)
 	ldp x10, x11, [x2], #16
@@ -857,14 +883,7 @@ vcpu_restore_volatile_and_run:
 #endif
 
 #if ENABLE_MTE
-	/* Restore vCPU MTE state. */
-	add	x1, x0, #VCPU_MTE
-	ldp	x2, x3, [x1], #16
-	msr	tfsr_el1, x2
-	msr	gcr_el1, x3
-	ldp	x2, x3, [x1]
-	msr	rgsr_el1, x2
-	msr	tfsre0_el1, x3
+	restore_vcpu_mte_context x0
 	/* Omit ISB as ERET following is a context synchronizing event. */
 #endif
 
@@ -884,12 +903,14 @@ vcpu_restore_volatile_and_run:
 	msr spsr_el2, x2
 
 	ldp x1, x2, [x0, #VCPU_REGS + 8 * 33]
-	ldp x3, xzr, [x0, #VCPU_REGS + 8 * 35]
 	msr hcr_el2, x1
 	isb
 
 	msr ttbr0_el2, x2
-	msr sctlr_el2, x3
+
+	ldp x1, x2, [x0, #VCPU_REGS + 8 * 35]
+	msr sctlr_el2, x1
+	msr cptr_el2, x2
 	isb
 
 	/* Restore x0..x3, which we have used as scratch before. */

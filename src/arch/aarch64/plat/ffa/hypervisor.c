@@ -20,6 +20,7 @@
 #include "hf/std.h"
 #include "hf/vcpu.h"
 #include "hf/vm.h"
+#include "hf/vm_ids.h"
 
 #include "msr.h"
 #include "smc.h"
@@ -27,34 +28,10 @@
 
 static bool ffa_tee_enabled;
 
-alignas(FFA_PAGE_SIZE) static uint8_t other_world_send_buffer[HF_MAILBOX_SIZE];
-alignas(FFA_PAGE_SIZE) static uint8_t other_world_recv_buffer[HF_MAILBOX_SIZE];
-
-/**
- * Buffer for retrieving memory region information from the other world for when
- * a region is reclaimed by a VM. Access to this buffer must be guarded by the
- * VM lock of the other world VM.
- */
-alignas(PAGE_SIZE) static uint8_t
-	other_world_retrieve_buffer[HF_MAILBOX_SIZE * MAX_FRAGMENTS];
-
 bool vm_supports_indirect_messages(struct vm *vm)
 {
-	return vm->ffa_version >= MAKE_FFA_VERSION(1, 1) &&
+	return vm->ffa_version >= FFA_VERSION_1_1 &&
 	       vm_supports_messaging_method(vm, FFA_PARTITION_INDIRECT_MSG);
-}
-
-/** Returns information on features specific to the NWd. */
-struct ffa_value plat_ffa_features(uint32_t function_feature_id)
-{
-	switch (function_feature_id) {
-	case FFA_MSG_POLL_32:
-	case FFA_YIELD_32:
-	case FFA_MSG_SEND_32:
-		return (struct ffa_value){.func = FFA_SUCCESS_32};
-	default:
-		return ffa_error(FFA_NOT_SUPPORTED);
-	}
 }
 
 struct ffa_value plat_ffa_spmc_id_get(void)
@@ -100,6 +77,18 @@ void plat_ffa_init(struct mpool *ppool)
 {
 	struct vm *other_world_vm = vm_find(HF_OTHER_WORLD_ID);
 	struct ffa_value ret;
+	struct mm_stage1_locked mm_stage1_locked;
+
+	/* This is a segment from TDRAM for the NS memory in the FVP platform.
+	 *
+	 * TODO: We ought to provide a better way to do this, if porting the
+	 * hypervisor to other platforms. One option would be to provide this
+	 * via DTS.
+	 */
+	const uint64_t start = 0x90000000;
+	const uint64_t len = 0x60000000;
+	const paddr_t send_addr = pa_init(start + len - PAGE_SIZE * 1);
+	const paddr_t recv_addr = pa_init(start + len - PAGE_SIZE * 2);
 
 	(void)ppool;
 
@@ -122,9 +111,19 @@ void plat_ffa_init(struct mpool *ppool)
 		panic("Hypervisor and SPMC versions are not compatible.\n");
 	}
 
-	/* Setup TEE VM RX/TX buffers */
-	other_world_vm->mailbox.send = &other_world_send_buffer;
-	other_world_vm->mailbox.recv = &other_world_recv_buffer;
+	/*
+	 * Setup TEE VM RX/TX buffers.
+	 * Using the following hard-coded addresses, as they must be within the
+	 * NS memory node in the SPMC manifest. From that region we should
+	 * exclude the Hypervisor's address space to prevent SPs from using that
+	 * memory in memory region nodes, or for the NWd to misuse that memory
+	 * in runtime via memory sharing interfaces.
+	 */
+
+	// NOLINTNEXTLINE(performance-no-int-to-ptr)
+	other_world_vm->mailbox.send = (void *)pa_addr(send_addr);
+	// NOLINTNEXTLINE(performance-no-int-to-ptr)
+	other_world_vm->mailbox.recv = (void *)pa_addr(recv_addr);
 
 	/*
 	 * Note that send and recv are swapped around, as the send buffer from
@@ -139,6 +138,22 @@ void plat_ffa_init(struct mpool *ppool)
 
 	ffa_tee_enabled = true;
 
+	/*
+	 * Hypervisor will write to secure world receive buffer, and will read
+	 * from the secure world send buffer.
+	 *
+	 * Mapping operation is necessary because the ranges are outside of the
+	 * hypervisor's binary.
+	 */
+	mm_stage1_locked = mm_lock_stage1();
+	CHECK(mm_identity_map(mm_stage1_locked, send_addr,
+			      pa_add(send_addr, PAGE_SIZE),
+			      MM_MODE_R | MM_MODE_SHARED, ppool) != NULL);
+	CHECK(mm_identity_map(
+		      mm_stage1_locked, recv_addr, pa_add(recv_addr, PAGE_SIZE),
+		      MM_MODE_R | MM_MODE_W | MM_MODE_SHARED, ppool) != NULL);
+	mm_unlock_stage1(&mm_stage1_locked);
+
 	dlog_verbose("TEE finished setting up buffers.\n");
 }
 
@@ -149,7 +164,7 @@ bool plat_ffa_run_forward(ffa_id_t vm_id, ffa_vcpu_index_t vcpu_idx,
 	 * VM's requests should be forwarded to the SPMC, if target is an SP.
 	 */
 	if (!vm_id_is_current_world(vm_id)) {
-		*ret = arch_other_world_call((struct ffa_value){
+		*ret = arch_other_world_call_ext((struct ffa_value){
 			.func = FFA_RUN_32, ffa_vm_vcpu(vm_id, vcpu_idx)});
 		return true;
 	}
@@ -160,7 +175,8 @@ bool plat_ffa_run_forward(ffa_id_t vm_id, ffa_vcpu_index_t vcpu_idx,
 /**
  * Check validity of the FF-A memory send function attempt.
  */
-bool plat_ffa_is_memory_send_valid(ffa_id_t receiver_vm_id, uint32_t share_func)
+bool plat_ffa_is_memory_send_valid(ffa_id_t receiver, ffa_id_t sender,
+				   uint32_t share_func, bool multiple_borrower)
 {
 	/*
 	 * Currently memory interfaces are not forwarded from hypervisor to
@@ -169,7 +185,10 @@ bool plat_ffa_is_memory_send_valid(ffa_id_t receiver_vm_id, uint32_t share_func)
 	 */
 
 	(void)share_func;
-	(void)receiver_vm_id;
+	(void)receiver;
+	(void)sender;
+	(void)multiple_borrower;
+
 	return true;
 }
 
@@ -188,15 +207,15 @@ bool plat_ffa_is_direct_request_valid(struct vcpu *current,
 	 * a different sender.
 	 */
 	return sender_vm_id != receiver_vm_id &&
-	       sender_vm_id == current_vm_id &&
-	       current_vm_id == HF_PRIMARY_VM_ID;
+	       sender_vm_id == current_vm_id && vm_is_primary(current->vm);
 }
 
 /**
- * Check validity of a FF-A notifications bitmap create.
+ * Check validity of the calls:
+ * FFA_NOTIFICATION_BITMAP_CREATE/FFA_NOTIFICATION_BITMAP_DESTROY.
  */
-bool plat_ffa_is_notifications_create_valid(struct vcpu *current,
-					    ffa_id_t vm_id)
+struct ffa_value plat_ffa_is_notifications_bitmap_access_valid(
+	struct vcpu *current, ffa_id_t vm_id)
 {
 	/*
 	 * Call should only be used by the Hypervisor, so any attempt of
@@ -205,14 +224,15 @@ bool plat_ffa_is_notifications_create_valid(struct vcpu *current,
 	(void)current;
 	(void)vm_id;
 
-	return false;
+	return ffa_error(FFA_NOT_SUPPORTED);
 }
 
 bool plat_ffa_is_direct_request_supported(struct vm *sender_vm,
-					  struct vm *receiver_vm)
+					  struct vm *receiver_vm, uint32_t func)
 {
 	(void)sender_vm;
 	(void)receiver_vm;
+	(void)func;
 
 	/*
 	 * As Hypervisor is only meant to be used as a test artifact, allow
@@ -244,21 +264,35 @@ bool plat_ffa_direct_request_forward(ffa_id_t receiver_vm_id,
 				     struct ffa_value *ret)
 {
 	if (!ffa_tee_enabled) {
+		dlog_verbose("Not forwarding: ffa_tee_enabled is false\n");
 		return false;
 	}
 
 	/*
 	 * VM's requests should be forwarded to the SPMC, if receiver is an SP.
 	 */
-	if (!vm_id_is_current_world(receiver_vm_id)) {
-		dlog_verbose("%s calling SPMC %#x %#x %#x %#x %#x\n", __func__,
-			     args.func, args.arg1, args.arg2, args.arg3,
-			     args.arg4);
-		*ret = arch_other_world_call(args);
-		return true;
+	if (vm_id_is_current_world(receiver_vm_id)) {
+		dlog_verbose(
+			"Not forwarding: receiver VM %#x is in the same "
+			"world\n",
+			receiver_vm_id);
+		return false;
 	}
 
-	return false;
+	switch (args.func) {
+	case FFA_MSG_SEND_DIRECT_REQ_32:
+	case FFA_MSG_SEND_DIRECT_REQ_64:
+		*ret = arch_other_world_call(args);
+		break;
+	case FFA_MSG_SEND_DIRECT_REQ2_64:
+		*ret = arch_other_world_call_ext(args);
+		break;
+	default:
+		panic("Invalid direct message function %#x\n", args.func);
+		break;
+	}
+
+	return true;
 }
 
 bool plat_ffa_rx_release_forward(struct vm_locked vm_locked,
@@ -330,6 +364,17 @@ bool plat_ffa_acquire_receiver_rx(struct vm_locked to_locked,
 	return other_world_ret.func == FFA_SUCCESS_32;
 }
 
+bool plat_ffa_intercept_call(struct vcpu_locked current_locked,
+			     struct vcpu_locked next_locked,
+			     struct ffa_value *signal_interrupt)
+{
+	(void)current_locked;
+	(void)next_locked;
+	(void)signal_interrupt;
+
+	return false;
+}
+
 bool plat_ffa_is_indirect_msg_supported(struct vm_locked sender_locked,
 					struct vm_locked receiver_locked)
 {
@@ -357,7 +402,7 @@ bool plat_ffa_msg_send2_forward(ffa_id_t receiver_vm_id, ffa_id_t sender_vm_id,
 		if (ffa_func_id(*ret) != FFA_SUCCESS_32) {
 			dlog_verbose(
 				"Failed forwarding FFA_MSG_SEND2_32 to the "
-				"SPMC, got error (%d).\n",
+				"SPMC, got error (%lu).\n",
 				ret->arg2);
 		}
 
@@ -385,7 +430,7 @@ uint32_t plat_ffa_other_world_mode(void)
 }
 
 ffa_partition_properties_t plat_ffa_partition_properties(
-	ffa_id_t vm_id, const struct vm *target)
+	ffa_id_t caller_id, const struct vm *target)
 {
 	ffa_partition_properties_t result = target->messaging_method;
 	/*
@@ -393,10 +438,10 @@ ffa_partition_properties_t plat_ffa_partition_properties(
 	 * Primary VM cannot receive direct requests.
 	 * Secondary VMs cannot send direct requests.
 	 */
-	if (!vm_id_is_current_world(vm_id)) {
+	if (!vm_id_is_current_world(caller_id)) {
 		result &= ~FFA_PARTITION_INDIRECT_MSG;
 	}
-	if (target->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(target)) {
 		result &= ~FFA_PARTITION_DIRECT_REQ_RECV;
 	} else {
 		result &= ~FFA_PARTITION_DIRECT_REQ_SEND;
@@ -468,7 +513,7 @@ bool plat_ffa_notification_set_forward(ffa_id_t sender_vm_id,
 	*ret = arch_other_world_call((struct ffa_value){
 		.func = FFA_NOTIFICATION_SET_32,
 		.arg1 = (sender_vm_id << 16) | receiver_vm_id,
-		.arg2 = flags,
+		.arg2 = flags & ~FFA_NOTIFICATIONS_FLAG_DELAY_SRI,
 		.arg3 = (uint32_t)(bitmap),
 		.arg4 = (uint32_t)(bitmap >> 32),
 	});
@@ -751,7 +796,7 @@ void plat_ffa_rxtx_unmap_forward(struct vm_locked vm_locked)
 		(struct ffa_value){.func = FFA_RXTX_UNMAP_32,
 				   .arg1 = id << FFA_RXTX_ALLOCATOR_SHIFT});
 	func = ret.func & ~SMCCC_CONVENTION_MASK;
-	if (ret.func == SMCCC_ERROR_UNKNOWN) {
+	if (ret.func == (uint64_t)SMCCC_ERROR_UNKNOWN) {
 		panic("Unknown error forwarding RXTX_UNMAP.\n");
 	} else if (func == FFA_ERROR_32) {
 		panic("Error %d forwarding RX/TX buffers.\n", ret.arg2);
@@ -785,7 +830,7 @@ bool plat_ffa_run_checks(struct vcpu_locked current_locked,
 	(void)vcpu_idx;
 
 	/* Only the primary VM can switch vCPUs. */
-	if (current_locked.vcpu->vm->id != HF_PRIMARY_VM_ID) {
+	if (!vm_is_primary(current_locked.vcpu->vm)) {
 		run_ret->arg2 = FFA_DENIED;
 		return false;
 	}
@@ -810,11 +855,6 @@ void plat_ffa_handle_secure_interrupt(struct vcpu *current, struct vcpu **next)
 	CHECK(false);
 }
 
-void plat_ffa_sri_state_set(enum plat_ffa_sri_state state)
-{
-	(void)state;
-}
-
 /**
  * An Hypervisor should send the SRI to the Primary Endpoint. Not implemented
  * as Hypervisor is only interesting for us for the sake of having a test
@@ -827,6 +867,15 @@ void plat_ffa_sri_trigger_if_delayed(struct cpu *cpu)
 }
 
 void plat_ffa_sri_trigger_not_delayed(struct cpu *cpu)
+{
+	(void)cpu;
+}
+
+/**
+ * Track that in current CPU there was a notification set with delay SRI
+ * flag.
+ */
+void plat_ffa_sri_set_delayed(struct cpu *cpu)
 {
 	(void)cpu;
 }
@@ -1023,7 +1072,7 @@ struct ffa_value plat_ffa_msg_recv(bool block,
 	 * The primary VM will receive messages as a status code from running
 	 * vCPUs and must not call this function.
 	 */
-	if (vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(vm)) {
 		return ffa_error(FFA_NOT_SUPPORTED);
 	}
 
@@ -1096,6 +1145,7 @@ bool plat_ffa_check_runtime_state_transition(struct vcpu_locked current_locked,
 		/* Fall through. */
 	case FFA_MSG_SEND_DIRECT_REQ_64:
 	case FFA_MSG_SEND_DIRECT_REQ_32:
+	case FFA_MSG_SEND_DIRECT_REQ2_64:
 	case FFA_RUN_32:
 		*next_state = VCPU_STATE_BLOCKED;
 		return true;
@@ -1103,6 +1153,7 @@ bool plat_ffa_check_runtime_state_transition(struct vcpu_locked current_locked,
 		/* Fall through. */
 	case FFA_MSG_SEND_DIRECT_RESP_64:
 	case FFA_MSG_SEND_DIRECT_RESP_32:
+	case FFA_MSG_SEND_DIRECT_RESP2_64:
 		*next_state = VCPU_STATE_WAITING;
 		return true;
 	default:
@@ -1142,23 +1193,6 @@ void plat_ffa_unwind_call_chain_ffa_direct_resp(
 	(void)next_locked;
 }
 
-bool plat_ffa_intercept_direct_response(struct vcpu_locked current_locked,
-					struct vcpu **next,
-					struct ffa_value to_ret,
-					struct ffa_value *signal_interrupt)
-{
-	/*
-	 * Only applicable to SPMC as it signals virtual secure interrupt to
-	 * S-EL0 partitions.
-	 */
-	(void)current_locked;
-	(void)next;
-	(void)to_ret;
-	(void)signal_interrupt;
-
-	return false;
-}
-
 /**
  * Enable relevant virtual interrupts for VMs.
  */
@@ -1177,25 +1211,18 @@ void plat_ffa_enable_virtual_interrupts(struct vcpu_locked current_locked,
 	}
 }
 
-bool plat_ffa_is_direct_response_interrupted(struct vcpu_locked current_locked)
-{
-	(void)current_locked;
-	return false;
-}
-
 /** Forwards a memory send message on to the other world. */
 static struct ffa_value memory_send_other_world_forward(
-	struct vm_locked other_world_locked, ffa_id_t sender_vm_id,
-	uint32_t share_func, struct ffa_memory_region *memory_region,
-	uint32_t memory_share_length, uint32_t fragment_length)
+	struct vm_locked other_world_locked, uint32_t share_func,
+	struct ffa_memory_region *memory_region, uint32_t memory_share_length,
+	uint32_t fragment_length)
 {
 	struct ffa_value ret;
 
 	/* Use its own RX buffer. */
 	memcpy_s(other_world_locked.vm->mailbox.recv, FFA_MSG_PAYLOAD_MAX,
 		 memory_region, fragment_length);
-	other_world_locked.vm->mailbox.recv_size = fragment_length;
-	other_world_locked.vm->mailbox.recv_sender = sender_vm_id;
+
 	other_world_locked.vm->mailbox.recv_func = share_func;
 	other_world_locked.vm->mailbox.state = MAILBOX_STATE_FULL;
 	ret = arch_other_world_call(
@@ -1256,8 +1283,8 @@ static struct ffa_value ffa_memory_other_world_send(
 
 		/* Forward memory send message on to other world. */
 		ret = memory_send_other_world_forward(
-			to_locked, from_locked.vm->id, share_func,
-			memory_region, memory_share_length, fragment_length);
+			to_locked, share_func, memory_region,
+			memory_share_length, fragment_length);
 		if (ret.func != FFA_SUCCESS_32) {
 			dlog_verbose(
 				"%s: failed to forward memory send message to "
@@ -1320,8 +1347,8 @@ static struct ffa_value ffa_memory_other_world_send(
 		 * have so far.
 		 */
 		ret = memory_send_other_world_forward(
-			to_locked, from_locked.vm->id, share_func,
-			memory_region, memory_share_length, fragment_length);
+			to_locked, share_func, memory_region,
+			memory_share_length, fragment_length);
 		if (ret.func != FFA_MEM_FRAG_RX_32) {
 			dlog_warning(
 				"%s: failed to forward to other world: "
@@ -1343,7 +1370,7 @@ static struct ffa_value ffa_memory_other_world_send(
 		if (ret.arg3 != fragment_length) {
 			dlog_warning(
 				"%s: got unexpected fragment offset for %s "
-				"from other world (expected %d, got %d)\n",
+				"from other world (expected %d, got %lu)\n",
 				__func__, ffa_func_name(FFA_MEM_FRAG_RX_32),
 				fragment_length, ret.arg3);
 			ret = ffa_error(FFA_INVALID_PARAMETERS);
@@ -1451,7 +1478,7 @@ static struct ffa_value deliver_msg(struct vm_locked to, ffa_id_t from_id,
 	};
 
 	/* Messages for the primary VM are delivered directly. */
-	if (to.vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(to.vm)) {
 		/*
 		 * Only tell the primary VM the size and other details if the
 		 * message is for it, to avoid leaking data about messages for
@@ -1516,7 +1543,7 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 
 	share_state = get_share_state(share_states, handle);
 	if (share_state == NULL) {
-		dlog_verbose("Unable to find share state for handle %#x.\n",
+		dlog_verbose("Unable to find share state for handle %#lx.\n",
 			     handle);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
 		goto out;
@@ -1528,7 +1555,7 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 	if (vm_id_is_current_world(to_locked.vm->id) &&
 	    to_locked.vm->id != memory_region->sender) {
 		dlog_verbose(
-			"VM %#x attempted to reclaim memory handle %#x "
+			"VM %#x attempted to reclaim memory handle %#lx "
 			"originally sent by VM %#x.\n",
 			to_locked.vm->id, handle, memory_region->sender);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
@@ -1537,7 +1564,7 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 
 	if (!share_state->sending_complete) {
 		dlog_verbose(
-			"Memory with handle %#x not fully sent, can't "
+			"Memory with handle %#lx not fully sent, can't "
 			"reclaim.\n",
 			handle);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
@@ -1545,21 +1572,26 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 	}
 
 	for (uint32_t i = 0; i < memory_region->receiver_count; i++) {
+		struct ffa_memory_access *receiver =
+			ffa_memory_region_get_receiver(memory_region, i);
+		struct ffa_memory_region_attributes receiver_permissions;
+
+		CHECK(receiver != NULL);
+
+		receiver_permissions = receiver->receiver_permissions;
+
 		/* Skip the entries that relate to SPs. */
-		if (!ffa_is_vm_id(memory_region->receivers[i]
-					  .receiver_permissions.receiver)) {
+		if (!ffa_is_vm_id(receiver_permissions.receiver)) {
 			continue;
 		}
 
 		/* Check that all VMs have relinquished. */
 		if (share_state->retrieved_fragment_count[i] != 0) {
 			dlog_verbose(
-				"Tried to reclaim memory handle %#x "
+				"Tried to reclaim memory handle %#lx "
 				"that has not been relinquished by all "
 				"borrowers(%x).\n",
-				handle,
-				memory_region->receivers[i]
-					.receiver_permissions.receiver);
+				handle, receiver_permissions.receiver);
 			ret = ffa_error(FFA_DENIED);
 			goto out;
 		}
@@ -1593,7 +1625,8 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 		to_locked, share_state->fragments,
 		share_state->fragment_constituent_counts,
 		share_state->fragment_count, share_state->sender_orig_mode,
-		FFA_MEM_RECLAIM_32, flags & FFA_MEM_RECLAIM_CLEAR, page_pool);
+		FFA_MEM_RECLAIM_32, flags & FFA_MEM_RECLAIM_CLEAR, page_pool,
+		NULL, false);
 
 	if (ret.func == FFA_SUCCESS_32) {
 		share_state_free(share_states, share_state, page_pool);
@@ -1614,7 +1647,7 @@ struct ffa_value plat_ffa_other_world_mem_reclaim(
 	struct two_vm_locked vm_to_from_lock;
 
 	if (!ffa_tee_enabled) {
-		dlog_verbose("Invalid handle %#x for FFA_MEM_RECLAIM.\n",
+		dlog_verbose("Invalid handle %#lx for FFA_MEM_RECLAIM.\n",
 			     handle);
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
@@ -1630,126 +1663,6 @@ struct ffa_value plat_ffa_other_world_mem_reclaim(
 	return ret;
 }
 
-struct ffa_value plat_ffa_other_world_mem_retrieve(
-	struct vm_locked to_locked, struct ffa_memory_region *retrieve_request,
-	uint32_t length, struct mpool *page_pool)
-{
-	struct ffa_memory_region_constituent *constituents = NULL;
-	struct ffa_value ret;
-	struct ffa_memory_region *memory_region;
-	struct vm *from;
-	struct vm_locked from_locked;
-	struct ffa_composite_memory_region *composite;
-	uint32_t receiver_index;
-	uint32_t fragment_length;
-	uint32_t share_func;
-	ffa_memory_region_flags_t transaction_type;
-
-	/*
-	 * TODO: Is there a way to retrieve the sender's original attributes
-	 * if it is an SP? Such that a receiver VM does not get more privilege
-	 * than a sender SP.
-	 */
-	uint32_t memory_to_attributes = MM_MODE_R | MM_MODE_W | MM_MODE_X;
-
-	assert(length <= HF_MAILBOX_SIZE);
-
-	if (!ffa_tee_enabled) {
-		dlog_verbose("There isn't a TEE in the system.\n");
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	from = vm_find(HF_TEE_VM_ID);
-	assert(from != NULL);
-	from_locked = vm_lock(from);
-
-	/* Copy retrieve request to the SPMC's RX buffer. */
-	memcpy_s(from->mailbox.recv, HF_MAILBOX_SIZE, retrieve_request, length);
-
-	ret = arch_other_world_call(
-		(struct ffa_value){.func = FFA_MEM_RETRIEVE_REQ_32,
-				   .arg1 = length,
-				   .arg2 = length});
-	if (ret.func == FFA_ERROR_32) {
-		dlog_verbose(
-			"Fail to forward FFA_MEM_RETRIEVE_REQ to the SPMC.\n");
-		goto out;
-	}
-
-	/* Check we received a valid memory retrieve response from the SPMC. */
-	CHECK(ret.func == FFA_MEM_RETRIEVE_RESP_32);
-
-	fragment_length = ret.arg2;
-	CHECK(fragment_length >=
-	      sizeof(struct ffa_memory_region) +
-		      sizeof(struct ffa_memory_access) +
-		      sizeof(struct ffa_composite_memory_region));
-	CHECK(fragment_length <= sizeof(other_world_retrieve_buffer));
-
-	/* Retrieve the retrieve response from SPMC. */
-	memcpy_s(other_world_retrieve_buffer,
-		 sizeof(other_world_retrieve_buffer),
-		 from_locked.vm->mailbox.send, fragment_length);
-
-	memory_region = (struct ffa_memory_region *)other_world_retrieve_buffer;
-
-	if (retrieve_request->sender != memory_region->sender) {
-		dlog_verbose(
-			"Retrieve request doesn't match the received memory "
-			"region from SPMC.\n");
-		ret = ffa_error(FFA_INVALID_PARAMETERS);
-		goto out;
-	}
-
-	receiver_index =
-		ffa_memory_region_get_receiver(memory_region, to_locked.vm->id);
-	CHECK(receiver_index == 0);
-
-	composite =
-		ffa_memory_region_get_composite(memory_region, receiver_index);
-	constituents = &composite->constituents[0];
-
-	/* Get the share func ID from the transaction type flag. */
-	transaction_type =
-		memory_region->flags & FFA_MEMORY_REGION_TRANSACTION_TYPE_MASK;
-	switch (transaction_type) {
-	case FFA_MEMORY_REGION_TRANSACTION_TYPE_SHARE:
-		share_func = FFA_MEM_SHARE_32;
-		break;
-	case FFA_MEMORY_REGION_TRANSACTION_TYPE_LEND:
-		share_func = FFA_MEM_LEND_32;
-		break;
-	case FFA_MEMORY_REGION_TRANSACTION_TYPE_DONATE:
-		share_func = FFA_MEM_DONATE_32;
-		break;
-	case FFA_MEMORY_REGION_TRANSACTION_TYPE_UNSPECIFIED:
-	default:
-		panic("Invalid transaction in memory region flag: %x\n",
-		      transaction_type);
-	}
-
-	CHECK(ffa_retrieve_check_update(
-		      to_locked, &constituents, &composite->constituent_count,
-		      1, memory_to_attributes, share_func, false, page_pool)
-		      .func == FFA_SUCCESS_32);
-
-	/* Acquire RX buffer from the SPMC and copy the retrieve response. */
-	CHECK(plat_ffa_acquire_receiver_rx(to_locked, NULL));
-	memcpy_s(to_locked.vm->mailbox.recv, HF_MAILBOX_SIZE, memory_region,
-		 fragment_length);
-
-	to_locked.vm->mailbox.recv_size = length;
-	to_locked.vm->mailbox.recv_sender = HF_HYPERVISOR_VM_ID;
-	to_locked.vm->mailbox.recv_func = FFA_MEM_RETRIEVE_RESP_32;
-	to_locked.vm->mailbox.state = MAILBOX_STATE_FULL;
-
-out:
-	vm_unlock(&from_locked);
-
-	/* Return ret as received from the SPMC. */
-	return ret;
-}
-
 /**
  * Forwards a memory send continuation message on to the other world.
  */
@@ -1761,8 +1674,7 @@ static struct ffa_value memory_send_continue_other_world_forward(
 
 	memcpy_s(other_world_locked.vm->mailbox.recv, FFA_MSG_PAYLOAD_MAX,
 		 fragment, fragment_length);
-	other_world_locked.vm->mailbox.recv_size = fragment_length;
-	other_world_locked.vm->mailbox.recv_sender = sender_vm_id;
+
 	other_world_locked.vm->mailbox.recv_func = FFA_MEM_FRAG_TX_32;
 	other_world_locked.vm->mailbox.state = MAILBOX_STATE_FULL;
 	ret = arch_other_world_call(
@@ -1873,8 +1785,8 @@ static struct ffa_value ffa_memory_other_world_send_continue(
 				dlog_verbose(
 					"other_world didn't successfully "
 					"complete "
-					"memory send operation; returned %#x "
-					"(%d). Rolling back.\n",
+					"memory send operation; returned %#lx "
+					"(%lu). Rolling back.\n",
 					ret.func, ret.arg2);
 
 				/*
@@ -1887,12 +1799,15 @@ static struct ffa_value ffa_memory_other_world_send_continue(
 				 * update.
 				 */
 				CHECK(ffa_region_group_identity_map(
-					from_locked, share_state->fragments,
-					share_state
-						->fragment_constituent_counts,
-					share_state->fragment_count,
-					share_state->sender_orig_mode,
-					&local_page_pool, true));
+					      from_locked,
+					      share_state->fragments,
+					      share_state
+						      ->fragment_constituent_counts,
+					      share_state->fragment_count,
+					      share_state->sender_orig_mode,
+					      &local_page_pool,
+					      MAP_ACTION_COMMIT, NULL)
+					      .func == FFA_SUCCESS_32);
 			}
 		} else {
 			/* Abort sending to other_world. */
@@ -1910,7 +1825,7 @@ static struct ffa_value ffa_memory_other_world_send_continue(
 				dlog_verbose(
 					"other_world didn't successfully abort "
 					"failed memory send operation; "
-					"returned %#x %d).\n",
+					"returned %#lx %lu).\n",
 					other_world_ret.func,
 					other_world_ret.arg2);
 			}
@@ -1936,9 +1851,9 @@ static struct ffa_value ffa_memory_other_world_send_continue(
 		    ffa_frag_sender(ret) != from_locked.vm->id) {
 			dlog_verbose(
 				"Got unexpected result from forwarding "
-				"FFA_MEM_FRAG_TX to other_world: %#x (handle "
-				"%#x, offset %d, sender %d); expected "
-				"FFA_MEM_FRAG_RX (handle %#x, offset %d, "
+				"FFA_MEM_FRAG_TX to other_world: %#lx (handle "
+				"%#lx, offset %lu, sender %d); expected "
+				"FFA_MEM_FRAG_RX (handle %#lx, offset %d, "
 				"sender %d).\n",
 				ret.func, ffa_frag_handle(ret), ret.arg3,
 				ffa_frag_sender(ret), handle,
@@ -2123,7 +2038,7 @@ ffa_memory_attributes_t plat_ffa_memory_security_mode(
 }
 
 struct ffa_value plat_ffa_error_32(struct vcpu *current, struct vcpu **next,
-				   uint32_t error_code)
+				   enum ffa_error error_code)
 {
 	(void)current;
 	(void)next;
@@ -2132,109 +2047,20 @@ struct ffa_value plat_ffa_error_32(struct vcpu *current, struct vcpu **next,
 	return ffa_error(FFA_NOT_SUPPORTED);
 }
 
-/**
- * Retrieves the next waiter and removes it from the wait list if the VM's
- * mailbox is in a writable state.
- */
-static struct wait_entry *plat_ffa_fetch_waiter(struct vm_locked locked_vm)
-{
-	struct wait_entry *entry;
-	struct vm *vm = locked_vm.vm;
-
-	if (vm->mailbox.state != MAILBOX_STATE_EMPTY ||
-	    vm->mailbox.recv == NULL || list_empty(&vm->mailbox.waiter_list)) {
-		/* The mailbox is not writable or there are no waiters. */
-		return NULL;
-	}
-
-	/* Remove waiter from the wait list. */
-	entry = CONTAINER_OF(vm->mailbox.waiter_list.next, struct wait_entry,
-			     wait_links);
-	list_remove(&entry->wait_links);
-	return entry;
-}
-
-/**
- * Retrieves the next VM whose mailbox became writable. For a VM to be notified
- * by this function, the caller must have called api_mailbox_send before with
- * the notify argument set to true, and this call must have failed because the
- * mailbox was not available.
- *
- * It should be called repeatedly to retrieve a list of VMs.
- *
- * Returns -1 if no VM became writable, or the id of the VM whose mailbox
- * became writable.
- */
-int64_t plat_ffa_mailbox_writable_get(const struct vcpu *current)
-{
-	struct vm *vm = current->vm;
-	struct wait_entry *entry;
-	int64_t ret;
-	struct vm_locked vm_locked = vm_lock(vm);
-
-	if (list_empty(&vm->mailbox.ready_list)) {
-		ret = -1;
-		goto exit;
-	}
-
-	entry = CONTAINER_OF(vm->mailbox.ready_list.next, struct wait_entry,
-			     ready_links);
-	list_remove(&entry->ready_links);
-	ret = vm_id_for_wait_entry(vm, entry);
-
-exit:
-	vm_unlock(&vm_locked);
-	return ret;
-}
-
-/**
- * Retrieves the next VM waiting to be notified that the mailbox of the
- * specified VM became writable. Only primary VMs are allowed to call this.
- *
- * Returns -1 on failure or if there are no waiters; the VM id of the next
- * waiter otherwise.
- */
-int64_t plat_ffa_mailbox_waiter_get(ffa_id_t vm_id, const struct vcpu *current)
-{
-	struct vm *vm;
-	struct vm_locked locked;
-	struct vm_locked waiting_locked;
-	struct wait_entry *entry;
-	struct vm *waiting_vm;
-
-	/* Only primary VMs are allowed to call this function. */
-	if (current->vm->id != HF_PRIMARY_VM_ID) {
-		return -1;
-	}
-
-	vm = vm_find(vm_id);
-	if (vm == NULL) {
-		return -1;
-	}
-
-	/* Check if there are outstanding notifications from given VM. */
-	locked = vm_lock(vm);
-	entry = plat_ffa_fetch_waiter(locked);
-	vm_unlock(&locked);
-
-	if (entry == NULL) {
-		return -1;
-	}
-
-	/* Enqueue notification to waiting VM. */
-	waiting_vm = entry->waiting_vm;
-	waiting_locked = vm_lock(waiting_vm);
-
-	if (list_empty(&entry->ready_links)) {
-		list_append(&waiting_vm->mailbox.ready_list,
-			    &entry->ready_links);
-	}
-	vm_unlock(&waiting_locked);
-
-	return waiting_vm->id;
-}
-
 void plat_ffa_free_vm_resources(struct vm_locked vm_locked)
 {
 	(void)vm_locked;
+}
+
+uint32_t plat_ffa_interrupt_get(struct vcpu_locked current_locked)
+{
+	return api_interrupt_get(current_locked);
+}
+
+bool plat_ffa_handle_framework_msg(struct ffa_value args, struct ffa_value *ret)
+{
+	(void)args;
+	(void)ret;
+
+	return false;
 }

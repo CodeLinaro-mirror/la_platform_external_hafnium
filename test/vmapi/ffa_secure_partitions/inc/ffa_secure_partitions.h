@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "hf/mm.h"
+
 #include "test/hftest.h"
 #include "test/vmapi/ffa.h"
 
@@ -45,6 +47,13 @@
 		}                                                      \
 	}
 
+#define SERVICE4                                                       \
+	(struct ffa_uuid)                                              \
+	{                                                              \
+		{                                                      \
+			0xd6d78930, 0x6cb26103, 0xda311d35, 0xfc03fced \
+		}                                                      \
+	}
 /*
  * Helpers to get services information.
  * Defined with SERVICE_PARTITION_INFO_GET macro.
@@ -52,11 +61,17 @@
 struct ffa_partition_info* service1(void* recv);
 struct ffa_partition_info* service2(void* recv);
 struct ffa_partition_info* service3(void* recv);
+struct ffa_partition_info* service4(void* recv);
 
 /* Precondition functions for this test setup. */
 bool service2_is_up_sp(void);
+bool service2_is_mp_sp(void);
 uint64_t syscounter_read(void);
 void waitms(uint64_t ms);
 bool sp1_fail_at_boot(void);
 bool sp2_fail_at_boot(void);
 bool sp3_fail_at_boot(void);
+bool service2_is_mp_sp(void);
+bool service2_is_el0(void);
+void setup_wdog_timer_interrupt(void);
+void start_wdog_timer(uint32_t time_ms);

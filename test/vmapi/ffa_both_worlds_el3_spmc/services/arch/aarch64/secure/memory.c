@@ -22,59 +22,32 @@
 
 static uint8_t retrieve_buffer[PAGE_SIZE * 2];
 
-static void update_mm_security_state(
-	struct ffa_composite_memory_region *composite,
-	ffa_memory_attributes_t attributes)
-{
-	if (ffa_get_memory_security_attr(attributes) ==
-		    FFA_MEMORY_SECURITY_NON_SECURE &&
-	    !ffa_is_vm_id(hf_vm_get_id())) {
-		for (uint32_t i = 0; i < composite->constituent_count; i++) {
-			uint32_t mode;
-
-			if (!hftest_mm_get_mode(
-				    // NOLINTNEXTLINE(performance-no-int-to-ptr)
-				    (const void *)composite->constituents[i]
-					    .address,
-				    FFA_PAGE_SIZE * composite->constituents[i]
-							    .page_count,
-				    &mode)) {
-				FAIL("Couldn't get the mode of the "
-				     "composite.\n");
-			}
-
-			hftest_mm_identity_map(
-				// NOLINTNEXTLINE(performance-no-int-to-ptr)
-				(const void *)composite->constituents[i]
-					.address,
-				FFA_PAGE_SIZE *
-					composite->constituents[i].page_count,
-				mode | MM_MODE_NS);
-		}
-	}
-}
-
 static void memory_increment(struct ffa_memory_region *memory_region)
 {
 	size_t i;
 	struct ffa_composite_memory_region *composite;
+	struct ffa_memory_access *receiver =
+		ffa_memory_region_get_receiver(memory_region, 0);
 	uint8_t *ptr;
+	enum ffa_memory_shareability shareability;
+	enum ffa_memory_cacheability cacheability;
+
 	composite = ffa_memory_region_get_composite(memory_region, 0);
 	// NOLINTNEXTLINE(performance-no-int-to-ptr)
 	ptr = (uint8_t *)composite->constituents[0].address;
 
 	ASSERT_EQ(memory_region->receiver_count, 1);
-	ASSERT_NE(memory_region->receivers[0].composite_memory_region_offset,
-		  0);
+	ASSERT_TRUE(receiver != NULL);
+	ASSERT_NE(receiver->composite_memory_region_offset, 0);
 
 	/*
 	 * Validate retrieve response contains the memory attributes
 	 * hafnium implements.
 	 */
-	ASSERT_EQ(ffa_get_memory_shareability_attr(memory_region->attributes),
-		  FFA_MEMORY_INNER_SHAREABLE);
-	ASSERT_EQ(ffa_get_memory_cacheability_attr(memory_region->attributes),
-		  FFA_MEMORY_CACHE_WRITE_BACK);
+	shareability = memory_region->attributes.shareability;
+	cacheability = memory_region->attributes.cacheability;
+	ASSERT_EQ(shareability, FFA_MEMORY_INNER_SHAREABLE);
+	ASSERT_EQ(cacheability, FFA_MEMORY_CACHE_WRITE_BACK);
 
 	update_mm_security_state(composite, memory_region->attributes);
 
@@ -96,7 +69,7 @@ void ffa_mem_retrieve_from_args(struct mailbox_buffers mb,
 		hf_vm_get_id(), tag, flags, FFA_DATA_ACCESS_RW,
 		FFA_INSTRUCTION_ACCESS_NOT_SPECIFIED,
 		FFA_MEMORY_NOT_SPECIFIED_MEM, FFA_MEMORY_CACHE_WRITE_BACK,
-		FFA_MEMORY_INNER_SHAREABLE);
+		FFA_MEMORY_INNER_SHAREABLE, NULL);
 
 	retrieve_memory(mb.recv, handle, retrieved_memory, HF_MAILBOX_SIZE,
 			msg_size);

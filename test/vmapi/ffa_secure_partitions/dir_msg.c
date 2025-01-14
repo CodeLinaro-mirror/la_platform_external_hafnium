@@ -22,8 +22,6 @@
 
 #define SP_SLEEP_LONG 2000U
 
-alignas(4096) static uint8_t secondary_ec_stack[MAX_CPUS - 1][PAGE_SIZE];
-
 struct secondary_cpu_entry_args {
 	ffa_id_t receiver_id;
 	ffa_vcpu_count_t vcpu_count;
@@ -70,7 +68,7 @@ TEST(ffa_msg_send_direct_req, succeeds_sp_to_sp_echo)
 
 /**
  * Test that if a direct message request is sent to an SP that is already
- * waiting for a direct message response an DENIED error code is returned.
+ * waiting for a direct message response an FFA_BUSY error code is returned.
  */
 TEST(ffa_msg_send_direct_req, fails_direct_req_to_waiting_sp)
 {
@@ -78,7 +76,7 @@ TEST(ffa_msg_send_direct_req, fails_direct_req_to_waiting_sp)
 	struct ffa_value res;
 	ffa_id_t own_id = hf_vm_get_id();
 
-	res = sp_req_echo_denied_cmd_send(own_id, receiver_id);
+	res = sp_req_echo_busy_cmd_send(own_id, receiver_id);
 
 	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
 	EXPECT_EQ(sp_resp(res), SP_SUCCESS);
@@ -160,15 +158,14 @@ TEST_PRECONDITION_LONG_RUNNING(ffa_call_chain, disallow_migration_blocked_sp,
 		uintptr_t id;
 
 		id = hftest_get_cpu_id(i);
-		HFTEST_LOG("Booting CPU %u - %x", i, id);
+		HFTEST_LOG("Booting CPU %zu - %lx", i, id);
 
 		EXPECT_EQ(
-			hftest_cpu_start(id, secondary_ec_stack[i - 1],
-					 sizeof(secondary_ec_stack[0]),
+			hftest_cpu_start(id, hftest_get_secondary_ec_stack(i),
 					 migrate_busy_up_sp, (uintptr_t)&args),
 			true);
 
-		HFTEST_LOG("Done with CPU %u", i);
+		HFTEST_LOG("Done with CPU %zu", i);
 	}
 
 	/*
@@ -176,7 +173,7 @@ TEST_PRECONDITION_LONG_RUNNING(ffa_call_chain, disallow_migration_blocked_sp,
 	 * there by putting receiver SP in BLOCKED state.
 	 */
 	res = sp_fwd_sleep_cmd_send(own_id, receiver_id, companion_id,
-				    SP_SLEEP_LONG, false);
+				    SP_SLEEP_LONG, 0);
 
 	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
 	EXPECT_EQ(sp_resp(res), SP_SUCCESS);

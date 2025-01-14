@@ -20,12 +20,12 @@
 #define HFTEST_MAX_TESTS 50
 
 /*
- * Log with the HFTEST_LOG_PREFIX and a new line. The zero is added so there is
- * always at least one variadic argument.
+ * Log with the HFTEST_LOG_PREFIX and a new line. The newline is passed as
+ * an argument so there is always at least one variadic argument.
  */
-#define HFTEST_LOG(...) HFTEST_LOG_IMPL(__VA_ARGS__, 0)
+#define HFTEST_LOG(...) HFTEST_LOG_IMPL(__VA_ARGS__, "\n")
 #define HFTEST_LOG_IMPL(format, ...) \
-	dlog("%s" format "\n", HFTEST_LOG_PREFIX, __VA_ARGS__)
+	dlog(HFTEST_LOG_PREFIX format "%s", __VA_ARGS__)
 
 /* Helper to wrap the argument in quotes. */
 #define HFTEST_STR(str) #str
@@ -70,55 +70,56 @@
 	hftest_test_ctor_##suite_name##_##test_name
 
 /* Register test functions. */
-#define HFTEST_SET_UP(suite_name)                                   \
-	static void HFTEST_SET_UP_FN(suite_name)(void);             \
-	const struct hftest_test __attribute__((used))              \
-	__attribute__((section(HFTEST_SET_UP_SECTION(suite_name)))) \
-	HFTEST_SET_UP_STRUCT(suite_name) = {                        \
-		.suite = #suite_name,                               \
-		.kind = HFTEST_KIND_SET_UP,                         \
-		.fn = HFTEST_SET_UP_FN(suite_name),                 \
-	};                                                          \
-	static void __attribute__((constructor))                    \
-	HFTEST_SET_UP_CONSTRUCTOR(suite_name)(void)                 \
-	{                                                           \
-		hftest_register(HFTEST_SET_UP_STRUCT(suite_name));  \
-	}                                                           \
+#define HFTEST_SET_UP(suite_name)                                           \
+	static void HFTEST_SET_UP_FN(suite_name)(void);                     \
+	const struct hftest_test __attribute__((used))                      \
+	__attribute__((section(HFTEST_SET_UP_SECTION(                       \
+		suite_name)))) HFTEST_SET_UP_STRUCT(suite_name) = {         \
+		.suite = #suite_name,                                       \
+		.kind = HFTEST_KIND_SET_UP,                                 \
+		.fn = HFTEST_SET_UP_FN(suite_name),                         \
+	};                                                                  \
+	static void __attribute__((constructor)) HFTEST_SET_UP_CONSTRUCTOR( \
+		suite_name)(void)                                           \
+	{                                                                   \
+		hftest_register(HFTEST_SET_UP_STRUCT(suite_name));          \
+	}                                                                   \
 	static void HFTEST_SET_UP_FN(suite_name)(void)
 
-#define HFTEST_TEAR_DOWN(suite_name)                                   \
-	static void HFTEST_TEAR_DOWN_FN(suite_name)(void);             \
-	const struct hftest_test __attribute__((used))                 \
-	__attribute__((section(HFTEST_TEAR_DOWN_SECTION(suite_name)))) \
-	HFTEST_TEAR_DOWN_STRUCT(suite_name) = {                        \
-		.suite = #suite_name,                                  \
-		.kind = HFTEST_KIND_TEAR_DOWN,                         \
-		.fn = HFTEST_TEAR_DOWN_FN(suite_name),                 \
-	};                                                             \
-	static void __attribute__((constructor))                       \
-	HFTEST_TEAR_DOWN_CONSTRUCTOR(suite_name)(void)                 \
-	{                                                              \
-		hftest_register(HFTEST_TEAR_DOWN_STRUCT(suite_name));  \
-	}                                                              \
+#define HFTEST_TEAR_DOWN(suite_name)                                           \
+	static void HFTEST_TEAR_DOWN_FN(suite_name)(void);                     \
+	const struct hftest_test __attribute__((used))                         \
+	__attribute__((section(HFTEST_TEAR_DOWN_SECTION(                       \
+		suite_name)))) HFTEST_TEAR_DOWN_STRUCT(suite_name) = {         \
+		.suite = #suite_name,                                          \
+		.kind = HFTEST_KIND_TEAR_DOWN,                                 \
+		.fn = HFTEST_TEAR_DOWN_FN(suite_name),                         \
+	};                                                                     \
+	static void __attribute__((constructor)) HFTEST_TEAR_DOWN_CONSTRUCTOR( \
+		suite_name)(void)                                              \
+	{                                                                      \
+		hftest_register(HFTEST_TEAR_DOWN_STRUCT(suite_name));          \
+	}                                                                      \
 	static void HFTEST_TEAR_DOWN_FN(suite_name)(void)
 
-#define HFTEST_TEST(suite_name, test_name, long_running, precon_fn)          \
-	static void HFTEST_TEST_FN(suite_name, test_name)(void);             \
-	const struct hftest_test __attribute__((used))                       \
-	__attribute__((section(HFTEST_TEST_SECTION(suite_name, test_name)))) \
-	HFTEST_TEST_STRUCT(suite_name, test_name) = {                        \
-		.suite = #suite_name,                                        \
-		.kind = HFTEST_KIND_TEST,                                    \
-		.name = #test_name,                                          \
-		.is_long_running = long_running,                             \
-		.fn = HFTEST_TEST_FN(suite_name, test_name),                 \
-		.precondition = precon_fn,                                   \
-	};                                                                   \
-	static void __attribute__((constructor))                             \
-	HFTEST_TEST_CONSTRUCTOR(suite_name, test_name)(void)                 \
-	{                                                                    \
-		hftest_register(HFTEST_TEST_STRUCT(suite_name, test_name));  \
-	}                                                                    \
+#define HFTEST_TEST(suite_name, test_name, long_running, precon_fn)         \
+	static void HFTEST_TEST_FN(suite_name, test_name)(void);            \
+	const struct hftest_test __attribute__((used))                      \
+	__attribute__((section(HFTEST_TEST_SECTION(                         \
+		suite_name, test_name)))) HFTEST_TEST_STRUCT(suite_name,    \
+							     test_name) = { \
+		.suite = #suite_name,                                       \
+		.kind = HFTEST_KIND_TEST,                                   \
+		.name = #test_name,                                         \
+		.is_long_running = (long_running),                          \
+		.fn = HFTEST_TEST_FN(suite_name, test_name),                \
+		.precondition = (precon_fn),                                \
+	};                                                                  \
+	static void __attribute__((constructor)) HFTEST_TEST_CONSTRUCTOR(   \
+		suite_name, test_name)(void)                                \
+	{                                                                   \
+		hftest_register(HFTEST_TEST_STRUCT(suite_name, test_name)); \
+	}                                                                   \
 	static void HFTEST_TEST_FN(suite_name, test_name)(void)
 
 #define HFTEST_SERVICE_SET_UP(service_name)                                   \
@@ -132,22 +133,22 @@
 	};                                                                    \
 	static void HFTEST_SERVICE_SET_UP_FN(service_name)(void)
 
-#define HFTEST_TEST_SERVICE(service_name)                              \
-	static void HFTEST_SERVICE_FN(service_name)(void);             \
-	const struct hftest_test __attribute__((used))                 \
-	__attribute__((section(HFTEST_SERVICE_SECTION(service_name)))) \
-	HFTEST_SERVICE_STRUCT(service_name) = {                        \
-		.kind = HFTEST_KIND_SERVICE,                           \
-		.name = #service_name,                                 \
-		.fn = HFTEST_SERVICE_FN(service_name),                 \
-		.precondition = NULL,                                  \
-	};                                                             \
+#define HFTEST_TEST_SERVICE(service_name)                                \
+	static void HFTEST_SERVICE_FN(service_name)(void);               \
+	const struct hftest_test __attribute__((used))                   \
+	__attribute__((section(HFTEST_SERVICE_SECTION(                   \
+		service_name)))) HFTEST_SERVICE_STRUCT(service_name) = { \
+		.kind = HFTEST_KIND_SERVICE,                             \
+		.name = #service_name,                                   \
+		.fn = HFTEST_SERVICE_FN(service_name),                   \
+		.precondition = NULL,                                    \
+	};                                                               \
 	static void HFTEST_SERVICE_FN(service_name)(void)
 
 /* Context for tests. */
 struct hftest_context {
 	uint32_t failures;
-	noreturn void (*abort)(void);
+	void (*abort)(void);
 
 	/* These are used in primary VMs. */
 	const struct fdt *fdt;
@@ -180,6 +181,7 @@ enum hftest_kind {
  * functions contained in the image allowing the image to inspect the tests it
  * contains.
  */
+/* NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding) */
 struct hftest_test {
 	const char *suite;
 	enum hftest_kind kind;
@@ -189,96 +191,88 @@ struct hftest_test {
 	hftest_test_precondition precondition;
 };
 
-/*
- * This union can store any of the primitive types supported by the assertion
- * macros.
- *
- * It does not include pointers as comparison of pointers is not often needed
- * and could be a mistake for string comparison. If pointer comparison is needed
- * and explicit assertion such as ASSERT_PTR_EQ() would be more appropriate.
- */
-union hftest_any {
-	bool b;
-	char c;
-	signed char sc;
-	unsigned char uc;
-	signed short ss;
-	unsigned short us;
-	signed int si;
-	unsigned int ui;
-	signed long int sli;
-	unsigned long int uli;
-	signed long long int slli;
-	unsigned long long int ulli;
-};
-
 /* _Generic formatting doesn't seem to be supported so doing this manually. */
 /* clang-format off */
-
-/* Select the union member to match the type of the expression. */
-#define hftest_any_get(any, x)                      \
-	_Generic((x),                               \
-		bool:                   (any).b,    \
-		char:                   (any).c,    \
-		signed char:            (any).sc,   \
-		unsigned char:          (any).uc,   \
-		signed short:           (any).ss,   \
-		unsigned short:         (any).us,   \
-		signed int:             (any).si,   \
-		unsigned int:           (any).ui,   \
-		signed long int:        (any).sli,  \
-		unsigned long int:      (any).uli,  \
-		signed long long int:   (any).slli, \
-		unsigned long long int: (any).ulli)
-
-/*
- * dlog format specifier for types. Note, these aren't the standard specifiers
- * for the types.
- */
-#define hftest_dlog_format(x)                 \
-	_Generic((x),                         \
-		bool:                   "%u", \
-		char:                   "%c", \
-		signed char:            "%d", \
-		unsigned char:          "%u", \
-		signed short:           "%d", \
-		unsigned short:         "%u", \
-		signed int:             "%d", \
-		unsigned int:           "%u", \
-		signed long int:        "%d", \
-		unsigned long int:      "%u", \
-		signed long long int:   "%d", \
-		unsigned long long int: "%u")
-
-/* clang-format on */
-
 #define HFTEST_LOG_FAILURE() \
 	dlog(HFTEST_LOG_PREFIX "Failure: %s:%u\n", __FILE__, __LINE__);
 
 #ifdef HFTEST_OPTIMIZE_FOR_SIZE
 #define HFTEST_LOG_ASSERT_DETAILS(lhs, rhs, op)
 #else /* HFTEST_OPTIMIZE_FOR_SIZE */
-#define HFTEST_LOG_ASSERT_DETAILS(lhs, rhs, op)                              \
-	dlog(HFTEST_LOG_PREFIX HFTEST_LOG_INDENT "%s %s %s (%s=", #lhs, #op, \
-	     #rhs, #lhs);                                                    \
-	dlog(hftest_dlog_format(lhs), hftest_any_get(lhs_value, lhs));       \
-	dlog(", %s=", #rhs);                                                 \
-	dlog(hftest_dlog_format(rhs), hftest_any_get(rhs_value, rhs));       \
-	dlog(")\n");
+#define HFTEST_LOG_ASSERT_DETAILS(lhs, rhs, op)                                    \
+	do {                                                                           \
+		dlog(HFTEST_LOG_PREFIX "assertion failed: `%s %s %s`\n", #lhs, #op, #rhs); \
+		dlog(_Generic(lhs_value,                                                   \
+			bool:               HFTEST_LOG_PREFIX "lhs = %hhu (%#02hhx)",          \
+			char:               HFTEST_LOG_PREFIX "lhs = '%c' (%#02hhx)",          \
+			signed char:        HFTEST_LOG_PREFIX "lhs = %hhd (%#02hhx)",          \
+			unsigned char:      HFTEST_LOG_PREFIX "lhs = %hhu (%#02hhx)",          \
+			signed short:       HFTEST_LOG_PREFIX "lhs = %hd (%#04hx)",            \
+			unsigned short:     HFTEST_LOG_PREFIX "lhs = %hu (%#04hx)",            \
+			signed int:         HFTEST_LOG_PREFIX "lhs = %d (%#08x)",              \
+			unsigned int:       HFTEST_LOG_PREFIX "lhs = %u (%#08x)",              \
+			signed long:        HFTEST_LOG_PREFIX "lhs = %ld (%#016lx)",            \
+			unsigned long:      HFTEST_LOG_PREFIX "lhs = %lu (%#016lx)",            \
+			signed long long:   HFTEST_LOG_PREFIX "lhs = %lld (%#016llx)",         \
+			unsigned long long: HFTEST_LOG_PREFIX "lhs = %llu (%#016llx)"          \
+		), lhs_value, lhs_value);                                                  \
+		dlog(_Generic(rhs_value,                                                   \
+			bool:               HFTEST_LOG_PREFIX "rhs = %hhu (%#02hhx)",          \
+			char:               HFTEST_LOG_PREFIX "rhs = '%c' (%#02hhx)",          \
+			signed char:        HFTEST_LOG_PREFIX "rhs = %hhd (%#02hhx)",          \
+			unsigned char:      HFTEST_LOG_PREFIX "rhs = %hhu (%#02hhx)",          \
+			signed short:       HFTEST_LOG_PREFIX "rhs = %hd (%#04hx)",            \
+			unsigned short:     HFTEST_LOG_PREFIX "rhs = %hu (%#04hx)",            \
+			signed int:         HFTEST_LOG_PREFIX "rhs = %d (%#08x)",              \
+			unsigned int:       HFTEST_LOG_PREFIX "rhs = %u (%#08x)",              \
+			signed long:        HFTEST_LOG_PREFIX "rhs = %ld (%#016lx)",            \
+			unsigned long:      HFTEST_LOG_PREFIX "rhs = %lu (%#016lx)",            \
+			signed long long:   HFTEST_LOG_PREFIX "rhs = %lld (%#016llx)",         \
+			unsigned long long: HFTEST_LOG_PREFIX "rhs = %llu (%#016llx)"          \
+		), rhs_value, rhs_value);                                                  \
+	} while (0)
+#endif /* HFTEST_OPTIMIZE_FOR_SIZE */
+/* clang-format on */
+
+#ifdef HFTEST_OPTIMIZE_FOR_SIZE
+#define HFTEST_LOG_ASSERT_STRING_DETAILS(lhs, rhs, op)
+#else /* HFTEST_OPTIMIZE_FOR_SIZE */
+#define HFTEST_LOG_ASSERT_STRING_DETAILS(lhs, rhs, op)                         \
+	do {                                                                   \
+		dlog(HFTEST_LOG_PREFIX "assertion failed: `%s %s %s`\n", #lhs, \
+		     #op, #rhs);                                               \
+		dlog(HFTEST_LOG_PREFIX "lhs = \"%s\"\n", lhs_value);           \
+		dlog(HFTEST_LOG_PREFIX "rhs = \"%s\"\n", rhs_value);           \
+		dlog("\n");                                                    \
+	} while (0)
+
 #endif /* HFTEST_OPTIMIZE_FOR_SIZE */
 
 #define HFTEST_ASSERT_OP(lhs, rhs, op, fatal)                              \
 	do {                                                               \
-		union hftest_any lhs_value;                                \
-		union hftest_any rhs_value;                                \
-		hftest_any_get(lhs_value, lhs) = (lhs);                    \
-		hftest_any_get(rhs_value, rhs) = (rhs);                    \
-		if (!(hftest_any_get(lhs_value, lhs)                       \
-			      op hftest_any_get(rhs_value, rhs))) {        \
+		__typeof(lhs) lhs_value = lhs;                             \
+		__typeof(rhs) rhs_value = rhs;                             \
+		if (!(lhs_value op rhs_value)) {                           \
 			struct hftest_context *ctx = hftest_get_context(); \
 			++ctx->failures;                                   \
 			HFTEST_LOG_FAILURE();                              \
 			HFTEST_LOG_ASSERT_DETAILS(lhs, rhs, op);           \
+			if (fatal) {                                       \
+				ctx->abort();                              \
+			}                                                  \
+		}                                                          \
+	} while (0)
+
+#define HFTEST_ASSERT_STRING_OP(lhs, rhs, op, fatal)                       \
+	do {                                                               \
+		char *lhs_value = (lhs);                                   \
+		char *rhs_value = (rhs);                                   \
+		/* NOLINTNEXTLINE(bugprone-macro-parentheses) */           \
+		if (!(strncmp(lhs_value, rhs_value, RSIZE_MAX) op 0)) {    \
+			struct hftest_context *ctx = hftest_get_context(); \
+			++ctx->failures;                                   \
+			HFTEST_LOG_FAILURE();                              \
+			HFTEST_LOG_ASSERT_STRING_DETAILS(lhs, rhs, op);    \
 			if (fatal) {                                       \
 				ctx->abort();                              \
 			}                                                  \
@@ -300,7 +294,7 @@ union hftest_any {
 /**
  * Select the service to run in a service VM.
  */
-#define HFTEST_SERVICE_SELECT(vm_id, service, send_buffer)                 \
+#define HFTEST_SERVICE_SELECT(vm_id, service, send_buffer, vcpu_id)        \
 	do {                                                               \
 		struct ffa_value res;                                      \
 		uint32_t msg_length =                                      \
@@ -312,9 +306,11 @@ union hftest_any {
 		 * If service is a Secondary VM, let the service configure \
 		 * its mailbox and wait for a message.                     \
 		 */                                                        \
-		res = ffa_run(vm_id, 0);                                   \
-		ASSERT_EQ(res.func, FFA_MSG_WAIT_32);                      \
-		ASSERT_EQ(res.arg2, FFA_SLEEP_INDEFINITE);                 \
+		if (ffa_is_vm_id(vm_id)) {                                 \
+			res = ffa_run(vm_id, vcpu_id);                     \
+			ASSERT_EQ(res.func, FFA_MSG_WAIT_32);              \
+			ASSERT_EQ(res.arg2, FFA_SLEEP_INDEFINITE);         \
+		}                                                          \
                                                                            \
 		/*                                                         \
 		 * Send the selected service to run and let it be          \
@@ -327,7 +323,7 @@ union hftest_any {
 		res = ffa_msg_send2(0);                                    \
                                                                            \
 		ASSERT_EQ(res.func, FFA_SUCCESS_32);                       \
-		res = ffa_run(vm_id, 0);                                   \
+		res = ffa_run(vm_id, vcpu_id);                             \
 		ASSERT_EQ(res.func, FFA_YIELD_32);                         \
 	} while (0)
 

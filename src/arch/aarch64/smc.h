@@ -21,6 +21,7 @@
 #define SMCCC_CONVENTION_MASK 0x40000000
 #define SMCCC_32_BIT          0x00000000
 #define SMCCC_64_BIT          0x40000000
+#define SMCCC_SVE_HINT_MASK   0x00010000
 
 #define SMCCC_SERVICE_CALL_MASK                0x3f000000
 #define SMCCC_ARM_ARCHITECTURE_CALL            0x00000000
@@ -32,12 +33,20 @@
 #define SMCCC_VENDOR_HYPERVISOR_SERVICE_CALL   0x06000000
 
 #define SMCCC_CALLER_HYPERVISOR   0x0
+
+/* SMCCC return codes. */
+#define SMCCC_OK 0
+
+/* NOT defined by the SMCCC */
+#define SMCCC_DENIED (-3)
+#define SMCCC_INVALID (-4)
+
 /*
  * TODO: Trusted application call: 0x30000000 - 0x31000000
  * TODO: Trusted OS call: 0x32000000 - 0x3f000000
  */
 
-#define SMCCC_ERROR_UNKNOWN  (-1)
+#define SMCCC_ERROR_UNKNOWN (-1)
 
 #define SMCCC_VERSION_FUNC_ID	0x80000000
 #define SMCCC_VERSION_1_2	0x10002

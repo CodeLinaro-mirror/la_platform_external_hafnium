@@ -104,6 +104,28 @@
 #define GET_ESR_IL(esr) ((esr) & (1 << 25))
 
 /**
+ * Gets the Data Fault Status Code ISS[5:0].
+ */
+#define GET_ESR_ISS_DFSC(iss) ((iss) & (0x3FU))
+
+/**
+ * Gets the FAR not Valid bit
+ */
+#define GET_ESR_FNV(esr) ((esr) & (1 << 10U))
+
+/**
+ * Define DFSC due to Granule protection fault if this is an RME
+ * enabled platform.
+ */
+#define DFSC_GPF UINT64_C(0x28)
+
+/**
+ * Data Fault Status Code for Synchronous Tag Check Fault.
+ * Applies when FEAT_MTE2 is implemented.
+ */
+#define DFSC_SYNC_TAG_CHECK_FAULT UINT64_C(0x11)
+
+/**
  * ESR code for an Unknown Reason exception.
  */
 #define EC_UNKNOWN UINT64_C(0x0)
@@ -156,7 +178,7 @@
 /**
  * Mask for ISS bits in ESR_ELx registers.
  */
-#define ISS_MASK ((UINT64_C(0x1) << 22) - UINT64_C(0x1))
+#define ISS_MASK ((UINT64_C(0x1) << 25) - UINT64_C(0x1))
 
 #define GET_ESR_ISS(esr) (ISS_MASK & (esr))
 
@@ -495,6 +517,13 @@
 #define CPTR_EL2_VHE_TTA (UINT64_C(0x1) << 28)
 
 /**
+ * When HCR_EL2.E2H=0 traps execution of instructions which access the
+ * Advanced SIMD and floating-point functionality, from both Execution
+ * states to EL2, when EL2 is enabled in the current Security state.
+ */
+#define CPTR_EL2_TFP (UINT64_C(0x1) << 10)
+
+/**
  * When HCR_EL2.E2H=1 (ARMv8.1-VHE enabled), CPTR_EL2 contains control bits to
  * enable and disable access to Floating Point, Advanced SIMD and SVE
  * instructions. This control does not cause execution of FP/SIMD instructions
@@ -503,10 +532,40 @@
 #define CPTR_EL2_VHE_FPEN (UINT64_C(0x3) << 20)
 
 /**
- * When HCR_EL2.E2H=1, this control does not cause execution of SVE instructions
- * and accesses to ZCR_EL2/ZCR_EL1 to be trapped.
+ * When HCR_EL2.E2H=0 and FEAT_SVE is implemented, traps execution at EL2, EL1,
+ * and EL0 of SVE instructions when the PE is not in Streaming SVE mode, and
+ * instructions that directly access the ZCR_EL2 or ZCR_EL1 System registers to
+ * EL2, when EL2 is enabled in the current Security state.
+ */
+#define CPTR_EL2_TZ (UINT64_C(0x1) << 8)
+
+/**
+ * When HCR_EL2.E2H=1 and FEAT_SVE implemented, this control does not cause
+ * execution of SVE instructions and accesses to ZCR_EL2/ZCR_EL1 to be trapped.
  */
 #define CPTR_EL2_VHE_ZEN (UINT64_C(0x3) << 16)
+
+/**
+ * When HCR_EL2.E2H=0 and FEAT_SME is implemented, traps execution at EL2, EL1,
+ * and EL0 of SME instructions, SVE instructions when FEAT_SVE is not
+ * implemented or the PE is in Streaming SVE mode, and instructions that
+ * directly access the SVCR, SMCR_EL1, or SMCR_EL2 System registers to EL2,
+ * when EL2 is enabled in the current Security state.
+ */
+#define CPTR_EL2_TSM (UINT64_C(0x1) << 12)
+
+/**
+ * When HCR_EL2.E2H=1, this control does not cause execution of SME instructions
+ * and accesses to SMCR_EL2/EL1 to be trapped.
+ */
+#define CPTR_EL2_SME_VHE_SMEN (UINT64_C(0x3) << 24)
+
+/**
+ * With CPTR_EL2.TAM=1 accesses from EL1 and EL0 to Activity Monitor registers
+ * are trapped to EL2, when EL2 is enabled in the current Security state.
+ * Note TAM is CPTR_EL2[30] whichever HCR_EL2.E2H state (VHE/nVHE).
+ */
+#define CPTR_EL2_TAM (UINT64_C(0x1) << 30)
 
 /*
  * Process State Bit definitions.
@@ -665,21 +724,61 @@
 #define ID_AA64MMFR1_EL1_VH_SUPPORTED UINT64_C(0x1)
 
 /**
- * Branch Target Identification mechanism support in AArch64 state.
- */
-#define ID_AA64PFR1_EL1_BT (UINT64_C(0xf) << 0)
-
-/**
  * Scalable Vector Extension.
  */
 #define ID_AA64PFR0_EL1_SVE_SHIFT 32
 #define ID_AA64PFR0_EL1_SVE_MASK UINT64_C(0xf)
 #define ID_AA64PFR0_EL1_SVE_SUPPORTED UINT64_C(0x1)
 
-/**
- * Returns true if the SVE feature is implemented.
- */
-
 /** SVE control register. */
 #define ZCR_LEN_MASK UINT32_C(0xf)
 #define ZCR_LEN_MAX UINT32_C(0xf)
+
+/**
+ * Branch Target Identification mechanism support in AArch64 state.
+ */
+#define ID_AA64PFR1_EL1_BT (UINT64_C(0xf) << 0)
+
+/**
+ * RME feature support.
+ */
+#define ID_AA64PFR0_EL1_RME_SHIFT 52
+#define ID_AA64PFR0_EL1_RME_MASK UINT64_C(0xf)
+
+/**
+ * Scalable Matrix Extension (FEAT_SME).
+ */
+#define ID_AA64PFR1_EL1_SME_SHIFT (24)
+#define ID_AA64PFR1_EL1_SME_MASK UINT64_C(0xf)
+#define ID_AA64PFR1_EL1_SME_SUPPORTED UINT64_C(1)
+#define ID_AA64PFR1_EL1_SME2_SUPPORTED UINT64_C(2)
+
+#define ID_AA64SMFR0_EL1_FA64_SHIFT (63)
+#define ID_AA64SMFR0_EL1_FA64_MASK UINT64_C(1)
+#define ID_AA64SMFR0_EL1_FA64_SUPPORTED UINT64_C(1)
+
+/**
+ * PAUTH feature support.
+ */
+#define ID_AA64ISAR1_EL1_PAUTH_SHIFT 4
+#define ID_AA64ISAR2_EL1_PAUTH_SHIFT 12
+
+#define ID_AA64ISAR1_EL1_PAUTH_MASK UINT64_C(0xff) /* API/APA */
+#define ID_AA64ISAR2_EL1_PAUTH_MASK UINT64_C(0xf)  /* APA3 */
+
+/**
+ * Define configuration bits for the Counter-timer Hypervisor Control Register,
+ * CNTHCTL_EL2 when HCR_EL2.E2H is 1.
+ */
+
+/**
+ * Controls whether EL0 accesses to frequency register and physical counter
+ * register are trapped to EL2.
+ */
+#define CNTHCTL_EL2_VHE_EL0PCTEN (1 << 0)
+
+/**
+ * Controls whether EL1 accesses to frequency register and physical counter
+ * register are trapped to EL2.
+ */
+#define CNTHCTL_EL2_VHE_EL1PCTEN (1 << 10)

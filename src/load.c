@@ -122,7 +122,7 @@ static bool link_rxtx_to_mailbox(struct mm_stage1_locked stage1_locked,
 		return false;
 	}
 
-	dlog_verbose("  mailbox: send = %#x, recv = %#x\n",
+	dlog_verbose("  mailbox: send = %p, recv = %p\n",
 		     vm_locked.vm->mailbox.send, vm_locked.vm->mailbox.recv);
 
 	return true;
@@ -133,25 +133,23 @@ static void infer_interrupt(struct interrupt_info interrupt,
 {
 	uint32_t attr = interrupt.attributes;
 
-	interrupt_desc_set_id(int_desc, interrupt.id);
-	interrupt_desc_set_priority(int_desc,
-				    (attr >> INT_DESC_PRIORITY_SHIFT) & 0xff);
+	int_desc->interrupt_id = interrupt.id;
+	int_desc->priority = (attr >> INT_INFO_ATTR_PRIORITY_SHIFT) & 0xff;
 
-	/* Refer to the comments in interrupt_descriptor struct definition. */
-	interrupt_desc_set_type_config_sec_state(
-		int_desc,
-		(((attr >> INT_DESC_TYPE_SHIFT) & 0x3) << 2) |
-			(((attr >> INT_DESC_CONFIG_SHIFT) & 0x1) << 1) |
-			((attr >> INT_DESC_SEC_STATE_SHIFT) & 0x1));
+	int_desc->type = (attr >> INT_INFO_ATTR_TYPE_SHIFT) & 0x3;
+	int_desc->config = (attr >> INT_INFO_ATTR_CONFIG_SHIFT) & 0x1;
+	int_desc->sec_state = (attr >> INT_INFO_ATTR_SEC_STATE_SHIFT) & 0x1;
 
 	if (interrupt.mpidr_valid) {
-		interrupt_desc_set_mpidr(int_desc, interrupt.mpidr);
+		int_desc->mpidr_valid = true;
+		int_desc->mpidr = interrupt.mpidr;
 	} else {
-		interrupt_desc_set_mpidr_invalid(int_desc);
+		int_desc->mpidr_valid = false;
+		int_desc->mpidr = 0;
 	}
 
-	interrupt_desc_set_valid(int_desc, true);
-	interrupt_desc_set_enabled(int_desc, true);
+	int_desc->valid = true;
+	int_desc->enabled = true;
 }
 
 /**
@@ -168,11 +166,24 @@ static bool load_common(struct mm_stage1_locked stage1_locked,
 	uint32_t k = 0;
 
 	vm_locked.vm->smc_whitelist = manifest_vm->smc_whitelist;
-	vm_locked.vm->uuid = manifest_vm->partition.uuid;
 	vm_locked.vm->power_management =
 		manifest_vm->partition.power_management;
 
-	/* Populate the interrupt descriptor for current VM. */
+	/* Populate array of UUIDs. */
+	for (uint16_t i = 0; i < PARTITION_MAX_UUIDS; i++) {
+		struct ffa_uuid current_uuid = manifest_vm->partition.uuids[i];
+
+		if (ffa_uuid_is_null(&current_uuid)) {
+			break;
+		}
+
+		vm_locked.vm->uuids[i] = current_uuid;
+	}
+
+	/*
+	 * Populate the interrupt descriptor for current VM.
+	 * They can be enabled in runtime using HF_INTERRUPT_ENABLE.
+	 */
 	for (uint16_t i = 0; i < PARTITION_MAX_DEVICE_REGIONS; i++) {
 		dev_region = manifest_vm->partition.dev_regions[i];
 
@@ -187,15 +198,11 @@ static bool load_common(struct mm_stage1_locked stage1_locked,
 			vm_locked.vm->interrupt_desc[k] = int_desc;
 			assert(int_desc.enabled);
 
-			/*
-			 * Configure the physical interrupts allocated for this
-			 * VM in its partition manifest.
-			 */
-			plat_interrupts_configure_interrupt(int_desc);
 			k++;
 			CHECK(k <= VM_MANIFEST_MAX_INTERRUPTS);
 		}
 	}
+
 	dlog_verbose("VM has %d physical interrupts defined in manifest.\n", k);
 
 	if (manifest_vm->is_ffa_partition) {
@@ -226,6 +233,13 @@ static bool load_common(struct mm_stage1_locked stage1_locked,
 
 		vm_locked.vm->notifications.enabled =
 			manifest_vm->partition.notification_support;
+
+		vm_locked.vm->vm_availability_messages.vm_created =
+			manifest_vm->partition.vm_availability_messages
+				.vm_created;
+		vm_locked.vm->vm_availability_messages.vm_destroyed =
+			manifest_vm->partition.vm_availability_messages
+				.vm_destroyed;
 
 		vm_locked.vm->boot_order = manifest_vm->partition.boot_order;
 
@@ -312,12 +326,13 @@ static bool load_primary(struct mm_stage1_locked stage1_locked,
 		}
 	}
 
-	if (!vm_init_next(MAX_CPUS, ppool, &vm, false)) {
+	if (!vm_init_next(MAX_CPUS, ppool, &vm, false,
+			  manifest_vm->partition.dma_device_count)) {
 		dlog_error("Unable to initialise primary VM.\n");
 		return false;
 	}
 
-	if (vm->id != HF_PRIMARY_VM_ID) {
+	if (!vm_is_primary(vm)) {
 		dlog_error("Primary VM was not given correct ID.\n");
 		return false;
 	}
@@ -390,7 +405,7 @@ static bool load_primary(struct mm_stage1_locked stage1_locked,
 		goto out;
 	}
 
-	dlog_info("Loaded primary VM with %u vCPUs, entry at %#x.\n",
+	dlog_info("Loaded primary VM with %u vCPUs, entry at %#lx.\n",
 		  vm->vcpu_count, pa_addr(primary_begin));
 
 	/* Mark the first VM vCPU to be the first booted vCPU. */
@@ -437,8 +452,8 @@ static bool load_secondary_fdt(struct mm_stage1_locked stage1_locked,
 
 	if (allocated_size > fdt_max_size) {
 		dlog_error(
-			"FDT allocated space (%u) is more than the specified "
-			"maximum to use (%u).\n",
+			"FDT allocated space (%zu) is more than the specified "
+			"maximum to use (%zu).\n",
 			allocated_size, fdt_max_size);
 		return false;
 	}
@@ -446,7 +461,7 @@ static bool load_secondary_fdt(struct mm_stage1_locked stage1_locked,
 	/* Load the FDT to the end of the VM's allocated memory space. */
 	*fdt_addr = pa_init(pa_addr(pa_sub(end, allocated_size)));
 
-	dlog_info("Loading secondary FDT of allocated size %u at 0x%x.\n",
+	dlog_info("Loading secondary FDT of allocated size %zu at 0x%lx.\n",
 		  allocated_size, pa_addr(*fdt_addr));
 
 	if (!copy_to_unmapped(stage1_locked, *fdt_addr, &fdt, ppool)) {
@@ -531,17 +546,18 @@ static bool ffa_map_memory_regions(const struct manifest_vm *manifest_vm,
 
 	/* Map memory-regions */
 	while (j < manifest_vm->partition.mem_region_count) {
-		size = manifest_vm->partition.mem_regions[j].page_count *
-		       PAGE_SIZE;
+		struct memory_region mem_region;
+
+		mem_region = manifest_vm->partition.mem_regions[j];
+		size = mem_region.page_count * PAGE_SIZE;
 		/*
 		 * Identity map memory region for both case,
 		 * VA(S-EL0) or IPA(S-EL1).
 		 */
-		region_begin = pa_init(
-			manifest_vm->partition.mem_regions[j].base_address);
+		region_begin = pa_init(mem_region.base_address);
 		region_end = pa_add(region_begin, size);
 
-		attributes = manifest_vm->partition.mem_regions[j].attributes;
+		attributes = mem_region.attributes;
 		if ((attributes & MANIFEST_REGION_ATTR_SECURITY) != 0) {
 			if (ffa_is_vm_id(vm_locked.vm->id)) {
 				dlog_warning("Memory%sVMs\n", error_string);
@@ -563,6 +579,23 @@ static bool ffa_map_memory_regions(const struct manifest_vm *manifest_vm,
 			return false;
 		}
 
+		/*
+		 * Enforce static DMA isolation through stage 2 address
+		 * translation.
+		 * Only the DMA device that is specified as part of this memory
+		 * region node in the partition manifest will be granted access
+		 * to the memory region.
+		 */
+		if (mem_region.dma_prop.stream_count > 0 &&
+		    !vm_iommu_mm_identity_map(
+			    vm_locked, region_begin, region_end, map_mode,
+			    ppool, NULL, mem_region.dma_prop.dma_device_id)) {
+			dlog_error(
+				"Unable to map memory-region in the page "
+				"tables of DMA device.\n");
+			return false;
+		}
+
 		/* Deny the primary VM access to this memory */
 		if (!vm_unmap(primary_vm_locked, region_begin, region_end,
 			      ppool)) {
@@ -572,8 +605,8 @@ static bool ffa_map_memory_regions(const struct manifest_vm *manifest_vm,
 			return false;
 		}
 
-		dlog_verbose("Memory region %#x - %#x allocated.\n",
-			     region_begin, region_end);
+		dlog_verbose("Memory region %#lx - %#lx allocated.\n",
+			     pa_addr(region_begin), pa_addr(region_end));
 
 		j++;
 	}
@@ -696,7 +729,8 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 	CHECK(!is_el0_partition || manifest_vm->secondary.vcpu_count == 1);
 
 	if (!vm_init_next(manifest_vm->secondary.vcpu_count, ppool, &vm,
-			  is_el0_partition)) {
+			  is_el0_partition,
+			  manifest_vm->partition.dma_device_count)) {
 		dlog_error("Unable to initialise VM.\n");
 		return false;
 	}
@@ -768,7 +802,7 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 		goto out;
 	}
 
-	dlog_info("Loaded with %u vCPUs, entry at %#x.\n",
+	dlog_info("Loaded with %u vCPUs, entry at %#lx.\n",
 		  manifest_vm->secondary.vcpu_count, pa_addr(mem_begin));
 
 	vcpu = vm_get_vcpu(vm, 0);
@@ -903,7 +937,7 @@ static bool init_other_world_vm(const struct boot_params *params,
 	 * -TrustZone (or the SPMC) when running the Hypervisor
 	 * -the Hypervisor when running TZ/SPMC
 	 */
-	other_world_vm = vm_init(HF_OTHER_WORLD_ID, MAX_CPUS, ppool, false);
+	other_world_vm = vm_init(HF_OTHER_WORLD_ID, MAX_CPUS, ppool, false, 0);
 	CHECK(other_world_vm != NULL);
 
 	for (i = 0; i < MAX_CPUS; i++) {
@@ -977,7 +1011,7 @@ bool load_vms(struct mm_stage1_locked stage1_locked,
 		}
 
 		dlog_info("Loading VM id %#x: %s.\n", vm_id,
-			  manifest_vm->debug_name);
+			  manifest_vm->debug_name.data);
 
 		mem_size = align_up(manifest_vm->secondary.mem_size, PAGE_SIZE);
 
@@ -991,7 +1025,8 @@ bool load_vms(struct mm_stage1_locked stage1_locked,
 						params->mem_ranges_count,
 						mem_size, &secondary_mem_begin,
 						&secondary_mem_end)) {
-			dlog_error("Not enough memory (%u bytes).\n", mem_size);
+			dlog_error("Not enough memory (%lu bytes).\n",
+				   mem_size);
 			continue;
 		}
 

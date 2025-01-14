@@ -12,12 +12,6 @@
 #include "hf/vcpu.h"
 #include "hf/vm.h"
 
-struct ffa_value plat_ffa_features(uint32_t function_feature_id)
-{
-	(void)function_feature_id;
-	return ffa_error(FFA_NOT_SUPPORTED);
-}
-
 struct ffa_value plat_ffa_spmc_id_get(void)
 {
 	return (struct ffa_value){.func = FFA_ERROR_32,
@@ -25,9 +19,9 @@ struct ffa_value plat_ffa_spmc_id_get(void)
 }
 
 ffa_partition_properties_t plat_ffa_partition_properties(
-	ffa_id_t vm_id, const struct vm *target)
+	ffa_id_t caller_id, const struct vm *target)
 {
-	(void)vm_id;
+	(void)caller_id;
 	(void)target;
 	return 0;
 }
@@ -72,10 +66,11 @@ bool plat_ffa_is_direct_request_valid(struct vcpu *current,
 }
 
 bool plat_ffa_is_direct_request_supported(struct vm *sender_vm,
-					  struct vm *receiver_vm)
+					  struct vm *receiver_vm, uint32_t func)
 {
 	(void)sender_vm;
 	(void)receiver_vm;
+	(void)func;
 
 	return false;
 }
@@ -94,8 +89,8 @@ bool plat_ffa_is_direct_response_valid(struct vcpu *current,
 	return false;
 }
 
-bool plat_ffa_is_notifications_create_valid(struct vcpu *current,
-					    ffa_id_t vm_id)
+bool plat_ffa_is_notifications_bitmap_access_valid(struct vcpu *current,
+						   ffa_id_t vm_id)
 {
 	(void)current;
 	(void)vm_id;
@@ -496,34 +491,11 @@ void plat_ffa_unwind_call_chain_ffa_direct_resp(
 	(void)next_locked;
 }
 
-bool plat_ffa_intercept_direct_response(struct vcpu_locked current_locked,
-					struct vcpu **next,
-					struct ffa_value to_ret,
-					struct ffa_value *signal_interrupt)
-{
-	/*
-	 * Only applicable to SPMC as it signals virtual secure interrupt to
-	 * S-EL0 partitions.
-	 */
-	(void)current_locked;
-	(void)next;
-	(void)to_ret;
-	(void)signal_interrupt;
-
-	return false;
-}
-
 void plat_ffa_enable_virtual_interrupts(struct vcpu_locked current_locked,
 					struct vm_locked vm_locked)
 {
 	(void)current_locked;
 	(void)vm_locked;
-}
-
-bool plat_ffa_is_direct_response_interrupted(struct vcpu_locked current_locked)
-{
-	(void)current_locked;
-	return false;
 }
 
 struct ffa_value plat_ffa_other_world_mem_send(
@@ -547,18 +519,6 @@ struct ffa_value plat_ffa_other_world_mem_reclaim(
 	(void)flags;
 	(void)page_pool;
 	(void)to;
-
-	return ffa_error(FFA_INVALID_PARAMETERS);
-}
-
-struct ffa_value plat_ffa_other_world_mem_retrieve(
-	struct vm_locked to_locked, struct ffa_memory_region *retrieve_request,
-	uint32_t length, struct mpool *page_pool)
-{
-	(void)to_locked;
-	(void)retrieve_request;
-	(void)length;
-	(void)page_pool;
 
 	return ffa_error(FFA_INVALID_PARAMETERS);
 }
@@ -603,7 +563,7 @@ struct ffa_value plat_ffa_yield_prepare(struct vcpu current_locked,
 }
 
 struct ffa_value plat_ffa_error_32(struct vcpu *current, struct vcpu **next,
-				   uint32_t error_code)
+				   enum ffa_error error_code)
 {
 	(void)current;
 	(void)next;
@@ -627,20 +587,20 @@ bool plat_ffa_partition_info_get_regs_forward_allowed(void)
 	return false;
 }
 
-int64_t plat_ffa_mailbox_waiter_get(ffa_id_t vm_id, const struct vcpu *current)
-{
-	(void)vm_id;
-	(void)current;
-	return -1;
-}
-
-int64_t plat_ffa_mailbox_writable_get(const struct vcpu *current)
-{
-	(void)current;
-	return -1;
-}
-
 void plat_ffa_free_vm_resources(struct vm_locked vm_locked)
 {
 	(void)vm_locked;
+}
+
+uint32_t plat_ffa_interrupt_get(struct vcpu_locked current_locked)
+{
+	return api_interrupt_get(current_locked);
+}
+
+bool plat_ffa_handle_framework_msg(struct ffa_value args, struct ffa_value *ret)
+{
+	(void)args;
+	(void)ret;
+
+	return false;
 }

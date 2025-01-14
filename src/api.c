@@ -10,23 +10,28 @@
 
 #include "hf/arch/cpu.h"
 #include "hf/arch/ffa.h"
+#include "hf/arch/memcpy_trapped.h"
 #include "hf/arch/mm.h"
 #include "hf/arch/other_world.h"
 #include "hf/arch/plat/ffa.h"
 #include "hf/arch/timer.h"
 #include "hf/arch/vm.h"
 
+#include "hf/bits.h"
 #include "hf/check.h"
 #include "hf/dlog.h"
 #include "hf/ffa_internal.h"
 #include "hf/ffa_memory.h"
 #include "hf/ffa_v1_0.h"
+#include "hf/hf_ipi.h"
 #include "hf/mm.h"
 #include "hf/plat/console.h"
 #include "hf/plat/interrupts.h"
 #include "hf/spinlock.h"
 #include "hf/static_assert.h"
 #include "hf/std.h"
+#include "hf/timer_mgmt.h"
+#include "hf/vcpu.h"
 #include "hf/vm.h"
 
 #include "vmapi/hf/call.h"
@@ -100,7 +105,7 @@ struct vcpu *api_ffa_get_vm_vcpu(struct vm *vm, struct vcpu *current)
 
 	CHECK((vm != NULL) && (current != NULL));
 
-	if (vm->vcpu_count == 1) {
+	if (vm_is_up(vm)) {
 		vcpu = vm_get_vcpu(vm, 0);
 	} else if (current_cpu_index < vm->vcpu_count) {
 		vcpu = vm_get_vcpu(vm, current_cpu_index);
@@ -148,39 +153,6 @@ struct vcpu *api_switch_to_primary(struct vcpu_locked current_locked,
 				   struct ffa_value primary_ret,
 				   enum vcpu_state secondary_state)
 {
-	/*
-	 * If the secondary is blocked but has a timer running, sleep until the
-	 * timer fires rather than indefinitely.
-	 */
-	switch (primary_ret.func) {
-	case HF_FFA_RUN_WAIT_FOR_INTERRUPT:
-	case FFA_MSG_WAIT_32: {
-		if (arch_timer_enabled_current()) {
-			uint64_t remaining_ns =
-				arch_timer_remaining_ns_current();
-
-			if (remaining_ns == 0) {
-				/*
-				 * Timer is pending, so the current vCPU should
-				 * be run again right away.
-				 */
-				primary_ret = (struct ffa_value){
-					.func = FFA_INTERRUPT_32};
-
-			} else {
-				primary_ret.arg2 = remaining_ns;
-			}
-		} else {
-			primary_ret.arg2 = FFA_SLEEP_INDEFINITE;
-		}
-		break;
-	}
-
-	default:
-		/* Do nothing. */
-		break;
-	}
-
 	return api_switch_to_vm(current_locked, primary_ret, secondary_state,
 				HF_PRIMARY_VM_ID);
 }
@@ -208,7 +180,7 @@ struct vcpu *api_switch_to_other_world(struct vcpu_locked current_locked,
  */
 bool is_ffa_direct_msg_request_ongoing(struct vcpu_locked locked)
 {
-	return locked.vcpu->direct_request_origin_vm_id != HF_INVALID_VM_ID;
+	return locked.vcpu->direct_request_origin.vm_id != HF_INVALID_VM_ID;
 }
 
 /**
@@ -274,11 +246,6 @@ struct vcpu *api_vcpu_off(struct vcpu *current)
 	};
 
 	current_locked = vcpu_lock(current);
-	/*
-	 * Disable the timer, so the scheduler doesn't get told to call back
-	 * based on it.
-	 */
-	arch_timer_disable_current();
 
 	next = api_switch_to_primary(current_locked, ret, VCPU_STATE_OFF);
 	vcpu_unlock(&current_locked);
@@ -316,7 +283,7 @@ struct ffa_value api_yield(struct vcpu *current, struct vcpu **next,
 		timeout_high = (uint32_t)args->arg3 & 0xFFFFFFFF;
 	}
 
-	if (current->vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(current->vm)) {
 		/* NOOP on the primary as it makes the scheduling decisions. */
 		return ret;
 	}
@@ -390,7 +357,7 @@ struct vcpu *api_abort(struct vcpu *current)
 	dlog_notice("Aborting VM %#x vCPU %u\n", current->vm->id,
 		    vcpu_index(current));
 
-	if (current->vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(current->vm)) {
 		/* TODO: what to do when the primary aborts? */
 		for (;;) {
 			/* Do nothing. */
@@ -420,7 +387,7 @@ static struct ffa_value send_versioned_partition_info_descriptors(
 	uint32_t vm_count)
 {
 	struct vm *vm = vm_locked.vm;
-	uint32_t version = vm->ffa_version;
+	enum ffa_version version = vm->ffa_version;
 	uint32_t partition_info_size;
 	uint32_t buffer_size;
 	struct ffa_value ret;
@@ -440,7 +407,7 @@ static struct ffa_value send_versioned_partition_info_descriptors(
 		return ffa_error(FFA_BUSY);
 	}
 
-	if (version == MAKE_FFA_VERSION(1, 0)) {
+	if (version == FFA_VERSION_1_0) {
 		struct ffa_partition_info_v1_0 *recv_mailbox = vm->mailbox.recv;
 
 		partition_info_size = sizeof(struct ffa_partition_info_v1_0);
@@ -448,8 +415,7 @@ static struct ffa_value send_versioned_partition_info_descriptors(
 		if (buffer_size > HF_MAILBOX_SIZE) {
 			dlog_error(
 				"Partition information does not fit in the "
-				"VM's RX "
-				"buffer.\n");
+				"VM's RX buffer.\n");
 			return ffa_error(FFA_NO_MEMORY);
 		}
 
@@ -469,18 +435,25 @@ static struct ffa_value send_versioned_partition_info_descriptors(
 	} else {
 		partition_info_size = sizeof(struct ffa_partition_info);
 		buffer_size = partition_info_size * vm_count;
+
 		if (buffer_size > HF_MAILBOX_SIZE) {
 			dlog_error(
 				"Partition information does not fit in the "
-				"VM's RX "
-				"buffer.\n");
+				"VM's RX buffer.\n");
 			return ffa_error(FFA_NO_MEMORY);
 		}
 
-		/* Populate the VM's RX buffer with the partition information.
+		/*
+		 * Populate the VM's RX buffer with the partition information.
 		 */
-		memcpy_s(vm->mailbox.recv, HF_MAILBOX_SIZE, partitions,
-			 buffer_size);
+		if (!memcpy_trapped(vm->mailbox.recv, HF_MAILBOX_SIZE,
+				    partitions, buffer_size)) {
+			dlog_error(
+				"%s: Failed to copy ffa_partition_info "
+				"descriptor\n",
+				__func__);
+			return ffa_error(FFA_ABORTED);
+		}
 	}
 
 	vm->mailbox.recv_size = buffer_size;
@@ -499,48 +472,106 @@ static struct ffa_value send_versioned_partition_info_descriptors(
 				  .arg3 = partition_info_size};
 }
 
-static void api_ffa_fill_partitions_info_array(
-	struct ffa_partition_info *partitions, size_t partitions_len,
-	const struct ffa_uuid *uuid, bool count_flag, ffa_id_t vm_id,
-	ffa_vm_count_t *vm_count_out)
+/**
+ * Set properties accoridng to the version of the partition, and the FF-A
+ * features it supports.
+ */
+static ffa_partition_properties_t api_ffa_partitions_info_get_properties(
+	ffa_id_t caller_id, struct vm *vm)
 {
-	ffa_vm_count_t vm_count = 0;
-	bool uuid_is_null = ffa_uuid_is_null(uuid);
+	ffa_partition_properties_t properties;
 
-	assert(vm_get_count() <= partitions_len);
+	properties = plat_ffa_partition_properties(caller_id, vm);
+	properties |= FFA_PARTITION_AARCH64_EXEC;
+
+	if (vm->ffa_version >= FFA_VERSION_1_1) {
+		properties |= vm_are_notifications_enabled(vm)
+				      ? FFA_PARTITION_NOTIFICATION
+				      : 0;
+		properties |= vm->messaging_method & FFA_PARTITION_INDIRECT_MSG;
+	}
+
+	/*
+	 * Only populate on calls from normal world,
+	 * and if SP supports receiving direct message requests.
+	 */
+	if (ffa_is_vm_id(caller_id) &&
+	    (properties & FFA_PARTITION_DIRECT_REQ_RECV) != 0) {
+		if (vm->vm_availability_messages.vm_created) {
+			properties |= FFA_PARTITION_VM_CREATED;
+		}
+		if (vm->vm_availability_messages.vm_destroyed) {
+			properties |= FFA_PARTITION_VM_DESTROYED;
+		}
+	}
+	return properties;
+}
+
+static void api_ffa_fill_partition_info(
+	struct ffa_partition_info *out_partition, struct vm *vm,
+	ffa_id_t caller_id)
+{
+	out_partition->vm_id = vm->id;
+	out_partition->vcpu_count = vm->vcpu_count;
+	out_partition->properties =
+		api_ffa_partitions_info_get_properties(caller_id, vm);
+}
+
+/**
+ * Find VMs with UUID matching `uuid_to_find` , and fill `out_partitions` with
+ * partition infos. Returns number of VMs that matched.
+ * A null UUID matches against any VM.
+ * If `count_flag` is true, no partition infos are written to `out_partitions`,
+ * only the number of VMs that matched is returned.
+ */
+static ffa_vm_count_t api_ffa_fill_partitions_info_array(
+	struct ffa_partition_info out_partitions[], size_t out_partitions_len,
+	const struct ffa_uuid *uuid_to_find, bool count_flag,
+	ffa_id_t caller_id)
+{
+	ffa_vm_count_t vms_found = 0;
+	bool match_any = ffa_uuid_is_null(uuid_to_find);
+
+	assert(vm_get_count() <= out_partitions_len);
 
 	/*
 	 * Iterate through the VMs to find the ones with a matching
 	 * UUID. A Null UUID retrieves information for all VMs.
 	 */
-	for (ffa_vm_count_t index = 0; index < vm_get_count(); ++index) {
-		struct vm *vm = vm_find_index(index);
+	for (ffa_vm_count_t vm_idx = 0; vm_idx < vm_get_count(); vm_idx++) {
+		struct vm *vm = vm_find_index(vm_idx);
 
-		if (uuid_is_null || ffa_uuid_equal(uuid, &vm->uuid)) {
-			uint16_t array_index = vm_count;
+		for (size_t uuid_idx = 0; uuid_idx < PARTITION_MAX_UUIDS;
+		     uuid_idx++) {
+			struct ffa_uuid uuid = vm->uuids[uuid_idx];
+			struct ffa_partition_info *out_partition =
+				&out_partitions[vms_found];
 
-			++vm_count;
-			if (count_flag) {
-				continue;
+			/*
+			 * Null UUID indicates reaching the end of a
+			 * partition's array of UUIDs.
+			 */
+			if (ffa_uuid_is_null(&uuid)) {
+				break;
 			}
 
-			partitions[array_index].vm_id = vm->id;
-			partitions[array_index].vcpu_count = vm->vcpu_count;
-			partitions[array_index].properties =
-				plat_ffa_partition_properties(vm_id, vm);
-			partitions[array_index].properties |=
-				vm_are_notifications_enabled(vm)
-					? FFA_PARTITION_NOTIFICATION
-					: 0;
-			partitions[array_index].properties |=
-				FFA_PARTITION_AARCH64_EXEC;
-			if (uuid_is_null) {
-				partitions[array_index].uuid = vm->uuid;
+			if (match_any || ffa_uuid_equal(uuid_to_find, &uuid)) {
+				vms_found++;
+
+				if (count_flag) {
+					continue;
+				}
+
+				api_ffa_fill_partition_info(out_partition, vm,
+							    caller_id);
+				if (match_any) {
+					out_partition->uuid = uuid;
+				}
 			}
 		}
 	}
 
-	*vm_count_out = vm_count;
+	return vms_found;
 }
 
 static inline void api_ffa_pack_vmid_count_props(
@@ -550,15 +581,6 @@ static inline void api_ffa_pack_vmid_count_props(
 	*xn = (uint64_t)vm_id;
 	*xn |= (uint64_t)vcpu_count << 16;
 	*xn |= (uint64_t)properties << 32;
-}
-
-static inline void api_ffa_pack_uuid(uint64_t *xn_1, uint64_t *xn_2,
-				     struct ffa_uuid *uuid)
-{
-	*xn_1 = (uint64_t)uuid->uuid[0];
-	*xn_1 |= (uint64_t)uuid->uuid[1] << 32;
-	*xn_2 = (uint64_t)uuid->uuid[2];
-	*xn_2 |= (uint64_t)uuid->uuid[3] << 32;
 }
 
 /**
@@ -742,9 +764,9 @@ struct ffa_value api_ffa_partition_info_get_regs(struct vcpu *current,
 
 	memset_s(&partitions, sizeof(partitions), 0, sizeof(partitions));
 
-	api_ffa_fill_partitions_info_array(partitions, ARRAY_SIZE(partitions),
-					   uuid, false, current_vm->id,
-					   &vm_count);
+	vm_count = api_ffa_fill_partitions_info_array(
+		partitions, ARRAY_SIZE(partitions), uuid, false,
+		current_vm->id);
 
 	/* If UUID is Null vm_count must not be zero at this stage. */
 	CHECK(!uuid_is_null || vm_count != 0);
@@ -785,7 +807,7 @@ struct ffa_value api_ffa_partition_info_get_regs(struct vcpu *current,
 	if (vm_count == 0 || vm_count > ARRAY_SIZE(partitions)) {
 		dlog_verbose(
 			"Invalid parameters. vm_count = %d (must not be zero "
-			"or > %d)\n",
+			"or > %lu)\n",
 			vm_count, ARRAY_SIZE(partitions));
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
@@ -823,7 +845,7 @@ struct ffa_value api_ffa_partition_info_get_regs(struct vcpu *current,
 					      partitions[idx].vcpu_count,
 					      partitions[idx].properties);
 		if (uuid_is_null) {
-			api_ffa_pack_uuid(xn_1, xn_2, &partitions[idx].uuid);
+			ffa_uuid_to_u64x2(xn_1, xn_2, &partitions[idx].uuid);
 		}
 		assert(arg_idx <= ARRAY_SIZE(arg_ptrs));
 	}
@@ -849,17 +871,9 @@ struct ffa_value api_ffa_partition_info_get(struct vcpu *current,
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
-	/*
-	 * No need to count if we are returning the number of partitions as we
-	 * already know this.
-	 */
-	if (uuid_is_null && count_flag) {
-		vm_count = vm_get_count();
-	} else {
-		api_ffa_fill_partitions_info_array(
-			partitions, ARRAY_SIZE(partitions), uuid, count_flag,
-			current_vm->id, &vm_count);
-	}
+	vm_count = api_ffa_fill_partitions_info_array(
+		partitions, ARRAY_SIZE(partitions), uuid, count_flag,
+		current_vm->id);
 
 	/* If UUID is Null vm_count must not be zero at this stage. */
 	CHECK(!uuid_is_null || vm_count != 0);
@@ -916,16 +930,16 @@ struct ffa_value api_ffa_id_get(const struct vcpu *current)
  */
 struct ffa_value api_ffa_spm_id_get(void)
 {
-#if (MAKE_FFA_VERSION(1, 1) <= FFA_VERSION_COMPILED)
-	/*
-	 * Return the SPMC ID that was fetched during FF-A
-	 * initialization.
-	 */
-	return (struct ffa_value){.func = FFA_SUCCESS_32,
-				  .arg2 = arch_ffa_spmc_id_get()};
-#else
+	if (FFA_VERSION_1_1 <= FFA_VERSION_COMPILED) {
+		/*
+		 * Return the SPMC ID that was fetched during FF-A
+		 * initialization.
+		 */
+		return (struct ffa_value){.func = FFA_SUCCESS_32,
+					  .arg2 = arch_ffa_spmc_id_get()};
+	}
+
 	return ffa_error(FFA_NOT_SUPPORTED);
-#endif
 }
 
 /**
@@ -939,6 +953,7 @@ void api_regs_state_saved(struct vcpu *vcpu)
 	vcpu->regs_available = true;
 	sl_unlock(&vcpu->lock);
 }
+
 /**
  * Assuming that the arguments have already been checked by the caller, injects
  * a virtual interrupt of the given ID into the given target vCPU. This doesn't
@@ -981,7 +996,7 @@ int64_t api_interrupt_inject_locked(struct vcpu_locked target_locked,
 		goto out;
 	}
 
-	if (current->vm->id == HF_PRIMARY_VM_ID) {
+	if (vm_is_primary(current->vm)) {
 		/*
 		 * If the call came from the primary VM, let it know that it
 		 * should run or kick the target vCPU.
@@ -1011,7 +1026,7 @@ struct ffa_value ffa_msg_recv_return(const struct vm *receiver)
 			.arg1 = (receiver->mailbox.recv_sender << 16) |
 				receiver->id,
 			.arg3 = receiver->mailbox.recv_size};
-	case FFA_MSG_SEND2_32:
+	default:
 		return (struct ffa_value){
 			.func = FFA_RUN_32,
 			/*
@@ -1021,28 +1036,24 @@ struct ffa_value ffa_msg_recv_return(const struct vm *receiver)
 			 * other APIs (eg: FFA_NOTIFICATION_GET).
 			 */
 			.arg1 = receiver->id};
-	default:
-		/* This should never be reached, but return an error in case. */
-		dlog_error("Tried to return an invalid message function %#x\n",
-			   receiver->mailbox.recv_func);
-		return ffa_error(FFA_DENIED);
 	}
 }
 
 /**
  * Change the state of mailbox to empty, such that the ownership is given to the
  * Partition manager.
- * Returns true if the mailbox was reset successfully, false otherwise.
+ * Returns FFA_SUCCESS if the mailbox was reset successfully, FFA_ERROR
+ * otherwise.
  */
-static bool api_release_mailbox(struct vm_locked vm_locked, int32_t *error_code)
+static struct ffa_value api_release_mailbox(struct vm_locked vm_locked)
 {
+	struct ffa_value ret = {.func = FFA_SUCCESS_32};
 	ffa_id_t vm_id = vm_locked.vm->id;
-	int32_t error_code_to_ret = 0;
 
 	switch (vm_locked.vm->mailbox.state) {
 	case MAILBOX_STATE_EMPTY:
 		dlog_verbose("Mailbox of %x is empty.\n", vm_id);
-		error_code_to_ret = FFA_DENIED;
+		ret = ffa_error(FFA_DENIED);
 		break;
 	case MAILBOX_STATE_FULL:
 		/* Check it doesn't have pending RX full notifications. */
@@ -1051,7 +1062,7 @@ static bool api_release_mailbox(struct vm_locked vm_locked, int32_t *error_code)
 				"Mailbox of endpoint %x has pending "
 				"messages.\n",
 				vm_id);
-			error_code_to_ret = FFA_DENIED;
+			ret = ffa_error(FFA_DENIED);
 		}
 		break;
 	case MAILBOX_STATE_OTHER_WORLD_OWNED:
@@ -1063,23 +1074,58 @@ static bool api_release_mailbox(struct vm_locked vm_locked, int32_t *error_code)
 		 */
 		if (vm_id_is_current_world(vm_id)) {
 			dlog_verbose(
-				"Mailbox of endpoint %x in a wrongful state.\n",
+				"Mailbox of endpoint %x is in an incorrect "
+				"state.\n",
 				vm_id);
-			error_code_to_ret = FFA_ABORTED;
+			ret = ffa_error(FFA_ABORTED);
 		}
 		break;
 	}
 
-	if (error_code_to_ret != 0) {
-		if (error_code != NULL) {
-			*error_code = error_code_to_ret;
-		}
-		return false;
+	if (ret.func == FFA_SUCCESS_32) {
+		vm_locked.vm->mailbox.state = MAILBOX_STATE_EMPTY;
 	}
 
-	vm_locked.vm->mailbox.state = MAILBOX_STATE_EMPTY;
+	return ret;
+}
 
+/*
+ * Helper to check if extended arguments (corresponding to regs x8-x17)
+ * are zeroed out.
+ */
+bool api_extended_args_are_zero(struct ffa_value *args)
+{
+	if (args->extended_val.arg8 != 0U || args->extended_val.arg9 != 0U ||
+	    args->extended_val.arg10 != 0U || args->extended_val.arg11 != 0U ||
+	    args->extended_val.arg12 != 0U || args->extended_val.arg13 != 0U ||
+	    args->extended_val.arg14 != 0U || args->extended_val.arg15 != 0U ||
+	    args->extended_val.arg16 != 0U || args->extended_val.arg17 != 0U) {
+		return false;
+	}
 	return true;
+}
+
+static void api_ffa_msg_wait_rx_release(struct vcpu *current)
+{
+	struct vm_locked vm_locked;
+
+	vm_locked = plat_ffa_vm_find_locked(current->vm->id);
+	if (vm_locked.vm == NULL) {
+		return;
+	}
+
+	api_release_mailbox(vm_locked);
+
+	if (vm_locked.vm->mailbox.state != MAILBOX_STATE_EMPTY) {
+		dlog_warning("Mailbox not released to producer\n");
+	}
+
+	vm_unlock(&vm_locked);
+}
+
+static bool api_retain_rx_buffer_ownership(struct ffa_value args)
+{
+	return ((args.arg2 & FFA_MSG_WAIT_FLAG_RETAIN_RX) != 0U);
 }
 
 struct ffa_value api_ffa_msg_wait(struct vcpu *current, struct vcpu **next,
@@ -1092,10 +1138,19 @@ struct ffa_value api_ffa_msg_wait(struct vcpu *current, struct vcpu **next,
 		.vcpu = NULL,
 	};
 
-	if (args->arg1 != 0U || args->arg2 != 0U || args->arg3 != 0U ||
-	    args->arg4 != 0U || args->arg5 != 0U || args->arg6 != 0U ||
-	    args->arg7 != 0U) {
+	if (args->arg1 != 0U || args->arg3 != 0U || args->arg4 != 0U ||
+	    args->arg5 != 0U || args->arg6 != 0U || args->arg7 != 0U) {
 		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	if (current->vm->ffa_version >= FFA_VERSION_1_2) {
+		if (!api_extended_args_are_zero(args)) {
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
+	} else {
+		if (args->arg2 != 0U) {
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
 	}
 
 	current_locked = vcpu_lock(current);
@@ -1110,17 +1165,36 @@ struct ffa_value api_ffa_msg_wait(struct vcpu *current, struct vcpu **next,
 	       next_state == VCPU_STATE_WAITING);
 
 	ret = plat_ffa_msg_wait_prepare(current_locked, next);
+
+	/*
+	 * To maintain partial ordering of locks, release vCPU lock before
+	 * releasing the VM's RX buffer, a process which requires locking the
+	 * VM.
+	 */
 out:
 	vcpu_unlock(&current_locked);
 
-	if (ret.func != FFA_ERROR_32) {
-		struct vm_locked vm_locked = vm_lock(current->vm);
-
-		api_release_mailbox(vm_locked, NULL);
-		vm_unlock(&vm_locked);
+	if (ret.func != FFA_ERROR_32 &&
+	    !api_retain_rx_buffer_ownership(*args)) {
+		api_ffa_msg_wait_rx_release(current);
 	}
-
 	return ret;
+}
+
+/**
+ * Inject virtual timer interrupt to next vCPU if its timer has expired.
+ */
+static void api_inject_arch_timer_interrupt(struct vcpu_locked current_locked,
+					    struct vcpu_locked next_locked)
+{
+	struct vcpu *next = next_locked.vcpu;
+
+	if (arch_timer_expired(&next->regs)) {
+		/* Make virtual timer interrupt pending. */
+		api_interrupt_inject_locked(next_locked, HF_VIRTUAL_TIMER_INTID,
+					    current_locked, NULL);
+		vcpu_interrupt_queue_push(next_locked, HF_VIRTUAL_TIMER_INTID);
+	}
 }
 
 /**
@@ -1137,6 +1211,10 @@ static bool api_vcpu_prepare_run(struct vcpu_locked current_locked,
 	bool vcpu_was_init_state = false;
 	bool need_vm_lock;
 	struct two_vcpu_locked vcpus_locked;
+
+	const struct ffa_value ffa_run_abi =
+		(struct ffa_value){.func = FFA_RUN_32};
+	const struct ffa_value *ffa_run_ret = NULL;
 
 	/*
 	 * Check that the registers are available so that the vCPU can be run.
@@ -1226,54 +1304,15 @@ static bool api_vcpu_prepare_run(struct vcpu_locked current_locked,
 		}
 
 		assert(need_vm_lock == true);
-		if (!vm_locked.vm->el0_partition &&
-		    plat_ffa_inject_notification_pending_interrupt(
-			    vcpu_next_locked, current_locked, vm_locked)) {
-			/* TODO: setting a return value to override
-			 * the placeholder (FFA_ERROR(INTERRUPTED))
-			 * set by FFA_MSG_WAIT. FF-A v1.1 allows
-			 * FFA_MSG_WAIT to successfully return even if
-			 * it didn't receive a message. TFTF tests are
-			 * still expecting an FFA_ERROR instead,
-			 * should be fixed?
-			 */
-			arch_regs_set_retval(
-				&vcpu->regs,
-				(struct ffa_value){.func = FFA_RUN_32,
-						   // TODO: does it make sense
-						   // to set vCPU/receiver?
-						   .arg1 = 0});
-			break;
+		if (!vm_locked.vm->el0_partition) {
+			plat_ffa_inject_notification_pending_interrupt(
+				vcpu_next_locked, current_locked, vm_locked);
 		}
 
-		/*
-		 * A pending message allows the vCPU to run so the message can
-		 * be delivered directly.
-		 */
-		if (vcpu->vm->mailbox.state == MAILBOX_STATE_FULL) {
-			arch_regs_set_retval(&vcpu->regs,
-					     ffa_msg_recv_return(vcpu->vm));
-			break;
-		}
+		/* Provide reference to the return value. */
+		ffa_run_ret = &ffa_run_abi;
 
-		if (vcpu_interrupt_count_get(vcpu_next_locked) > 0) {
-			break;
-		}
-
-		if (arch_timer_enabled(&vcpu->regs)) {
-			timer_remaining_ns =
-				arch_timer_remaining_ns(&vcpu->regs);
-			if (timer_remaining_ns == 0) {
-				break;
-			}
-		} else {
-			dlog_verbose("Timer disabled\n");
-		}
-		run_ret->func = FFA_MSG_WAIT_32;
-		run_ret->arg1 = ffa_vm_vcpu(vcpu->vm->id, vcpu_index(vcpu));
-		run_ret->arg2 = timer_remaining_ns;
-		ret = false;
-		goto out;
+		break;
 	case VCPU_STATE_BLOCKED_INTERRUPT:
 		if (need_vm_lock &&
 		    plat_ffa_inject_notification_pending_interrupt(
@@ -1332,21 +1371,15 @@ static bool api_vcpu_prepare_run(struct vcpu_locked current_locked,
 
 	plat_ffa_init_schedule_mode_ffa_run(current_locked, vcpu_next_locked);
 
-	/* It has been decided that the vCPU should be run. */
+	timer_migrate_to_other_cpu(current_locked.vcpu->cpu, vcpu_next_locked);
 	vcpu->cpu = current_locked.vcpu->cpu;
-	vcpu->state = VCPU_STATE_RUNNING;
+
+	vcpu_set_running(vcpu_next_locked, ffa_run_ret);
 
 	if (vcpu_was_init_state) {
 		vcpu_set_phys_core_idx(vcpu);
 		vcpu_set_boot_info_gp_reg(vcpu);
 	}
-
-	/*
-	 * Mark the registers as unavailable now that we're about to reflect
-	 * them onto the real registers. This will also prevent another physical
-	 * CPU from trying to read these registers.
-	 */
-	vcpu->regs_available = false;
 
 	ret = true;
 
@@ -1421,28 +1454,6 @@ struct ffa_value api_ffa_run(ffa_id_t vm_id, ffa_vcpu_index_t vcpu_idx,
 		goto out_vcpu;
 	}
 
-	/*
-	 * Inject timer interrupt if timer has expired. It's safe to access
-	 * vcpu->regs here because api_vcpu_prepare_run already made sure that
-	 * regs_available was true (and then set it to false) before returning
-	 * true.
-	 */
-	if (arch_timer_pending(&vcpu->regs)) {
-		/* Make virtual timer interrupt pending. */
-		api_interrupt_inject_locked(vcpu_next_locked,
-					    HF_VIRTUAL_TIMER_INTID,
-					    vcpu_next_locked, NULL);
-
-		/*
-		 * Set the mask bit so the hardware interrupt doesn't fire
-		 * again. Ideally we wouldn't do this because it affects what
-		 * the secondary vCPU sees, but if we don't then we end up with
-		 * a loop of the interrupt firing each time we try to return to
-		 * the secondary vCPU.
-		 */
-		arch_timer_mask(&vcpu->regs);
-	}
-
 	/* Switch to the vCPU. */
 	*next = vcpu;
 
@@ -1454,9 +1465,7 @@ struct ffa_value api_ffa_run(ffa_id_t vm_id, ffa_vcpu_index_t vcpu_idx,
 	 * Set a placeholder return code to the scheduler. This will be
 	 * overwritten when the switch back to the primary occurs.
 	 */
-	ret.func = FFA_INTERRUPT_32;
-	ret.arg1 = 0;
-	ret.arg2 = 0;
+	ret = api_ffa_interrupt_return(0);
 
 out_vcpu:
 	vcpu_unlock(&vcpu_next_locked);
@@ -1478,35 +1487,38 @@ static bool api_mode_valid_owned_and_exclusive(uint32_t mode)
 /**
  * Configures the hypervisor's stage-1 view of the send and receive pages.
  */
-static bool api_vm_configure_stage1(struct mm_stage1_locked mm_stage1_locked,
-				    struct vm_locked vm_locked,
-				    paddr_t pa_send_begin, paddr_t pa_send_end,
-				    paddr_t pa_recv_begin, paddr_t pa_recv_end,
-				    uint32_t extra_attributes,
-				    struct mpool *local_page_pool)
+static struct ffa_value api_vm_configure_stage1(
+	struct mm_stage1_locked mm_stage1_locked, struct vm_locked vm_locked,
+	paddr_t pa_send_begin, paddr_t pa_send_end, paddr_t pa_recv_begin,
+	paddr_t pa_recv_end, uint32_t extra_attributes,
+	struct mpool *local_page_pool)
 {
-	bool ret;
+	struct ffa_value ret;
 
-	/* Map the send page as read-only in the hypervisor address space. */
+	/*
+	 * Map the send page as read-only in the SPMC/hypervisor address space.
+	 */
 	vm_locked.vm->mailbox.send =
 		mm_identity_map(mm_stage1_locked, pa_send_begin, pa_send_end,
 				MM_MODE_R | extra_attributes, local_page_pool);
 	if (!vm_locked.vm->mailbox.send) {
-		goto fail;
+		ret = ffa_error(FFA_NO_MEMORY);
+		goto out;
 	}
 
 	/*
-	 * Map the receive page as writable in the hypervisor address space. On
-	 * failure, unmap the send page before returning.
+	 * Map the receive page as writable in the SPMC/hypervisor address
+	 * space. On failure, unmap the send page before returning.
 	 */
 	vm_locked.vm->mailbox.recv =
 		mm_identity_map(mm_stage1_locked, pa_recv_begin, pa_recv_end,
 				MM_MODE_W | extra_attributes, local_page_pool);
 	if (!vm_locked.vm->mailbox.recv) {
+		ret = ffa_error(FFA_NO_MEMORY);
 		goto fail_undo_send;
 	}
 
-	ret = true;
+	ret = (struct ffa_value){.func = FFA_SUCCESS_32};
 	goto out;
 
 	/*
@@ -1517,9 +1529,6 @@ fail_undo_send:
 	vm_locked.vm->mailbox.send = NULL;
 	CHECK(mm_unmap(mm_stage1_locked, pa_send_begin, pa_send_end,
 		       local_page_pool));
-
-fail:
-	ret = false;
 
 out:
 	return ret;
@@ -1554,12 +1563,16 @@ struct ffa_value api_vm_configure_pages(
 
 	/* We only allow these to be setup once. */
 	if (vm_locked.vm->mailbox.send || vm_locked.vm->mailbox.recv) {
+		dlog_error("%s: Mailboxes have already been setup for VM %#x\n",
+			   __func__, vm_locked.vm->id);
 		ret = ffa_error(FFA_DENIED);
 		goto out;
 	}
 
 	/* Hafnium only supports a fixed size of RX/TX buffers. */
 	if (page_count != HF_MAILBOX_SIZE / FFA_PAGE_SIZE) {
+		dlog_error("%s: Page count must be %zu, it is %d\n", __func__,
+			   HF_MAILBOX_SIZE / FFA_PAGE_SIZE, page_count);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
 		goto out;
 	}
@@ -1567,6 +1580,7 @@ struct ffa_value api_vm_configure_pages(
 	/* Fail if addresses are not page-aligned. */
 	if (!is_aligned(ipa_addr(send), PAGE_SIZE) ||
 	    !is_aligned(ipa_addr(recv), PAGE_SIZE)) {
+		dlog_error("%s: Mailbox buffers not page-aligned\n", __func__);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
 		goto out;
 	}
@@ -1579,6 +1593,7 @@ struct ffa_value api_vm_configure_pages(
 
 	/* Fail if the same page is used for the send and receive pages. */
 	if (pa_addr(pa_send_begin) == pa_addr(pa_recv_begin)) {
+		dlog_error("%s: Mailbox buffers overlap\n", __func__);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
 		goto out;
 	}
@@ -1637,8 +1652,17 @@ struct ffa_value api_vm_configure_pages(
 				     mode, local_page_pool, NULL)) {
 			/* TODO: partial defrag of failed range. */
 			/* Recover any memory consumed in failed mapping. */
+			dlog_error("%s: cannot map recv page\n", __func__);
 			vm_ptable_defrag(vm_locked, local_page_pool);
+			ret = ffa_error(FFA_NO_MEMORY);
 			goto fail_undo_send;
+		}
+	} else {
+		ret = arch_other_world_vm_configure_rxtx_map(
+			vm_locked, local_page_pool, pa_send_begin, pa_send_end,
+			pa_recv_begin, pa_recv_end);
+		if (ret.func != FFA_SUCCESS_32) {
+			goto out;
 		}
 	}
 
@@ -1660,9 +1684,10 @@ struct ffa_value api_vm_configure_pages(
 		extra_attributes |= MM_MODE_NG;
 	}
 
-	if (!api_vm_configure_stage1(mm_stage1_locked, vm_locked, pa_send_begin,
-				     pa_send_end, pa_recv_begin, pa_recv_end,
-				     extra_attributes, local_page_pool)) {
+	ret = api_vm_configure_stage1(
+		mm_stage1_locked, vm_locked, pa_send_begin, pa_send_end,
+		pa_recv_begin, pa_recv_end, extra_attributes, local_page_pool);
+	if (ret.func != FFA_SUCCESS_32) {
 		goto fail_undo_send_and_recv;
 	}
 
@@ -1676,44 +1701,69 @@ fail_undo_send_and_recv:
 fail_undo_send:
 	CHECK(vm_identity_map(vm_locked, pa_send_begin, pa_send_end,
 			      orig_send_mode, local_page_pool, NULL));
-	ret = ffa_error(FFA_NO_MEMORY);
 
 out:
 	return ret;
 }
 
-static void api_get_rxtx_description(struct vm *current_vm, ipaddr_t *send,
-				     ipaddr_t *recv, uint32_t *page_count,
-				     ffa_id_t *owner_vm_id)
+/**
+ * Read the buffer addresses and VM ID of an FFA_RXTX_MAP request. Handles
+ * forwarded messages by reading from the hypervisor's TX buffer.
+ *
+ * Returns the VM/SP ID on success.
+ *
+ * Returns `HF_INVALID_VM_ID` when the arguments provided via the ABI
+ * FFA_RXTX_MAP indicate the SPMC should retrieve the RXTX description from the
+ * Hypervisor RXTX buffers, and the hypervisor hasn't given its own RXTX buffers
+ * for the SPMC to map.
+ */
+static ffa_id_t api_get_rxtx_description(struct vm *current_vm, ipaddr_t *send,
+					 ipaddr_t *recv, uint32_t *page_count)
 {
+	bool forwarded;
+	struct vm_locked vm_locked;
+	ffa_id_t owner_vm_id;
+	struct ffa_endpoint_rx_tx_descriptor *endpoint_desc;
+	struct ffa_composite_memory_region *rx_region;
+	struct ffa_composite_memory_region *tx_region;
+
 	/*
 	 * If the message has been forwarded the effective addresses are in
 	 * hypervisor's TX buffer.
 	 */
-	bool forwarded = (current_vm->id == HF_OTHER_WORLD_ID) &&
-			 (ipa_addr(*send) == 0) && (ipa_addr(*recv) == 0) &&
-			 (*page_count == 0);
+	forwarded = (current_vm->id == HF_OTHER_WORLD_ID) &&
+		    (ipa_addr(*send) == 0) && (ipa_addr(*recv) == 0) &&
+		    (*page_count == 0);
 
 	if (forwarded) {
-		struct vm_locked vm_locked = vm_lock(current_vm);
-		struct ffa_endpoint_rx_tx_descriptor *endpoint_desc =
-			(struct ffa_endpoint_rx_tx_descriptor *)
-				vm_locked.vm->mailbox.send;
-		struct ffa_composite_memory_region *rx_region =
-			ffa_enpoint_get_rx_memory_region(endpoint_desc);
-		struct ffa_composite_memory_region *tx_region =
-			ffa_enpoint_get_tx_memory_region(endpoint_desc);
+		vm_locked = vm_lock(current_vm);
+		endpoint_desc = (struct ffa_endpoint_rx_tx_descriptor *)
+					vm_locked.vm->mailbox.send;
 
-		*owner_vm_id = endpoint_desc->endpoint_id;
+		if (endpoint_desc == NULL) {
+			dlog_error(
+				"Trying to access RXTX description, but "
+				"hypervisor has not provided RXTX buffers\n");
+			vm_unlock(&vm_locked);
+			return HF_INVALID_VM_ID;
+		}
+
+		rx_region = ffa_endpoint_get_rx_memory_region(endpoint_desc);
+		tx_region = ffa_endpoint_get_tx_memory_region(endpoint_desc);
+
+		owner_vm_id = endpoint_desc->endpoint_id;
 		*recv = ipa_init(rx_region->constituents[0].address);
 		*send = ipa_init(tx_region->constituents[0].address);
 		*page_count = rx_region->constituents[0].page_count;
 
 		vm_unlock(&vm_locked);
 	} else {
-		*owner_vm_id = current_vm->id;
+		owner_vm_id = current_vm->id;
 	}
+
+	return owner_vm_id;
 }
+
 /**
  * Configures the VM to send/receive data through the specified pages. The pages
  * must not be shared. Locking of the page tables combined with a local memory
@@ -1743,8 +1793,11 @@ struct ffa_value api_ffa_rxtx_map(ipaddr_t send, ipaddr_t recv,
 	 * Get the original buffer addresses and VM ID in case of forwarded
 	 * message.
 	 */
-	api_get_rxtx_description(current->vm, &send, &recv, &page_count,
-				 &owner_vm_id);
+	owner_vm_id = api_get_rxtx_description(current->vm, &send, &recv,
+					       &page_count);
+	if (owner_vm_id == HF_INVALID_VM_ID) {
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
 
 	owner_vm_locked = plat_ffa_vm_find_locked_create(owner_vm_id);
 	if (owner_vm_locked.vm == NULL) {
@@ -1806,7 +1859,7 @@ struct ffa_value api_ffa_rxtx_unmap(ffa_id_t allocator_id, struct vcpu *current)
 	struct ffa_value ret = (struct ffa_value){.func = FFA_SUCCESS_32};
 
 	if (vm->id == HF_HYPERVISOR_VM_ID && !ffa_is_vm_id(allocator_id)) {
-		dlog_error(
+		dlog_verbose(
 			"The Hypervisor must specify a valid VM ID in register "
 			"W1, if FFA_RXTX_UNMAP call forwarded to SPM.\n");
 		return ffa_error(FFA_INVALID_PARAMETERS);
@@ -1861,6 +1914,13 @@ struct ffa_value api_ffa_rxtx_unmap(ffa_id_t allocator_id, struct vcpu *current)
 		CHECK(vm_identity_map(vm_locked, recv_pa_begin, recv_pa_end,
 				      MM_MODE_R | MM_MODE_W | MM_MODE_X,
 				      &api_page_pool, NULL));
+	} else {
+		ret = arch_other_world_vm_configure_rxtx_unmap(
+			vm_locked, &api_page_pool, send_pa_begin, send_pa_end,
+			recv_pa_begin, recv_pa_end);
+		if (ret.func != FFA_SUCCESS_32) {
+			goto out;
+		}
 	}
 
 	/* Unmap the buffers in the partition manager. */
@@ -1898,11 +1958,11 @@ struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
 	struct vm_locked sender_locked;
 	const void *from_msg;
 	struct ffa_value ret;
-	struct ffa_partition_rxtx_header header;
 	ffa_id_t sender_id;
 	ffa_id_t receiver_id;
 	uint32_t msg_size;
-	ffa_notifications_bitmap_t rx_buffer_full;
+
+	alignas(8) struct ffa_partition_rxtx_header header;
 
 	/* Only Hypervisor can set `sender_vm_id` when forwarding messages. */
 	if (from->id != HF_HYPERVISOR_VM_ID && sender_vm_id != 0) {
@@ -1935,7 +1995,16 @@ struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
 	 * unsafe memory which could be 'corrupted' between safety checks and
 	 * final buffer copy.
 	 */
-	memcpy_s(&header, FFA_RXTX_HEADER_SIZE, from_msg, FFA_RXTX_HEADER_SIZE);
+	if (!memcpy_trapped(&header, FFA_RXTX_HEADER_SIZE, from_msg,
+			    FFA_RXTX_HEADER_SIZE)) {
+		dlog_error(
+			"%s: Failed to copy message from sender's(%x) TX "
+			"buffer.\n",
+			__func__, sender_locked.vm->id);
+		ret = ffa_error(FFA_ABORTED);
+		goto out_unlock_sender;
+	}
+
 	sender_id = ffa_rxtx_header_sender(&header);
 	receiver_id = ffa_rxtx_header_receiver(&header);
 
@@ -1959,6 +2028,11 @@ struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
 	/* `flags` can be set only at secure virtual FF-A instances. */
 	if (ffa_is_vm_id(sender_id) && (flags != 0)) {
 		dlog_error("flags must be zero.\n");
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	if (header.offset != FFA_RXTX_HEADER_SIZE) {
+		dlog_error("Indirect msg payload must follow the header.\n");
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -2010,7 +2084,7 @@ struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
 
 	/* Check the size of transfer. */
 	msg_size = FFA_RXTX_HEADER_SIZE + header.size;
-	if ((msg_size > FFA_PARTITION_MSG_PAYLOAD_MAX) ||
+	if ((msg_size > FFA_MSG_PAYLOAD_MAX) ||
 	    (header.size > FFA_PARTITION_MSG_PAYLOAD_MAX)) {
 		dlog_error("Message is too big.\n");
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
@@ -2018,23 +2092,44 @@ struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
 	}
 
 	/* Copy data. */
-	memcpy_s(to->mailbox.recv, FFA_MSG_PAYLOAD_MAX, from_msg, msg_size);
+	if (!memcpy_trapped(to->mailbox.recv, FFA_MSG_PAYLOAD_MAX, from_msg,
+			    msg_size)) {
+		dlog_error(
+			"%s: Failed to copy message to receiver's(%x) RX "
+			"buffer.\n",
+			__func__, to->id);
+		ret = ffa_error(FFA_ABORTED);
+		goto out;
+	}
+
 	to->mailbox.recv_size = msg_size;
 	to->mailbox.recv_sender = sender_id;
 	to->mailbox.recv_func = FFA_MSG_SEND2_32;
 	to->mailbox.state = MAILBOX_STATE_FULL;
 
-	rx_buffer_full = ffa_is_vm_id(sender_id)
-				 ? FFA_NOTIFICATION_HYP_BUFFER_FULL_MASK
-				 : FFA_NOTIFICATION_SPM_BUFFER_FULL_MASK;
-	vm_notifications_framework_set_pending(to_locked, rx_buffer_full);
+	/*
+	 * Set framework notifications, only if the SP has enabled
+	 * receipt of notifications.
+	 * If VMs have provided the RX buffer it is implied they already
+	 * support indirect messaging, and therefore framework notifications.
+	 */
+	if (ffa_is_vm_id(to_locked.vm->id) ||
+	    vm_are_notifications_enabled(to_locked.vm)) {
+		ffa_notifications_bitmap_t rx_buffer_full =
+			ffa_is_vm_id(sender_id)
+				? FFA_NOTIFICATION_HYP_BUFFER_FULL_MASK
+				: FFA_NOTIFICATION_SPM_BUFFER_FULL_MASK;
 
-	if ((FFA_NOTIFICATIONS_FLAG_DELAY_SRI & flags) == 0) {
-		dlog_verbose("SRI was NOT delayed. vcpu: %u!\n",
-			     vcpu_index(current));
-		plat_ffa_sri_trigger_not_delayed(current->cpu);
-	} else {
-		plat_ffa_sri_state_set(DELAYED);
+		vm_notifications_framework_set_pending(to_locked,
+						       rx_buffer_full);
+
+		if ((FFA_NOTIFICATIONS_FLAG_DELAY_SRI & flags) == 0) {
+			dlog_verbose("SRI was NOT delayed. vcpu: %u!\n",
+				     vcpu_index(current));
+			plat_ffa_sri_trigger_not_delayed(current->cpu);
+		} else {
+			plat_ffa_sri_set_delayed(current->cpu);
+		}
 	}
 
 	ret = (struct ffa_value){.func = FFA_SUCCESS_32};
@@ -2070,7 +2165,6 @@ struct ffa_value api_ffa_rx_release(ffa_id_t receiver_id, struct vcpu *current)
 	ffa_id_t current_vm_id = current_vm->id;
 	ffa_id_t release_vm_id;
 	struct ffa_value ret;
-	int32_t error_code;
 
 	/* `receiver_id` can be set only at Non-Secure Physical interface. */
 	if (vm_id_is_current_world(current_vm_id) && (receiver_id != 0)) {
@@ -2100,12 +2194,7 @@ struct ffa_value api_ffa_rx_release(ffa_id_t receiver_id, struct vcpu *current)
 		goto out;
 	}
 
-	if (!api_release_mailbox(vm_locked, &error_code)) {
-		ret = ffa_error(error_code);
-		goto out;
-	}
-
-	ret = (struct ffa_value){.func = FFA_SUCCESS_32};
+	ret = api_release_mailbox(vm_locked);
 
 out:
 	vm_unlock(&vm_locked);
@@ -2166,6 +2255,22 @@ out:
 	return ret;
 }
 
+/*
+ * Returns true if intid relates with either of those:
+ * - NPI
+ * - ME
+ * - Virtual Timer.
+ * - IPI
+ *
+ * These are VIs with no expected interrupt descriptor.
+ */
+static bool api_is_maintenance_virtual_interrupt(uint32_t intid)
+{
+	return intid == HF_NOTIFICATION_PENDING_INTID ||
+	       intid == HF_MANAGED_EXIT_INTID ||
+	       intid == HF_VIRTUAL_TIMER_INTID || intid == HF_IPI_INTID;
+}
+
 /**
  * Enables or disables a given interrupt ID for the calling vCPU.
  *
@@ -2176,12 +2281,30 @@ int64_t api_interrupt_enable(uint32_t intid, bool enable,
 {
 	struct vcpu_locked current_locked;
 	struct interrupts *interrupts = &current->interrupts;
+	struct interrupt_descriptor *int_desc = NULL;
+	struct vm *vm = current->vm;
+	struct vm_locked vm_locked;
+
+	int64_t ret = -1;
 
 	if (intid >= HF_NUM_INTIDS) {
 		return -1;
 	}
 
+	vm_locked = vm_lock(vm);
 	current_locked = vcpu_lock(current);
+
+	int_desc = vm_interrupt_set_enable(vm_locked, intid, enable);
+
+	if (!api_is_maintenance_virtual_interrupt(intid)) {
+		if (int_desc == NULL) {
+			dlog_error("%s: invalid interrupt ID.\n", __func__);
+			goto out;
+		}
+
+		plat_interrupts_configure_interrupt(*int_desc);
+	}
+
 	if (enable) {
 		/*
 		 * If it is pending and was not enabled before, increment the
@@ -2192,6 +2315,7 @@ int64_t api_interrupt_enable(uint32_t intid, bool enable,
 			vcpu_interrupt_count_increment(current_locked,
 						       interrupts, intid);
 		}
+
 		vcpu_virt_interrupt_set_enabled(interrupts, intid);
 		vcpu_virt_interrupt_set_type(interrupts, intid, type);
 	} else {
@@ -2208,16 +2332,13 @@ int64_t api_interrupt_enable(uint32_t intid, bool enable,
 					     INTERRUPT_TYPE_IRQ);
 	}
 
-	vcpu_unlock(&current_locked);
-	return 0;
-}
+	ret = 0;
 
-static void api_interrupt_clear_decrement(struct vcpu_locked locked_vcpu,
-					  struct interrupts *interrupts,
-					  uint32_t intid)
-{
-	vcpu_virt_interrupt_clear_pending(interrupts, intid);
-	vcpu_interrupt_count_decrement(locked_vcpu, interrupts, intid);
+out:
+	vm_unlock(&vm_locked);
+	vcpu_unlock(&current_locked);
+
+	return ret;
 }
 
 /**
@@ -2225,18 +2346,16 @@ static void api_interrupt_clear_decrement(struct vcpu_locked locked_vcpu,
  * acknowledges it (i.e. marks it as no longer pending). Returns
  * HF_INVALID_INTID if there are no pending interrupts.
  */
-uint32_t api_interrupt_get(struct vcpu *current)
+uint32_t api_interrupt_get(struct vcpu_locked current_locked)
 {
 	uint32_t i;
 	uint32_t first_interrupt = HF_INVALID_INTID;
-	struct vcpu_locked current_locked;
-	struct interrupts *interrupts = &current->interrupts;
+	struct interrupts *interrupts = &current_locked.vcpu->interrupts;
 
 	/*
 	 * Find the first enabled and pending interrupt ID, return it, and
 	 * deactivate it.
 	 */
-	current_locked = vcpu_lock(current);
 	for (i = 0; i < HF_NUM_INTIDS / INTERRUPT_REGISTER_BITS; ++i) {
 		uint32_t enabled_and_pending =
 			interrupts->interrupt_enabled.bitmap[i] &
@@ -2251,171 +2370,91 @@ uint32_t api_interrupt_get(struct vcpu *current)
 			/*
 			 * Mark it as no longer pending and decrement the count.
 			 */
-			api_interrupt_clear_decrement(
-				current_locked, interrupts, first_interrupt);
+			vcpu_interrupt_clear_decrement(current_locked,
+						       first_interrupt);
 			break;
 		}
 	}
 
-	vcpu_unlock(&current_locked);
 	return first_interrupt;
 }
 
 /**
- * Returns whether the current vCPU is allowed to inject an interrupt into the
- * given VM and vCPU.
- */
-static inline bool is_injection_allowed(uint32_t target_vm_id,
-					struct vcpu *current)
-{
-	uint32_t current_vm_id = current->vm->id;
-
-	/*
-	 * The primary VM is allowed to inject interrupts into any VM. Secondary
-	 * VMs are only allowed to inject interrupts into their own vCPUs.
-	 */
-	return current_vm_id == HF_PRIMARY_VM_ID ||
-	       current_vm_id == target_vm_id;
-}
-
-/**
- * Injects a virtual interrupt of the given ID into the given target vCPU.
- * This doesn't cause the vCPU to actually be run immediately; it will be taken
- * when the vCPU is next run, which is up to the scheduler.
+ * Negotiate the FF-A version to be used for this FF-A instance.
+ * See section 13.2 of the FF-A v1.2 ALP1 spec.
  *
- * Returns:
- *  - -1 on failure because the target VM or vCPU doesn't exist, the interrupt
- *    ID is invalid, or the current VM is not allowed to inject interrupts to
- *    the target VM.
- *  - 0 on success if no further action is needed.
- *  - 1 if it was called by the primary VM and the primary VM now needs to wake
- *    up or kick the target vCPU.
+ * Returns Hafnium's version number (`FFA_VERSION_COMPILED`) on success.
+ * Returns `FFA_NOT_SUPPORTED` on error:
+ * - The version is invalid (highest bit set).
+ * - The requested version is incompatible.
+ * - The version has already been negotiated and cannot be changed.
  */
-int64_t api_interrupt_inject(ffa_id_t target_vm_id,
-			     ffa_vcpu_index_t target_vcpu_idx, uint32_t intid,
-			     struct vcpu *current, struct vcpu **next)
-{
-	struct vcpu *target_vcpu;
-	struct vm *target_vm = vm_find(target_vm_id);
-	struct vcpu_locked current_locked;
-	struct vcpu_locked target_locked;
-	struct two_vcpu_locked vcpus_locked;
-	int64_t ret;
-
-	if (intid >= HF_NUM_INTIDS) {
-		return -1;
-	}
-
-	if (target_vm == NULL) {
-		return -1;
-	}
-
-	if (target_vcpu_idx >= target_vm->vcpu_count) {
-		/* The requested vCPU must exist. */
-		return -1;
-	}
-
-	if (!is_injection_allowed(target_vm_id, current)) {
-		return -1;
-	}
-
-	target_vcpu = vm_get_vcpu(target_vm, target_vcpu_idx);
-
-	/* A VM could inject an interrupt for itself. */
-	if (target_vcpu != current) {
-		/* Lock both vCPUs at once to avoid deadlock. */
-		vcpus_locked = vcpu_lock_both(current, target_vcpu);
-		current_locked = vcpus_locked.vcpu1;
-		target_locked = vcpus_locked.vcpu2;
-	} else {
-		current_locked = vcpu_lock(current);
-		target_locked = current_locked;
-	}
-
-	dlog_verbose(
-		"Injecting interrupt %u for VM %#x vCPU %u from VM %#x vCPU "
-		"%u\n",
-		intid, target_vm_id, target_vcpu_idx, current->vm->id,
-		vcpu_index(current));
-	ret = api_interrupt_inject_locked(target_locked, intid, current_locked,
-					  next);
-	if (target_vcpu != current) {
-		vcpu_unlock(&target_locked);
-	}
-
-	vcpu_unlock(&current_locked);
-	return ret;
-}
-
-/** Returns the version of the implemented FF-A specification. */
 struct ffa_value api_ffa_version(struct vcpu *current,
-				 uint32_t requested_version)
+				 enum ffa_version requested_version)
 {
+	static_assert(sizeof(enum ffa_version) == 4,
+		      "enum ffa_version must be 4 bytes wide");
+
+	const struct ffa_value error = {.func = (uint32_t)FFA_NOT_SUPPORTED};
 	struct vm_locked current_vm_locked;
 
-	/*
-	 * Ensure that both major and minor revision representation occupies at
-	 * most 15 bits.
-	 */
-	static_assert(0x8000 > FFA_VERSION_MAJOR,
-		      "Major revision representation takes more than 15 bits.");
-	static_assert(0x10000 > FFA_VERSION_MINOR,
-		      "Minor revision representation takes more than 16 bits.");
-	if (requested_version & FFA_VERSION_RESERVED_BIT) {
-		/* Invalid encoding, return an error. */
-		return (struct ffa_value){.func = (uint32_t)FFA_NOT_SUPPORTED};
+	if (!ffa_version_is_valid(requested_version)) {
+		dlog_error(
+			"FFA_VERSION: requested version %#x is invalid "
+			"(highest bit must be zero)\n",
+			requested_version);
+		return error;
 	}
 
-	if ((requested_version >> FFA_VERSION_MAJOR_OFFSET) !=
-		    FFA_VERSION_MAJOR ||
-	    requested_version > FFA_VERSION_COMPILED) {
-		dlog_error("Version %x incompatible with %x\n",
-			   requested_version, FFA_VERSION_COMPILED);
-		return (struct ffa_value){.func = (uint32_t)FFA_NOT_SUPPORTED};
+	if (!ffa_versions_are_compatible(requested_version,
+					 FFA_VERSION_COMPILED)) {
+		dlog_error(
+			"FFA_VERSION: requested version v%u.%u is not "
+			"compatible with v%u.%u\n",
+			ffa_version_get_major(requested_version),
+			ffa_version_get_minor(requested_version),
+			ffa_version_get_major(FFA_VERSION_COMPILED),
+			ffa_version_get_minor(FFA_VERSION_COMPILED));
+		return error;
 	}
 
 	current_vm_locked = vm_lock(current->vm);
+
+	if (current_vm_locked.vm->ffa_version_negotiated &&
+	    requested_version != current_vm_locked.vm->ffa_version) {
+		vm_unlock(&current_vm_locked);
+		dlog_error(
+			"FFA_VERSION: Cannot change FF-A version after other "
+			"FF-A calls have been made\n");
+		return error;
+	}
+
 	current_vm_locked.vm->ffa_version = requested_version;
 	vm_unlock(&current_vm_locked);
 
-	return ((struct ffa_value){.func = FFA_VERSION_COMPILED});
+	return (struct ffa_value){.func = (uint32_t)FFA_VERSION_COMPILED};
 }
 
 /**
- * Helper for success return of FFA_FEATURES, for when it is used to query
- * an interrupt ID.
+ * Helper for success return of FFA_FEATURES.
  */
 struct ffa_value api_ffa_feature_success(uint32_t arg2)
 {
 	return (struct ffa_value){
-		.func = FFA_SUCCESS_32, .arg1 = 0U, .arg2 = arg2};
+		.func = FFA_SUCCESS_32,
+		.arg1 = 0U,
+		.arg2 = arg2,
+	};
 }
 
-/**
- * Discovery function returning information about the implementation of optional
- * FF-A interfaces.
- */
-struct ffa_value api_ffa_features(uint32_t feature_function_id,
-				  uint32_t input_property, uint32_t ffa_version)
+static struct ffa_value ffa_features_function(uint32_t func,
+					      uint32_t input_property,
+					      struct vcpu *current)
 {
-	/*
-	 * According to table 13.8 of FF-A v1.1 Beta 0 spec, bits [30:8] MBZ
-	 * if using a feature ID.
-	 */
-	if ((feature_function_id & FFA_FEATURES_FUNC_ID_MASK) == 0U &&
-	    (feature_function_id & ~FFA_FEATURES_FEATURE_ID_MASK) != 0U) {
-		return ffa_error(FFA_NOT_SUPPORTED);
-	}
+	const enum ffa_version ffa_version = current->vm->ffa_version;
+	const bool el0_partition = current->vm->el0_partition;
 
-	if (feature_function_id != FFA_MEM_RETRIEVE_REQ_32 &&
-	    input_property != 0U) {
-		dlog_verbose(
-			"input_property must be zero.\ninput_property = %u.\n",
-			input_property);
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	switch (feature_function_id) {
+	switch (func) {
 	/* Check support of the given Function ID. */
 	case FFA_ERROR_32:
 	case FFA_SUCCESS_32:
@@ -2423,15 +2462,17 @@ struct ffa_value api_ffa_features(uint32_t feature_function_id,
 	case FFA_VERSION_32:
 	case FFA_FEATURES_32:
 	case FFA_RX_RELEASE_32:
-	case FFA_RXTX_MAP_64:
 	case FFA_RXTX_UNMAP_32:
 	case FFA_PARTITION_INFO_GET_32:
 	case FFA_ID_GET_32:
 	case FFA_MSG_WAIT_32:
 	case FFA_RUN_32:
+	case FFA_MEM_DONATE_64:
 	case FFA_MEM_DONATE_32:
 	case FFA_MEM_LEND_32:
+	case FFA_MEM_LEND_64:
 	case FFA_MEM_SHARE_32:
+	case FFA_MEM_SHARE_64:
 	case FFA_MEM_RETRIEVE_RESP_32:
 	case FFA_MEM_RELINQUISH_32:
 	case FFA_MEM_RECLAIM_32:
@@ -2441,7 +2482,7 @@ struct ffa_value api_ffa_features(uint32_t feature_function_id,
 	case FFA_MSG_SEND_DIRECT_RESP_32:
 	case FFA_MSG_SEND_DIRECT_REQ_64:
 	case FFA_MSG_SEND_DIRECT_REQ_32:
-#if (MAKE_FFA_VERSION(1, 1) <= FFA_VERSION_COMPILED)
+
 	/* FF-A v1.1 features. */
 	case FFA_SPM_ID_GET_32:
 	case FFA_NOTIFICATION_BITMAP_CREATE_32:
@@ -2451,54 +2492,223 @@ struct ffa_value api_ffa_features(uint32_t feature_function_id,
 	case FFA_NOTIFICATION_SET_32:
 	case FFA_NOTIFICATION_GET_32:
 	case FFA_NOTIFICATION_INFO_GET_64:
+	case FFA_MSG_SEND2_32:
+		if (FFA_VERSION_1_1 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+	/* FF-A v1.2 features. */
+	case FFA_CONSOLE_LOG_32:
+	case FFA_CONSOLE_LOG_64:
+	case FFA_PARTITION_INFO_GET_REGS_64:
+	case FFA_MSG_SEND_DIRECT_REQ2_64:
+	case FFA_MSG_SEND_DIRECT_RESP2_64:
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+		return api_ffa_feature_success(0);
+
+	/* These functions are only supported on S-EL0 partitions. */
 	case FFA_MEM_PERM_GET_32:
 	case FFA_MEM_PERM_SET_32:
 	case FFA_MEM_PERM_GET_64:
 	case FFA_MEM_PERM_SET_64:
-	case FFA_MSG_SEND2_32:
-	case FFA_PARTITION_INFO_GET_REGS_64:
-#endif
-		return (struct ffa_value){.func = FFA_SUCCESS_32};
-	case FFA_MEM_RETRIEVE_REQ_32:
-		if ((input_property & FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_MASK) !=
-		    0U) {
+		if (!(vm_id_is_current_world(current->vm->id) &&
+		      el0_partition)) {
 			dlog_verbose(
-				"Bits[31:2] and Bit[0] of input_property must "
-				"be zero.\ninput_property = %u.\n",
-				input_property);
-			return ffa_error(FFA_INVALID_PARAMETERS);
+				"FFA_FEATURE: %s is only supported on S-EL0 "
+				"partitions\n",
+				ffa_func_name(func));
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		return api_ffa_feature_success(0);
+
+	case FFA_SECONDARY_EP_REGISTER_64:
+		if (FFA_VERSION_COMPILED < FFA_VERSION_1_1) {
+			return ffa_error(FFA_NOT_SUPPORTED);
 		}
 
-		if (ffa_version >= MAKE_FFA_VERSION(1, 1)) {
-			if ((input_property &
-			     FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT) == 0U) {
-				dlog_verbose("NS bit support must be 1.\n");
-				return ffa_error(FFA_INVALID_PARAMETERS);
-			}
+		if (!(vm_id_is_current_world(current->vm->id) &&
+		      current->vm->vcpu_count > 1)) {
+			dlog_verbose(
+				"FFA_FEATURE: %s is only supported on SPs with "
+				"more than 1 vCPU\n",
+				ffa_func_name(func));
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		return api_ffa_feature_success(0);
+
+	/*
+	 * This function is restricted to the secure virtual FF-A instance (i.e.
+	 * only report success to SPs).
+	 */
+	case FFA_YIELD_32:
+		if (!vm_id_is_current_world(current->vm->id)) {
+			dlog_verbose(
+				"FFA_FEATURES: %s is only supported at secure "
+				"virtual FF-A instance\n",
+				ffa_func_name(FFA_YIELD_32));
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		return api_ffa_feature_success(0);
+
+	case FFA_RXTX_MAP_64: {
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+		uint32_t arg2 = 0;
+		struct ffa_features_rxtx_map_params params = {
+			.min_buf_size = FFA_RXTX_MAP_MIN_BUF_4K,
+			.mbz = 0,
+			.max_buf_size =
+				(ffa_version >= FFA_VERSION_1_2)
+					? FFA_RXTX_MAP_MAX_BUF_PAGE_COUNT
+					: 0,
+		};
+
+		memcpy_s(&arg2, sizeof(arg2), &params, sizeof(params));
+		return api_ffa_feature_success(arg2);
+	}
+
+	case FFA_MEM_RETRIEVE_REQ_64:
+	case FFA_MEM_RETRIEVE_REQ_32: {
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+		if (ANY_BITS_SET(input_property,
+				 FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_HI_BIT,
+				 FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_LO_BIT) ||
+		    IS_BIT_SET(input_property,
+			       FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_BIT)) {
+			dlog_warning(
+				"FFA_FEATURES: Bits[%u:%u] and Bit[%u] of "
+				"input_property should be 0 (input_property = "
+				"%#x)\n",
+				FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_HI_BIT,
+				FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_LO_BIT,
+				FFA_FEATURES_MEM_RETRIEVE_REQ_MBZ_BIT,
+				input_property);
+		}
+
+		if (ffa_version >= FFA_VERSION_1_1 &&
+		    (input_property &
+		     FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT) == 0U) {
+			dlog_verbose(
+				"FFA_FEATURES: NS bit support must be 1\n");
+			return ffa_error(FFA_NOT_SUPPORTED);
 		}
 
 		return api_ffa_feature_success(
 			FFA_FEATURES_MEM_RETRIEVE_REQ_BUFFER_SUPPORT |
-			(input_property &
-			 FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT) |
+			FFA_FEATURES_MEM_RETRIEVE_REQ_NS_SUPPORT |
 			FFA_FEATURES_MEM_RETRIEVE_REQ_HYPERVISOR_SUPPORT);
+	}
 
-#if (MAKE_FFA_VERSION(1, 1) <= FFA_VERSION_COMPILED)
+	default:
+		return ffa_error(FFA_NOT_SUPPORTED);
+	}
+}
+
+static struct ffa_value ffa_features_feature(enum ffa_feature_id feature,
+					     uint32_t input_property,
+					     struct vcpu *current)
+{
+	const bool el0_partition = current->vm->el0_partition;
+
+	if (ANY_BITS_SET(feature, FFA_FEATURES_FEATURE_MBZ_HI_BIT,
+			 FFA_FEATURES_FEATURE_MBZ_LO_BIT)) {
+		dlog_verbose(
+			"FFA_FEATURES: feature ID %#x is invalid (bits [%u:%u] "
+			"must be zero)\n",
+			feature, FFA_FEATURES_FEATURE_MBZ_HI_BIT,
+			FFA_FEATURES_FEATURE_MBZ_LO_BIT);
+		return ffa_error(FFA_NOT_SUPPORTED);
+	}
+	if (input_property != 0) {
+		dlog_verbose(
+			"FFA_FEATURES: input_property must be 0 "
+			"(input_property = %#x)\n",
+			input_property);
+		return ffa_error(FFA_NOT_SUPPORTED);
+	}
+
+	switch (feature) {
 	/* Check support of a feature provided respective feature ID. */
+
+	/*
+	 * For NPI and MEI, report the IDs as supported only to partitions at
+	 * the virtual FF-A instances.
+	 */
 	case FFA_FEATURE_NPI:
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+		if (el0_partition) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		if (!vm_id_is_current_world(current->vm->id)) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
 		return api_ffa_feature_success(HF_NOTIFICATION_PENDING_INTID);
+
+	case FFA_FEATURE_MEI:
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		if (el0_partition) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		if (!vm_id_is_current_world(current->vm->id)) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+		return api_ffa_feature_success(HF_MANAGED_EXIT_INTID);
+
 	case FFA_FEATURE_SRI:
+		if (FFA_VERSION_1_2 > FFA_VERSION_COMPILED) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
+
+		if (!ffa_is_vm_id(current->vm->id)) {
+			return ffa_error(FFA_NOT_SUPPORTED);
+		}
 		return api_ffa_feature_success(HF_SCHEDULE_RECEIVER_INTID);
-#endif
+
 	/* Platform specific feature support. */
 	default:
-		return arch_ffa_features(feature_function_id);
+		return ffa_error(FFA_NOT_SUPPORTED);
 	}
 }
 
 /**
- * FF-A specification states that x2/w2 Must Be Zero for direct messaging
- * interfaces.
+ * Discovery function returning information about the implementation of optional
+ * FF-A interfaces. See section 13.3 of the FF-A v1.2 ALP1 spec.
+ *
+ * `function_or_feature_id` is interpreted as either a function ID or a feature
+ * ID, depending on the value of bit 31.
+ * When it is a feature ID, bits [30:8] MBZ and input_property MBZ.
+ *
+ * Returns `FFA_SUCCESS` if the interface is supported.
+ * Returns `FFA_NOT_SUPPORTED` if the interface is not supported or the
+ * parameters are invalid.
+ */
+struct ffa_value api_ffa_features(uint32_t function_or_feature_id,
+				  uint32_t input_property, struct vcpu *current)
+{
+	return IS_BIT_UNSET(function_or_feature_id, FFA_FEATURES_FEATURE_BIT)
+		       ? ffa_features_feature(function_or_feature_id,
+					      input_property, current)
+		       : ffa_features_function(function_or_feature_id,
+					       input_property, current);
+}
+
+/**
+ * FF-A specification states that x2/w2 Must Be Zero for FFA_MSG_SEND_DIRECT_REQ
+ * and FFA_MSG_SEND_DIRECT_RESP interfaces when used for partition messages. See
+ * FF-A v1.2 Table 16.6: FFA_MSG_SEND_DIRECT_REQ function syntax.
  */
 static inline bool api_ffa_dir_msg_is_arg2_zero(struct ffa_value args)
 {
@@ -2513,7 +2723,7 @@ static struct ffa_value api_ffa_value_copy32(struct ffa_value args)
 	return (struct ffa_value){
 		.func = (uint32_t)args.func,
 		.arg1 = (uint32_t)args.arg1,
-		.arg2 = (uint32_t)0,
+		.arg2 = (uint32_t)args.arg2,
 		.arg3 = (uint32_t)args.arg3,
 		.arg4 = (uint32_t)args.arg4,
 		.arg5 = (uint32_t)args.arg5,
@@ -2523,37 +2733,96 @@ static struct ffa_value api_ffa_value_copy32(struct ffa_value args)
 }
 
 /**
- * Helper to copy direct message payload, depending on SMC used and expected
- * registers size.
+ * Helper to copy direct message payload, depending on SMC used, direct
+ * messaging interface used, and expected registers size. Can be used for both
+ * framework messages and standard messages.
  */
 static struct ffa_value api_ffa_dir_msg_value(struct ffa_value args)
 {
-	if (args.func == FFA_MSG_SEND_DIRECT_REQ_32 ||
-	    args.func == FFA_MSG_SEND_DIRECT_RESP_32) {
-		return api_ffa_value_copy32(args);
+	switch (args.func) {
+	case FFA_MSG_SEND_DIRECT_REQ_32:
+	case FFA_MSG_SEND_DIRECT_RESP_32:
+		args = api_ffa_value_copy32(args);
+		if (!ffa_is_framework_msg(args)) {
+			args.arg2 = 0;
+		}
+		break;
+
+	case FFA_MSG_SEND_DIRECT_REQ_64:
+	case FFA_MSG_SEND_DIRECT_RESP_64:
+		if (!ffa_is_framework_msg(args)) {
+			args.arg2 = 0;
+		}
+		break;
+
+	case FFA_MSG_SEND_DIRECT_REQ2_64:
+		args.extended_val.valid = true;
+		break;
+
+	case FFA_MSG_SEND_DIRECT_RESP2_64:
+		args.arg2 = 0;
+		args.arg3 = 0;
+		break;
+	default:
+		panic("Invalid direct message function %#x\n", args.func);
+		break;
 	}
 
-	return (struct ffa_value){
-		.func = args.func,
-		.arg1 = args.arg1,
-		.arg2 = 0,
-		.arg3 = args.arg3,
-		.arg4 = args.arg4,
-		.arg5 = args.arg5,
-		.arg6 = args.arg6,
-		.arg7 = args.arg7,
-	};
+	return args;
+}
+
+/**
+ * Return a pointer to the first UUID in `uuids` that is equal to
+ * `target_uuid`. If `target_uuid` is 0-0-0-0, it matches any UUID.
+ */
+static struct ffa_uuid *ffa_uuid_find(struct ffa_uuid *uuids,
+				      size_t uuids_count,
+				      struct ffa_uuid target_uuid)
+{
+	if (ffa_uuid_is_null(&target_uuid)) {
+		return &uuids[0];
+	}
+
+	for (size_t i = 0; i < uuids_count; i++) {
+		if (ffa_uuid_is_null(&uuids[i])) {
+			break;
+		}
+		if (ffa_uuid_equal(&target_uuid, &uuids[i])) {
+			return &uuids[i];
+		}
+	}
+	return NULL;
+}
+
+static bool api_ffa_dir_msg_req2_is_uuid_valid(struct vm *receiver_vm,
+					       struct ffa_value args)
+{
+	struct ffa_uuid target_uuid;
+
+	ffa_uuid_from_u64x2(args.arg2, args.arg3, &target_uuid);
+
+	return ffa_uuid_find(receiver_vm->uuids, PARTITION_MAX_UUIDS,
+			     target_uuid) != NULL;
 }
 
 /**
  * Send an FF-A direct message request.
+ * This handler covers both FFA_MSG_SEND_DIRECT_REQ_32/64
+ * and FFA_MSG_SEND_DIRECT_REQ2_64 (introduced in FF-A v1.2) with function-based
+ * checks to accomodate for the difference between the ABIs.
+ *
+ * FFA_MSG_SEND_DIRECT_REQ2_64 works mostly the same as
+ * FFA_MSG_SEND_DIRECT_REQ_32/64, but adds the ability to send a direct message
+ * request to a specified UUID within a partition and the usage of an extended
+ * range of registers (x4-x17, instead of x4-x7) to be used as part of the
+ * message payload.
  */
-struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
-					     ffa_id_t receiver_vm_id,
-					     struct ffa_value args,
+struct ffa_value api_ffa_msg_send_direct_req(struct ffa_value args,
 					     struct vcpu *current,
 					     struct vcpu **next)
 {
+	ffa_id_t sender_vm_id = ffa_sender(args);
+	ffa_id_t receiver_vm_id = ffa_receiver(args);
 	struct ffa_value ret;
 	struct vm *receiver_vm;
 	struct vm_locked receiver_locked;
@@ -2563,8 +2832,18 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 	struct two_vcpu_locked vcpus_locked;
 	enum vcpu_state next_state = VCPU_STATE_RUNNING;
 
-	if (!api_ffa_dir_msg_is_arg2_zero(args)) {
+	if ((args.func == FFA_MSG_SEND_DIRECT_REQ_32 ||
+	     args.func == FFA_MSG_SEND_DIRECT_REQ_64) &&
+	    !ffa_is_framework_msg(args) &&
+	    !api_ffa_dir_msg_is_arg2_zero(args)) {
+		dlog_verbose("Direct messaging: w2 must be zero (w2 = %#lx)\n",
+			     args.arg2);
 		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	if (ffa_is_framework_msg(args) &&
+	    plat_ffa_handle_framework_msg(args, &ret)) {
+		return ret;
 	}
 
 	if (!plat_ffa_is_direct_request_valid(current, sender_vm_id,
@@ -2574,10 +2853,11 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 	}
 
 	if (plat_ffa_direct_request_forward(receiver_vm_id, args, &ret)) {
+		dlog_verbose("Direct message request forwarded\n");
 		return ret;
 	}
 
-	ret = (struct ffa_value){.func = FFA_INTERRUPT_32};
+	ret = api_ffa_interrupt_return(0);
 
 	receiver_vm = vm_find(receiver_vm_id);
 	if (receiver_vm == NULL) {
@@ -2585,11 +2865,19 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
+	if (args.func == FFA_MSG_SEND_DIRECT_REQ2_64 &&
+	    !api_ffa_dir_msg_req2_is_uuid_valid(receiver_vm, args)) {
+		dlog_verbose("UUID unrecognized for this VM\n");
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
 	/*
 	 * Check if sender supports sending direct message req, and if
 	 * receiver supports receipt of direct message requests.
 	 */
-	if (!plat_ffa_is_direct_request_supported(current->vm, receiver_vm)) {
+	if (!plat_ffa_is_direct_request_supported(current->vm, receiver_vm,
+						  args.func)) {
+		dlog_verbose("Direct message request not supported\n");
 		return ffa_error(FFA_DENIED);
 	}
 
@@ -2616,13 +2904,6 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 	current_locked = vcpus_locked.vcpu1;
 	receiver_vcpu_locked = vcpus_locked.vcpu2;
 
-	if (!plat_ffa_check_runtime_state_transition(
-		    current_locked, sender_vm_id, HF_INVALID_VM_ID,
-		    receiver_vcpu_locked, args.func, &next_state)) {
-		ret = ffa_error(FFA_DENIED);
-		goto out;
-	}
-
 	/*
 	 * If destination vCPU is executing or already received an
 	 * FFA_MSG_SEND_DIRECT_REQ then return to caller hinting recipient is
@@ -2635,6 +2916,13 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 	    !receiver_vcpu->regs_available) {
 		dlog_verbose("Receiver is busy with another request.\n");
 		ret = ffa_error(FFA_BUSY);
+		goto out;
+	}
+
+	if (!plat_ffa_check_runtime_state_transition(
+		    current_locked, sender_vm_id, HF_INVALID_VM_ID,
+		    receiver_vcpu_locked, args.func, &next_state)) {
+		ret = ffa_error(FFA_DENIED);
 		goto out;
 	}
 
@@ -2659,8 +2947,6 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 	case VCPU_STATE_BLOCKED_INTERRUPT:
 	case VCPU_STATE_BLOCKED:
 	case VCPU_STATE_PREEMPTED:
-		dlog_verbose("Receiver's vCPU can't receive request (%u)!\n",
-			     vcpu_index(receiver_vcpu));
 		ret = ffa_error(FFA_BUSY);
 		goto out;
 	case VCPU_STATE_WAITING:
@@ -2671,20 +2957,19 @@ struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
 		break;
 	}
 
-	/* Inject timer interrupt if any pending */
-	if (arch_timer_pending(&receiver_vcpu->regs)) {
-		api_interrupt_inject_locked(receiver_vcpu_locked,
-					    HF_VIRTUAL_TIMER_INTID,
-					    current_locked, NULL);
-
-		arch_timer_mask(&receiver_vcpu->regs);
-	}
+	/* Inject timer interrupt if timer has expired. */
+	api_inject_arch_timer_interrupt(current_locked, receiver_vcpu_locked);
+	timer_migrate_to_other_cpu(current->cpu, receiver_vcpu_locked);
 
 	/* The receiver vCPU runs upon direct message invocation */
 	receiver_vcpu->cpu = current->cpu;
 	receiver_vcpu->state = VCPU_STATE_RUNNING;
 	receiver_vcpu->regs_available = false;
-	receiver_vcpu->direct_request_origin_vm_id = sender_vm_id;
+	receiver_vcpu->direct_request_origin.is_ffa_req2 =
+		(args.func == FFA_MSG_SEND_DIRECT_REQ2_64);
+	receiver_vcpu->direct_request_origin.vm_id = sender_vm_id;
+	receiver_vcpu->direct_request_origin.is_framework =
+		ffa_is_framework_msg(args);
 
 	arch_regs_set_retval(&receiver_vcpu->regs, api_ffa_dir_msg_value(args));
 
@@ -2756,15 +3041,96 @@ void api_ffa_resume_direct_resp_target(struct vcpu_locked current_locked,
 	}
 }
 
+static bool api_ffa_msg_send_direct_resp_validate_args(struct ffa_value args,
+						       struct vcpu *current)
+{
+	ffa_id_t sender_vm_id = ffa_sender(args);
+	ffa_id_t receiver_vm_id = ffa_receiver(args);
+
+	/*
+	 * If using FFA_MSG_SEND_DIRECT_RESP, the caller's
+	 *  - x2 MBZ for partition messages
+	 *  - x8-x17 SBZ if caller's FF-A version >= FF-A v1.2
+	 */
+	if (args.func != FFA_MSG_SEND_DIRECT_RESP2_64) {
+		if (!ffa_is_framework_msg(args) &&
+		    !api_ffa_dir_msg_is_arg2_zero(args)) {
+			dlog_verbose("%s: w2 Must Be Zero",
+				     ffa_func_name(args.func));
+			return false;
+		}
+
+		if (current->vm->ffa_version >= FFA_VERSION_1_2 &&
+		    !api_extended_args_are_zero(&args)) {
+			return false;
+		}
+	}
+
+	if (!plat_ffa_is_direct_response_valid(current, sender_vm_id,
+					       receiver_vm_id)) {
+		dlog_verbose("Invalid direct response call.\n");
+		return false;
+	}
+
+	return true;
+}
+
+static bool api_ffa_msg_send_direct_resp_validate_ongoing_request(
+	struct ffa_value args, struct vcpu_locked current_locked)
+{
+	bool req_framework =
+		current_locked.vcpu->direct_request_origin.is_framework;
+	bool resp_framework = ffa_is_framework_msg(args);
+	bool received_req2 =
+		current_locked.vcpu->direct_request_origin.is_ffa_req2;
+
+	if (!is_ffa_direct_msg_request_ongoing(current_locked)) {
+		return false;
+	}
+
+	if (req_framework && !resp_framework) {
+		dlog_verbose(
+			"Mismatch in framework message bit: request was a %s "
+			"message, but response is a %s message\n",
+			req_framework ? "framework" : "non-framework",
+			resp_framework ? "framework" : "non-framework");
+		return false;
+	}
+
+	if (args.func != FFA_MSG_SEND_DIRECT_RESP2_64 && received_req2) {
+		dlog_verbose(
+			"FFA_MSG_SEND_DIRECT_RESP must be used with "
+			"FFA_MSG_SEND_DIRECT_REQ\n");
+		return false;
+	}
+
+	if (args.func == FFA_MSG_SEND_DIRECT_RESP2_64 && !received_req2) {
+		dlog_verbose(
+			"FFA_MSG_SEND_DIRECT_RESP2 must be used with "
+			"FFA_MSG_SEND_DIRECT_REQ2\n");
+		return false;
+	}
+
+	return true;
+}
+
 /**
  * Send an FF-A direct message response.
+ * This handler covers both FFA_MSG_SEND_DIRECT_RESP_32/64
+ * and FFA_MSG_SEND_DIRECT_RESP2_64 (introduced in FF-A v1.2) with
+ * function-based checks to accomodate for the difference between the ABIs.
+ *
+ * FFA_MSG_SEND_DIRECT_RESP2_64 is used to respond to requests sent via
+ * FFA_MSG_SEND_DIRECT_REQ2_64 and adds the usage of an extended range
+ * of registers (x4-x17, instead of x4-x7) to be used as part of the
+ * message payload.
  */
-struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
-					      ffa_id_t receiver_vm_id,
-					      struct ffa_value args,
+struct ffa_value api_ffa_msg_send_direct_resp(struct ffa_value args,
 					      struct vcpu *current,
 					      struct vcpu **next)
 {
+	ffa_id_t sender_vm_id = ffa_sender(args);
+	ffa_id_t receiver_vm_id = ffa_receiver(args);
 	struct vcpu_locked current_locked;
 	struct vcpu_locked next_locked = (struct vcpu_locked){
 		.vcpu = NULL,
@@ -2776,13 +3142,7 @@ struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
 	struct ffa_value to_ret = api_ffa_dir_msg_value(args);
 	struct two_vcpu_locked vcpus_locked;
 
-	if (!api_ffa_dir_msg_is_arg2_zero(args)) {
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	if (!plat_ffa_is_direct_response_valid(current, sender_vm_id,
-					       receiver_vm_id)) {
-		dlog_verbose("Invalid direct response call.\n");
+	if (!api_ffa_msg_send_direct_resp_validate_args(args, current)) {
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -2795,37 +3155,22 @@ struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
 		goto out;
 	}
 
-	if (plat_ffa_is_direct_response_interrupted(current_locked)) {
-		ret = ffa_error(FFA_INTERRUPTED);
-		goto out;
-	}
-
 	assert(!vm_id_is_current_world(current->vm->id) ||
 	       next_state == VCPU_STATE_WAITING);
 
-	/*
-	 * Ensure the terminating FFA_MSG_SEND_DIRECT_REQ had a
-	 * defined originator.
-	 */
-	if (!is_ffa_direct_msg_request_ongoing(current_locked)) {
-		/*
-		 * Sending direct response but direct request origin
-		 * vCPU is not set.
-		 */
+	if (!api_ffa_msg_send_direct_resp_validate_ongoing_request(
+		    args, current_locked)) {
 		ret = ffa_error(FFA_DENIED);
 		goto out;
 	}
 
 	if (api_ffa_is_managed_exit_ongoing(current_locked)) {
-		/*
-		 * Per FF-A v1.1 EAC0 section 8.3.1.2.1 rule 6, SPMC can signal
-		 * a secure interrupt to a SP that is performing managed exit.
-		 * We have taken a implementation defined choice to not allow
-		 * Managed exit while a SP is processing a secure interrupt.
-		 */
-		CHECK(!current->processing_secure_interrupt);
+		struct interrupts *interrupts = &current->interrupts;
 
-		plat_interrupts_set_priority_mask(current->priority_mask);
+		CHECK(current->scheduling_mode != SPMC_MODE);
+
+		plat_interrupts_set_priority_mask(
+			current->prev_interrupt_priority);
 		/*
 		 * A SP may be signaled a managed exit but actually not trap
 		 * the virtual interrupt, probably because it has virtual
@@ -2835,24 +3180,17 @@ struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
 		 * vCPU.
 		 */
 		current->processing_managed_exit = false;
-		struct interrupts *interrupts = &current->interrupts;
 
 		if (vcpu_is_virt_interrupt_pending(interrupts,
 						   HF_MANAGED_EXIT_INTID)) {
-			api_interrupt_clear_decrement(current_locked,
-						      interrupts,
-						      HF_MANAGED_EXIT_INTID);
+			vcpu_interrupt_clear_decrement(current_locked,
+						       HF_MANAGED_EXIT_INTID);
 		}
 	}
 
-	if (plat_ffa_intercept_direct_response(current_locked, next, to_ret,
-					       &signal_interrupt)) {
-		ret = signal_interrupt;
-		goto out;
-	}
-
-	/* Clear direct request origin for the caller. */
-	current->direct_request_origin_vm_id = HF_INVALID_VM_ID;
+	/* Clear direct request origin vm_id and request type for the caller. */
+	current->direct_request_origin.is_ffa_req2 = false;
+	current->direct_request_origin.vm_id = HF_INVALID_VM_ID;
 
 	api_ffa_resume_direct_resp_target(current_locked, next, receiver_vm_id,
 					  to_ret, false);
@@ -2868,7 +3206,21 @@ struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
 	current_locked = vcpus_locked.vcpu1;
 	next_locked = vcpus_locked.vcpu2;
 
+	/* Inject timer interrupt if timer has expired. */
+	api_inject_arch_timer_interrupt(current_locked, next_locked);
 	plat_ffa_unwind_call_chain_ffa_direct_resp(current_locked, next_locked);
+
+	/*
+	 * Check if there is a pending secure interrupt.
+	 * If there is, return back to the caller with FFA_INTERRUPT,
+	 * and set the `next` vcpu in a preempted state.
+	 */
+	if (plat_ffa_intercept_call(current_locked, next_locked,
+				    &signal_interrupt)) {
+		ret = signal_interrupt;
+		*next = NULL;
+	}
+
 	vcpu_unlock(&next_locked);
 
 out:
@@ -2880,13 +3232,16 @@ static bool api_memory_region_check_flags(
 	struct ffa_memory_region *memory_region, uint32_t share_func)
 {
 	switch (share_func) {
+	case FFA_MEM_SHARE_64:
 	case FFA_MEM_SHARE_32:
 		if ((memory_region->flags & FFA_MEMORY_REGION_FLAG_CLEAR) !=
 		    0U) {
 			return false;
 		}
 		/* Intentional fall-through */
+	case FFA_MEM_LEND_64:
 	case FFA_MEM_LEND_32:
+	case FFA_MEM_DONATE_64:
 	case FFA_MEM_DONATE_32: {
 		/* Bits 31:2 Must Be Zero. */
 		ffa_memory_receiver_flags_t to_mask =
@@ -2915,14 +3270,14 @@ static void api_ffa_memory_region_v1_1_from_v1_0(
 {
 	memory_region_v1_1->sender = memory_region_v1_0->sender;
 	memory_region_v1_1->handle = memory_region_v1_0->handle;
-	memory_region_v1_1->attributes = memory_region_v1_0->attributes;
+	memory_region_v1_1->attributes =
+		ffa_memory_attributes_extend(memory_region_v1_0->attributes);
 	memory_region_v1_1->flags = memory_region_v1_0->flags;
 	memory_region_v1_1->tag = memory_region_v1_0->tag;
 	memory_region_v1_1->memory_access_desc_size =
-		sizeof(struct ffa_memory_access);
+		sizeof(struct ffa_memory_access_v1_0);
 	memory_region_v1_1->receiver_count = memory_region_v1_0->receiver_count;
-	memory_region_v1_1->receivers_offset =
-		offsetof(struct ffa_memory_region, receivers);
+	memory_region_v1_1->receivers_offset = sizeof(struct ffa_memory_region);
 
 	/* Zero reserved fields. */
 	for (uint32_t i = 0; i < 3U; i++) {
@@ -2930,12 +3285,24 @@ static void api_ffa_memory_region_v1_1_from_v1_0(
 	}
 }
 
-/*
- * Checks the FF-A version of the lender and makes necessary updates.
+/**
+ * Updates a v1.0 transaction descriptor to v1.1. This gives us the
+ * memory_access_desc_size field we need for forwards compatability.
+ * Copy the receivers and composite descriptors to the new struct.
+ * We also check the fields in the v1.0 transaction descriptor and return:
+ *  - FFA_ERROR FFA_INVALID_PARAMETERS: If any of the fields are not valid
+ *    values, eg the reserved fields are not 0, receiver_count is too large or
+ *    composite offsets are not 0 for retrieve requests or in bounds for send
+ *    requests.
+ *  - FFA ERROR FFA_NOT_SUPPORTED: If an invalid ffa_version is supplied to the
+ *    function. Or the fragment length is more than a single page.
+ *  - FFA_ERROR FFA_NO_MEMORY: If we do not have enough memory for a scratch
+ *    memory transaction descriptor.
+ *  - FFA_SUCCESS: If a successful update has occured.
  */
-static struct ffa_value api_ffa_memory_send_per_ffa_version(
-	void *allocated, struct ffa_memory_region **out_v1_1,
-	uint32_t *fragment_length, uint32_t *total_length, uint32_t ffa_version)
+static struct ffa_value api_ffa_memory_transaction_descriptor_v1_1_from_v1_0(
+	void *allocated, uint32_t *fragment_length, uint32_t *total_length,
+	enum ffa_version ffa_version, bool send_transaction)
 {
 	struct ffa_memory_region_v1_0 *memory_region_v1_0;
 	struct ffa_memory_region *memory_region_v1_1 = NULL;
@@ -2943,43 +3310,33 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 	struct ffa_composite_memory_region *composite_v1_1;
 	size_t receivers_length;
 	size_t space_left;
+	size_t receivers_end;
 	size_t composite_offset_v1_1;
 	size_t composite_offset_v1_0;
 	size_t fragment_constituents_size;
 	size_t fragment_length_v1_1;
 
-	assert(out_v1_1 != NULL);
 	assert(fragment_length != NULL);
 	assert(total_length != NULL);
 
-	*out_v1_1 = (struct ffa_memory_region *)allocated;
-
-	if (ffa_version == MAKE_FFA_VERSION(1, 1)) {
+	if (ffa_version >= FFA_VERSION_1_1) {
 		return (struct ffa_value){.func = FFA_SUCCESS_32};
 	}
 
-	if (ffa_version != MAKE_FFA_VERSION(1, 0)) {
+	if (ffa_version != FFA_VERSION_1_0) {
 		dlog_verbose("%s: Unsupported FF-A version %x\n", __func__,
 			     ffa_version);
 		return ffa_error(FFA_NOT_SUPPORTED);
 	}
 
-	dlog_verbose("FF-A v1.0 memory transaction descriptor.\n");
+	dlog_verbose(
+		"Updating memory transaction descriptor from v1.0 to v1.1.\n");
 
 	memory_region_v1_0 = (struct ffa_memory_region_v1_0 *)allocated;
 
-	if (memory_region_v1_0->reserved_0 != 0U ||
-	    memory_region_v1_0->reserved_1 != 0U) {
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	/* This should also prevent over flows. */
-	if (memory_region_v1_0->receiver_count > MAX_MEM_SHARE_RECIPIENTS) {
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	receivers_length = sizeof(struct ffa_memory_access) *
+	receivers_length = sizeof(struct ffa_memory_access_v1_0) *
 			   memory_region_v1_0->receiver_count;
+	receivers_end = sizeof(struct ffa_memory_region) + receivers_length;
 
 	/*
 	 * Check the specified composite offset of v1.0 descriptor, and that all
@@ -2988,44 +3345,21 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 	composite_offset_v1_0 =
 		memory_region_v1_0->receivers[0].composite_memory_region_offset;
 
-	if (composite_offset_v1_0 == 0U ||
-	    composite_offset_v1_0 <
-		    sizeof(struct ffa_memory_region_v1_0) + receivers_length ||
-	    composite_offset_v1_0 + sizeof(struct ffa_composite_memory_region) >
-		    *fragment_length ||
-	    composite_offset_v1_0 > *fragment_length) {
-		dlog_verbose(
-			"Invalid composite memory region descriptor offset "
-			"%d.\n",
-			composite_offset_v1_0);
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	for (uint32_t i = 1; i < memory_region_v1_0->receiver_count; i++) {
-		const uint32_t current_offset =
-			memory_region_v1_0->receivers[i]
-				.composite_memory_region_offset;
-
-		if (current_offset != composite_offset_v1_0) {
-			dlog_verbose(
-				"Composite offset %x differs from %x in index "
-				"%u\n",
-				composite_offset_v1_0, current_offset, i);
-			return ffa_error(FFA_INVALID_PARAMETERS);
-		}
-	}
-
-	fragment_constituents_size = *fragment_length - composite_offset_v1_0 -
-				     sizeof(struct ffa_composite_memory_region);
-
 	/* Determine the composite offset for v1.1 descriptor. */
-	composite_offset_v1_1 =
-		sizeof(struct ffa_memory_region) + receivers_length;
-
-	/* Determine final size of the v1.1 descriptor. */
-	fragment_length_v1_1 = composite_offset_v1_1 +
-			       sizeof(struct ffa_composite_memory_region) +
-			       fragment_constituents_size;
+	if (send_transaction) {
+		fragment_constituents_size =
+			*fragment_length - composite_offset_v1_0 -
+			sizeof(struct ffa_composite_memory_region);
+		fragment_length_v1_1 =
+			receivers_end +
+			sizeof(struct ffa_composite_memory_region) +
+			fragment_constituents_size;
+		composite_offset_v1_1 = receivers_end;
+	} else {
+		fragment_constituents_size = 0;
+		fragment_length_v1_1 = receivers_end;
+		composite_offset_v1_1 = 0;
+	}
 
 	/*
 	 * Currently only support the simpler cases: memory transaction
@@ -3036,7 +3370,7 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 	 */
 	if (fragment_length_v1_1 > MM_PPOOL_ENTRY_SIZE) {
 		dlog_verbose(
-			"Translation of FF-A v1.0 descriptors for over %u is "
+			"Translation of FF-A v1.0 descriptors for over %lu is "
 			"unsupported.",
 			MM_PPOOL_ENTRY_SIZE);
 		return ffa_error(FFA_NOT_SUPPORTED);
@@ -3044,6 +3378,11 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 
 	space_left = fragment_length_v1_1;
 
+	/*
+	 * Allocate a page of memory to construct the v1.1 memory descriptor.
+	 * Earlier we checked that the fragment_length_v1_1 would not be larger
+	 * than a page.
+	 */
 	memory_region_v1_1 =
 		(struct ffa_memory_region *)mpool_alloc(&api_page_pool);
 	if (memory_region_v1_1 == NULL) {
@@ -3057,40 +3396,45 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 	space_left -= sizeof(struct ffa_memory_region);
 
 	/* Copy memory access information. */
-	memcpy_s(memory_region_v1_1->receivers, space_left,
-		 memory_region_v1_0->receivers, receivers_length);
+	memcpy_s((uint8_t *)memory_region_v1_1 +
+			 memory_region_v1_1->receivers_offset,
+		 space_left, memory_region_v1_0->receivers, receivers_length);
 
 	/* Initialize the memory access descriptors with composite offset. */
 	for (uint32_t i = 0; i < memory_region_v1_1->receiver_count; i++) {
 		struct ffa_memory_access *receiver =
-			&memory_region_v1_1->receivers[i];
-
+			ffa_memory_region_get_receiver(memory_region_v1_1, i);
+		assert(receiver != NULL);
 		receiver->composite_memory_region_offset =
 			composite_offset_v1_1;
 	}
 
 	space_left -= receivers_length;
 
-	/* Init v1.1 composite. */
-	composite_v1_1 = (struct ffa_composite_memory_region
-				  *)((uint8_t *)memory_region_v1_1 +
-				     composite_offset_v1_1);
+	/* Composite memory descriptors to copy. */
+	if (send_transaction) {
+		/* Init v1.1 composite. */
+		composite_v1_1 = (struct ffa_composite_memory_region
+					  *)((uint8_t *)memory_region_v1_1 +
+					     composite_offset_v1_1);
 
-	composite_v1_0 =
-		ffa_memory_region_get_composite_v1_0(memory_region_v1_0, 0);
-	composite_v1_1->constituent_count = composite_v1_0->constituent_count;
-	composite_v1_1->page_count = composite_v1_0->page_count;
+		composite_v1_0 = ffa_memory_region_get_composite_v1_0(
+			memory_region_v1_0, 0);
+		composite_v1_1->constituent_count =
+			composite_v1_0->constituent_count;
+		composite_v1_1->page_count = composite_v1_0->page_count;
 
-	space_left -= sizeof(struct ffa_composite_memory_region);
+		space_left -= sizeof(struct ffa_composite_memory_region);
 
-	/* Initialize v1.1 constituents. */
-	memcpy_s(composite_v1_1->constituents, space_left,
-		 composite_v1_0->constituents, fragment_constituents_size);
+		/* Initialize v1.1 constituents. */
+		memcpy_s(composite_v1_1->constituents, space_left,
+			 composite_v1_0->constituents,
+			 fragment_constituents_size);
 
-	space_left -= fragment_constituents_size;
+		space_left -= fragment_constituents_size;
+	}
+
 	assert(space_left == 0U);
-
-	*out_v1_1 = memory_region_v1_1;
 
 	/*
 	 * Remove the v1.0 fragment size, and resultant size of v1.1 fragment.
@@ -3099,10 +3443,13 @@ static struct ffa_value api_ffa_memory_send_per_ffa_version(
 	*fragment_length = fragment_length_v1_1;
 
 	/*
-	 * After successfully convert to v1.1 free memory containing v1.0
-	 * descriptor.
+	 * After successfully updating to v1.1 copy the descriptor to the
+	 * internal buffer given as a parameter (used to prevent TOCTOU attacks)
+	 * and free the scratch memory used to construct it.
 	 */
-	mpool_free(&api_page_pool, allocated);
+	memcpy_s(allocated, MM_PPOOL_ENTRY_SIZE, memory_region_v1_1,
+		 *fragment_length);
+	mpool_free(&api_page_pool, memory_region_v1_1);
 
 	return (struct ffa_value){.func = FFA_SUCCESS_32};
 }
@@ -3115,10 +3462,10 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 	struct vm *to;
 	const void *from_msg;
 	void *allocated_entry;
-	struct ffa_memory_region *memory_region;
+	struct ffa_memory_region *memory_region = NULL;
 	struct ffa_value ret;
 	bool targets_other_world = false;
-	uint32_t ffa_version;
+	enum ffa_version ffa_version;
 
 	if (ipa_addr(address) != 0 || page_count != 0) {
 		/*
@@ -3166,25 +3513,38 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 		return ffa_error(FFA_NO_MEMORY);
 	}
 
-	memcpy_s(allocated_entry, MM_PPOOL_ENTRY_SIZE, from_msg,
-		 fragment_length);
+	if (!memcpy_trapped(allocated_entry, MM_PPOOL_ENTRY_SIZE, from_msg,
+			    fragment_length)) {
+		dlog_error(
+			"%s: Failed to copy FF-A memory region descriptor.\n",
+			__func__);
+		return ffa_error(FFA_ABORTED);
+	}
 
-	ret = api_ffa_memory_send_per_ffa_version(
-		allocated_entry, &memory_region, &fragment_length, &length,
-		ffa_version);
+	if (!ffa_memory_region_sanity_check(allocated_entry, ffa_version,
+					    fragment_length, true)) {
+		ret = ffa_error(FFA_INVALID_PARAMETERS);
+		goto out;
+	}
+
+	ret = api_ffa_memory_transaction_descriptor_v1_1_from_v1_0(
+		allocated_entry, &fragment_length, &length, ffa_version, true);
 	if (ret.func != FFA_SUCCESS_32) {
 		goto out;
 	}
 
+	memory_region = allocated_entry;
+
 	if (fragment_length < sizeof(struct ffa_memory_region) +
-				      sizeof(struct ffa_memory_access)) {
+				      memory_region->memory_access_desc_size) {
 		dlog_verbose(
 			"Initial fragment length %d smaller than header size "
-			"%d.\n",
+			"%lu.\n",
 			fragment_length,
 			sizeof(struct ffa_memory_region) +
-				sizeof(struct ffa_memory_access));
-		return ffa_error(FFA_INVALID_PARAMETERS);
+				memory_region->memory_access_desc_size);
+		ret = ffa_error(FFA_INVALID_PARAMETERS);
+		goto out;
 	}
 
 	if (!api_memory_region_check_flags(memory_region, share_func)) {
@@ -3200,21 +3560,12 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 		goto out;
 	}
 
-	if (share_func == FFA_MEM_DONATE_32 &&
+	if ((share_func == FFA_MEM_DONATE_32 ||
+	     share_func == FFA_MEM_DONATE_64) &&
 	    memory_region->receiver_count != 1U) {
 		dlog_verbose(
-			"FFA_MEM_DONATE only supports one recipient. "
-			"Specified %u\n",
-			memory_region->receiver_count);
-		ret = ffa_error(FFA_INVALID_PARAMETERS);
-		goto out;
-	}
-
-	if (memory_region->receiver_count > MAX_MEM_SHARE_RECIPIENTS) {
-		dlog_verbose(
-			"Max number of recipients supported is %u "
-			"specified %u\n",
-			MAX_MEM_SHARE_RECIPIENTS,
+			"FFA_MEM_DONATE only supports one recipient. Specified "
+			"%u\n",
 			memory_region->receiver_count);
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
 		goto out;
@@ -3226,18 +3577,26 @@ struct ffa_value api_ffa_mem_send(uint32_t share_func, uint32_t length,
 	 * forwarding if needed.
 	 */
 	for (uint32_t i = 0U; i < memory_region->receiver_count; i++) {
-		ffa_id_t receiver_id = memory_region->receivers[i]
-					       .receiver_permissions.receiver;
+		struct ffa_memory_access *receiver =
+			ffa_memory_region_get_receiver(memory_region, i);
+		ffa_id_t receiver_id;
+
+		assert(receiver != NULL);
+
+		receiver_id = receiver->receiver_permissions.receiver;
+
 		to = vm_find(receiver_id);
 
-		if (vm_id_is_current_world(receiver_id) &&
-		    (to == NULL || to == from)) {
+		if ((vm_id_is_current_world(receiver_id) && to == NULL) ||
+		    to == from) {
 			dlog_verbose("%s: invalid receiver.\n", __func__);
 			ret = ffa_error(FFA_INVALID_PARAMETERS);
 			goto out;
 		}
 
-		if (!plat_ffa_is_memory_send_valid(receiver_id, share_func)) {
+		if (!plat_ffa_is_memory_send_valid(
+			    receiver_id, from->id, share_func,
+			    memory_region->receiver_count > 1)) {
 			ret = ffa_error(FFA_DENIED);
 			goto out;
 		}
@@ -3276,98 +3635,41 @@ out:
 	return ret;
 }
 
-static struct ffa_value api_ffa_mem_retrieve_req_version_update(
-	void *retrieve_msg, uint32_t retrieve_msg_buffer_size,
-	struct ffa_memory_region **out_v1_1, uint32_t *fragment_length,
-	uint32_t ffa_version)
+/**
+ * An FFA_MEM_RETRIEVE_REQ from the hypervisor must specify the handle of the
+ * memory transaction it is querying and all other fields must be 0.
+ */
+static bool api_ffa_memory_hypervisor_retrieve_request_validate(
+	struct ffa_memory_region *request, enum ffa_version version)
 {
-	struct ffa_memory_region_v1_0 *retrieve_request_v1_0;
-	struct ffa_memory_region *retrieve_request_v1_1;
-	size_t fragment_length_v1_1;
-	uint32_t expected_retrieve_request_length_v1_0;
-	size_t space_left = retrieve_msg_buffer_size;
-	size_t receivers_length;
+	switch (version) {
+	case FFA_VERSION_1_0: {
+		struct ffa_memory_region_v1_0 *request_v1_0 =
+			(struct ffa_memory_region_v1_0 *)request;
 
-	assert(out_v1_1 != NULL);
-	assert(fragment_length != NULL);
-	assert(retrieve_msg != NULL);
-
-	if (ffa_version == MAKE_FFA_VERSION(1, 1)) {
-		*out_v1_1 = (struct ffa_memory_region *)retrieve_msg;
-		return (struct ffa_value){.func = FFA_SUCCESS_32};
+		return request_v1_0->sender == 0U &&
+		       request_v1_0->attributes.shareability == 0U &&
+		       request_v1_0->attributes.cacheability == 0U &&
+		       request_v1_0->attributes.type == 0U &&
+		       request_v1_0->attributes.security == 0U &&
+		       request_v1_0->flags == 0U && request_v1_0->tag == 0U &&
+		       request_v1_0->receiver_count == 0U &&
+		       plat_ffa_memory_handle_allocated_by_current_world(
+			       request_v1_0->handle);
 	}
-	if (ffa_version != MAKE_FFA_VERSION(1, 0)) {
-		dlog_verbose("%s: Unsupported FF-A version %x\n", __func__,
-			     ffa_version);
-		return ffa_error(FFA_NOT_SUPPORTED);
+	default:
+		return request->sender == 0U &&
+		       request->attributes.shareability == 0U &&
+		       request->attributes.cacheability == 0U &&
+		       request->attributes.type == 0U &&
+		       request->attributes.security == 0U &&
+		       request->flags == 0U && request->tag == 0U &&
+		       request->memory_access_desc_size == 0U &&
+		       request->receiver_count == 0U &&
+		       request->receivers_offset == 0U &&
+		       plat_ffa_memory_handle_allocated_by_current_world(
+			       request->handle);
 	}
-
-	retrieve_request_v1_0 = (struct ffa_memory_region_v1_0 *)retrieve_msg;
-
-	if (retrieve_request_v1_0->receiver_count > MAX_MEM_SHARE_RECIPIENTS) {
-		dlog_verbose(
-			"Specified more than expected maximum receivers.\n");
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	receivers_length = retrieve_request_v1_0->receiver_count *
-			   sizeof(struct ffa_memory_access);
-
-	expected_retrieve_request_length_v1_0 =
-		sizeof(struct ffa_memory_region_v1_0) + receivers_length;
-
-	if (*fragment_length != expected_retrieve_request_length_v1_0) {
-		dlog_verbose("Retrieve request size is not as expected.\n");
-		return ffa_error(FFA_INVALID_PARAMETERS);
-	}
-
-	/* Determine expected v1.1 retrieve request size. */
-	fragment_length_v1_1 = sizeof(struct ffa_memory_region) +
-			       retrieve_request_v1_0->receiver_count *
-				       sizeof(struct ffa_memory_access);
-
-	/*
-	 * At this point there is the assumption that the retrieve request has
-	 * been copied to an internal buffer to prevent TOCTOU attacks.
-	 * The translation of the resultant v1.1 transaction descriptor will be
-	 * written to that same buffer. That said, the referred buffer needs
-	 * space to accommodate both v1.0 and v1.1 descriptors simultaneously.
-	 */
-	assert(fragment_length_v1_1 + expected_retrieve_request_length_v1_0 <=
-	       retrieve_msg_buffer_size);
-
-	space_left -= expected_retrieve_request_length_v1_0;
-
-	/*
-	 * Prepare to write the resultant FF-A v1.1 retrieve request in an
-	 * offset following the FF-A v1.0 within the same buffer.
-	 */
-	retrieve_request_v1_1 =
-		// NOLINTNEXTLINE(performance-no-int-to-ptr)
-		(struct ffa_memory_region *)((uintptr_t)retrieve_msg +
-					     *fragment_length);
-
-	api_ffa_memory_region_v1_1_from_v1_0(retrieve_request_v1_0,
-					     retrieve_request_v1_1);
-
-	space_left -= sizeof(struct ffa_memory_region);
-
-	/* Copy memory access information. */
-	memcpy_s(retrieve_request_v1_1->receivers, space_left,
-		 retrieve_request_v1_0->receivers, receivers_length);
-
-	/* Initialize the memory access descriptors with composite offset. */
-	for (uint32_t i = 0; i < retrieve_request_v1_1->receiver_count; i++) {
-		struct ffa_memory_access *receiver =
-			&retrieve_request_v1_1->receivers[i];
-
-		receiver->composite_memory_region_offset = 0U;
-	}
-
-	*fragment_length = fragment_length_v1_1;
-	*out_v1_1 = retrieve_request_v1_1;
-
-	return (struct ffa_value){.func = FFA_SUCCESS_32};
 }
 
 struct ffa_value api_ffa_mem_retrieve_req(uint32_t length,
@@ -3382,7 +3684,7 @@ struct ffa_value api_ffa_mem_retrieve_req(uint32_t length,
 	struct ffa_memory_region *retrieve_request = NULL;
 	uint32_t message_buffer_size;
 	struct ffa_value ret;
-	uint32_t ffa_version;
+	enum ffa_version ffa_version;
 
 	if (ipa_addr(address) != 0 || page_count != 0) {
 		/*
@@ -3418,7 +3720,15 @@ struct ffa_value api_ffa_mem_retrieve_req(uint32_t length,
 	 * Copy the retrieve request descriptor to an internal buffer, so that
 	 * the caller can't change it underneath us.
 	 */
-	memcpy_s(retrieve_msg, message_buffer_size, to_msg, length);
+	if (!memcpy_trapped(retrieve_msg, message_buffer_size, to_msg,
+			    length)) {
+		dlog_error(
+			"%s: Failed to copy FF-A retrieve request "
+			"descriptor.\n",
+			__func__);
+		ret = ffa_error(FFA_ABORTED);
+		goto out;
+	}
 
 	if ((vm_is_mailbox_other_world_owned(to_locked) &&
 	     !plat_ffa_acquire_receiver_rx(to_locked, &ret)) ||
@@ -3432,30 +3742,152 @@ struct ffa_value api_ffa_mem_retrieve_req(uint32_t length,
 		goto out;
 	}
 
-	/*
-	 * If required, transform the retrieve request to FF-A v1.1.
-	 */
-	ret = api_ffa_mem_retrieve_req_version_update(
-		retrieve_msg, message_buffer_size, &retrieve_request, &length,
-		ffa_version);
+	if (!is_ffa_hypervisor_retrieve_request(retrieve_msg)) {
+		if (!ffa_memory_region_sanity_check(retrieve_msg, ffa_version,
+						    fragment_length, false)) {
+			ret = ffa_error(FFA_INVALID_PARAMETERS);
+			goto out;
+		}
+		/*
+		 * If required, transform the retrieve request to FF-A v1.1.
+		 */
+		ret = api_ffa_memory_transaction_descriptor_v1_1_from_v1_0(
+			retrieve_msg, &fragment_length, &length, ffa_version,
+			false);
 
-	if (ret.func != FFA_SUCCESS_32) {
-		goto out;
+		if (ret.func != FFA_SUCCESS_32) {
+			goto out;
+		}
+	} else {
+		if (!api_ffa_memory_hypervisor_retrieve_request_validate(
+			    retrieve_msg, ffa_version)) {
+			dlog_verbose(
+				"All fields except the handle in the "
+				"memory access descriptor must be zero for a "
+				"hypervisor retrieve request.\n");
+			ret = ffa_error(FFA_INVALID_PARAMETERS);
+			goto out;
+		}
 	}
 
-	assert(retrieve_request != NULL);
+	retrieve_request = retrieve_msg;
 
 	if (plat_ffa_memory_handle_allocated_by_current_world(
 		    retrieve_request->handle)) {
 		ret = ffa_memory_retrieve(to_locked, retrieve_request, length,
 					  &api_page_pool);
 	} else {
-		ret = plat_ffa_other_world_mem_retrieve(
-			to_locked, retrieve_request, length, &api_page_pool);
+		dlog_error("Invalid FF-A memory handle.\n");
+		ret = ffa_error(FFA_INVALID_PARAMETERS);
 	}
 out:
 	vm_unlock(&to_locked);
 	return ret;
+}
+
+/**
+ * Copies the memory relinquish descriptor from the partition's TX buffer, to
+ * the buffer of the local CPU. Do it safely, and return error if:
+ * - FFA_ABORTED: if the `memcpy_trapped` fails.
+ * - FFA_INVALID_PARAMETERS: if the size of the full memory relinquish
+ * descriptor doesn't fit the local CPU buffer.
+ *
+ * Returns FFA_SUCCESS if copying goes well, and sets 'out_relinquish'
+ * to the address of the cpu buffer with the relinquish descriptor.
+ */
+static struct ffa_value api_get_ffa_mem_relinquish_descriptor(
+	struct vcpu *current, const void *from_msg,
+	struct ffa_mem_relinquish **out_relinquish)
+{
+	struct ffa_mem_relinquish *relinquish_request;
+	uint32_t from_msg_size;
+	uint32_t total_from_msg_size;
+	uint32_t dst_size;
+	vaddr_t dst;
+	vaddr_t src;
+
+	assert(from_msg != NULL);
+	assert(out_relinquish != NULL);
+
+	/*
+	 * Copy the relinquish descriptor to an internal buffer, so that the
+	 * caller can't change it underneath us.
+	 */
+	relinquish_request =
+		(struct ffa_mem_relinquish *)cpu_get_buffer(current->cpu);
+
+	/* Set the destination for the copy. */
+	dst = va_from_ptr(relinquish_request);
+	src = va_from_ptr(from_msg);
+
+	dst_size = cpu_get_buffer_size(current->cpu);
+
+	/* Only copy the size to start with. */
+	from_msg_size = sizeof(struct ffa_mem_relinquish);
+	total_from_msg_size = from_msg_size;
+
+	if (!memcpy_trapped(ptr_from_va(dst), dst_size, ptr_from_va(src),
+			    from_msg_size)) {
+		dlog_error(
+			"%s: Failed to copy FF-A memory relinquish "
+			"descriptor.\n",
+			__func__);
+		return ffa_error(FFA_ABORTED);
+	}
+
+	if (relinquish_request->endpoint_count != 1) {
+		dlog_error("%s: relinquish descriptor must have 1 endpoint\n",
+			   __func__);
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	/*
+	 * Increment the `dst` to the position right after the copied header.
+	 * Increment the `src` to point at the list of endpoints.
+	 *
+	 * Calculate the new `dst_size` which is the size of the allocated cpu
+	 * buffer, minus the size of the copied memory relinquish header.
+	 *
+	 * Only after the above: determine the new `from_msg_size` in accordance
+	 * to the endpoint count.
+	 */
+	dst = va_add(dst, from_msg_size);
+	src = va_add(src, from_msg_size);
+
+	/*
+	 * Check if it is safe to copy the rest of the message.
+	 * This also serves as a santiy check to 'endpoint_count'.
+	 * The size of what is left in the descriptor, based on endpoint_count,
+	 * shall not be bigger than the size of the mailbox minus the size of
+	 * the header which was previously copied in this function.
+	 */
+	dst_size -= from_msg_size;
+	from_msg_size = relinquish_request->endpoint_count * sizeof(ffa_id_t);
+	total_from_msg_size += from_msg_size;
+
+	if (total_from_msg_size > HF_MAILBOX_SIZE ||
+	    total_from_msg_size > dst_size) {
+		dlog_verbose(
+			"Relinquish message too long. Endpoint count: %u\n",
+			relinquish_request->endpoint_count);
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	/* Copy the remaining fragment. */
+	if (!memcpy_trapped(ptr_from_va(dst), dst_size, ptr_from_va(src),
+			    from_msg_size)) {
+		dlog_error("%s: Failed to copy FF-A relinquish request.\n",
+			   __func__);
+		return ffa_error(FFA_ABORTED);
+	}
+
+	/*
+	 * Set the output address for the relinquish descriptor to the current
+	 * cpu's buffer.
+	 */
+	*out_relinquish = relinquish_request;
+
+	return (struct ffa_value){.func = FFA_SUCCESS_32};
 }
 
 struct ffa_value api_ffa_mem_relinquish(struct vcpu *current)
@@ -3463,10 +3895,8 @@ struct ffa_value api_ffa_mem_relinquish(struct vcpu *current)
 	struct vm *from = current->vm;
 	struct vm_locked from_locked;
 	const void *from_msg;
-	struct ffa_mem_relinquish *relinquish_request;
-	uint32_t message_buffer_size;
 	struct ffa_value ret;
-	uint32_t length;
+	struct ffa_mem_relinquish *relinquish_request;
 
 	from_locked = vm_lock(from);
 	from_msg = from->mailbox.send;
@@ -3477,39 +3907,17 @@ struct ffa_value api_ffa_mem_relinquish(struct vcpu *current)
 		goto out;
 	}
 
-	/*
-	 * Calculate length from relinquish descriptor before copying. We will
-	 * check again later to make sure it hasn't changed.
-	 */
-	length = sizeof(struct ffa_mem_relinquish) +
-		 ((struct ffa_mem_relinquish *)from_msg)->endpoint_count *
-			 sizeof(ffa_id_t);
-	/*
-	 * Copy the relinquish descriptor to an internal buffer, so that the
-	 * caller can't change it underneath us.
-	 */
-	relinquish_request =
-		(struct ffa_mem_relinquish *)cpu_get_buffer(current->cpu);
-	message_buffer_size = cpu_get_buffer_size(current->cpu);
-	if (length > HF_MAILBOX_SIZE || length > message_buffer_size) {
-		dlog_verbose("Relinquish message too long.\n");
-		ret = ffa_error(FFA_INVALID_PARAMETERS);
-		goto out;
-	}
-	memcpy_s(relinquish_request, message_buffer_size, from_msg, length);
+	ret = api_get_ffa_mem_relinquish_descriptor(current, from_msg,
+						    &relinquish_request);
 
-	if (sizeof(struct ffa_mem_relinquish) +
-		    relinquish_request->endpoint_count * sizeof(ffa_id_t) !=
-	    length) {
-		dlog_verbose(
-			"Endpoint count changed while copying to internal "
-			"buffer.\n");
-		ret = ffa_error(FFA_INVALID_PARAMETERS);
-		goto out;
+	/*
+	 * If the descriptor was safely copied, continue with the handling of
+	 * the retrieve request.
+	 */
+	if (ret.func == FFA_SUCCESS_32) {
+		ret = ffa_memory_relinquish(from_locked, relinquish_request,
+					    &api_page_pool);
 	}
-
-	ret = ffa_memory_relinquish(from_locked, relinquish_request,
-				    &api_page_pool);
 
 out:
 	vm_unlock(&from_locked);
@@ -3568,8 +3976,21 @@ struct ffa_value api_ffa_mem_frag_rx(ffa_memory_handle_t handle,
 		goto out;
 	}
 
-	ret = ffa_memory_retrieve_continue(to_locked, handle, fragment_offset,
-					   sender_vm_id, &api_page_pool);
+	/*
+	 * Whilst copying the fragments, initialize the remaining constituents
+	 * in the CPU's internal structure, and later copy from the CPU buffer
+	 * into the partition's RX buffer. In the case SPMC is doing a retrieve
+	 * request for a VM/Hypervisor in an RME enabled system, there is no
+	 * guarantee the RX buffer is in the NS PAS. Accessing the buffer with
+	 * the wrong security state attribute would then result in an GPF.
+	 * The fragment is initialized in an internal buffer, and is later
+	 * copied to the RX buffer using the 'memcpy_trapped' which allows to
+	 * smoothly terminate the operation if the access has been preempted by
+	 * a GPF exception.
+	 */
+	ret = ffa_memory_retrieve_continue(
+		to_locked, handle, fragment_offset, sender_vm_id,
+		cpu_get_buffer(current->cpu), &api_page_pool);
 out:
 	vm_unlock(&to_locked);
 	return ret;
@@ -3614,7 +4035,7 @@ struct ffa_value api_ffa_mem_frag_tx(ffa_memory_handle_t handle,
 	if (fragment_length > HF_MAILBOX_SIZE ||
 	    fragment_length > MM_PPOOL_ENTRY_SIZE) {
 		dlog_verbose(
-			"Fragment length %d larger than mailbox size %d.\n",
+			"Fragment length %d larger than mailbox size %zu.\n",
 			fragment_length, HF_MAILBOX_SIZE);
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
@@ -3629,7 +4050,12 @@ struct ffa_value api_ffa_mem_frag_tx(ffa_memory_handle_t handle,
 		dlog_verbose("Failed to allocate fragment copy.\n");
 		return ffa_error(FFA_NO_MEMORY);
 	}
-	memcpy_s(fragment_copy, MM_PPOOL_ENTRY_SIZE, from_msg, fragment_length);
+
+	if (!memcpy_trapped(fragment_copy, MM_PPOOL_ENTRY_SIZE, from_msg,
+			    fragment_length)) {
+		dlog_error("%s: Failed to copy fragment.\n", __func__);
+		return ffa_error(FFA_ABORTED);
+	}
 
 	/*
 	 * Hafnium doesn't support fragmentation of memory retrieve requests
@@ -3675,7 +4101,7 @@ struct ffa_value api_ffa_secondary_ep_register(ipaddr_t entry_point,
 	 * (DEN0077A FF-A v1.1 Beta0 Table 18.29) or the VM is UP.
 	 */
 	if (!plat_ffa_is_secondary_ep_register_supported() ||
-	    current->vm->vcpu_count == 1) {
+	    vm_is_up(current->vm)) {
 		return ffa_error(FFA_NOT_SUPPORTED);
 	}
 
@@ -3712,10 +4138,15 @@ struct ffa_value api_ffa_notification_bitmap_create(ffa_id_t vm_id,
 						    ffa_vcpu_count_t vcpu_count,
 						    struct vcpu *current)
 {
-	if (!plat_ffa_is_notifications_create_valid(current, vm_id)) {
-		dlog_verbose("Bitmap create for NWd VM IDs only (%x).\n",
-			     vm_id);
-		return ffa_error(FFA_NOT_SUPPORTED);
+	const struct ffa_value ret =
+		plat_ffa_is_notifications_bitmap_access_valid(current, vm_id);
+
+	if (ffa_func_id(ret) != FFA_SUCCESS_32) {
+		dlog_verbose(
+			"FFA_NOTIFICATION_BITMAP_CREATE to be used by "
+			"hypervisor for valid NWd VM IDs only (%x).\n",
+			vm_id);
+		return ret;
 	}
 
 	return plat_ffa_notifications_bitmap_create(vm_id, vcpu_count);
@@ -3724,13 +4155,15 @@ struct ffa_value api_ffa_notification_bitmap_create(ffa_id_t vm_id,
 struct ffa_value api_ffa_notification_bitmap_destroy(ffa_id_t vm_id,
 						     struct vcpu *current)
 {
-	/*
-	 * Validity of use of this interface is the same as for bitmap create.
-	 */
-	if (!plat_ffa_is_notifications_create_valid(current, vm_id)) {
-		dlog_verbose("Bitmap destroy for NWd VM IDs only (%x).\n",
-			     vm_id);
-		return ffa_error(FFA_NOT_SUPPORTED);
+	const struct ffa_value ret =
+		plat_ffa_is_notifications_bitmap_access_valid(current, vm_id);
+
+	if (ffa_func_id(ret) != FFA_SUCCESS_32) {
+		dlog_verbose(
+			"FFA_NOTIFICATION_BITMAP_DESTROY to be used by "
+			"hypervisor for valid NWd VM IDs only (%x).\n",
+			vm_id);
+		return ret;
 	}
 
 	return plat_ffa_notifications_bitmap_destroy(vm_id);
@@ -3767,7 +4200,8 @@ struct ffa_value api_ffa_notification_update_bindings(
 	}
 
 	if (notifications == 0U) {
-		dlog_verbose("No notifications have been specified.\n");
+		dlog_verbose("No notifications have been specified %lx.\n",
+			     notifications);
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -3779,7 +4213,15 @@ struct ffa_value api_ffa_notification_update_bindings(
 
 	if (receiver_locked.vm == NULL) {
 		dlog_verbose("Receiver doesn't exist!\n");
-		return ffa_error(FFA_DENIED);
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	if (receiver_locked.vm->ffa_version < FFA_VERSION_1_1) {
+		dlog_verbose(
+			"%s: caller (%x) version should be GE to FF-A v1.1.\n",
+			__func__, receiver_locked.vm->id);
+		ret = ffa_error(FFA_NOT_SUPPORTED);
+		goto out;
 	}
 
 	if (!vm_locked_are_notifications_enabled(receiver_locked)) {
@@ -3802,7 +4244,10 @@ struct ffa_value api_ffa_notification_update_bindings(
 	if (!vm_notifications_validate_bound_sender(
 		    receiver_locked, ffa_is_vm_id(sender_vm_id), id_to_validate,
 		    notifications)) {
-		dlog_verbose("Notifications are bound to other sender.\n");
+		dlog_verbose(
+			"Sender %x not permitted to set notifications %lx to "
+			"%x.\n",
+			sender_vm_id, notifications, receiver_vm_id);
 		ret = ffa_error(FFA_DENIED);
 		goto out;
 	}
@@ -3814,7 +4259,7 @@ struct ffa_value api_ffa_notification_update_bindings(
 	if (vm_are_notifications_pending(receiver_locked,
 					 ffa_is_vm_id(sender_vm_id),
 					 notifications)) {
-		dlog_verbose("Notifications within '%x' pending.\n",
+		dlog_verbose("Notifications within '%lx' pending.\n",
 			     notifications);
 		ret = ffa_error(FFA_DENIED);
 		goto out;
@@ -3835,13 +4280,30 @@ struct ffa_value api_ffa_notification_set(
 {
 	struct ffa_value ret;
 	struct vm_locked receiver_locked;
-
 	/*
 	 * Check if is per-vCPU or global, and extracting vCPU ID according
 	 * to table 17.19 of the FF-A v1.1 Beta 0 spec.
 	 */
 	bool is_per_vcpu = (flags & FFA_NOTIFICATION_FLAG_PER_VCPU) != 0U;
 	ffa_vcpu_index_t vcpu_id = (uint16_t)(flags >> 16);
+	const uint32_t flags_mbz =
+		~(FFA_NOTIFICATIONS_FLAG_PER_VCPU |
+		  FFA_NOTIFICATIONS_FLAG_DELAY_SRI | (0xFFFFU << 16));
+	const bool delay_sri = (FFA_NOTIFICATIONS_FLAG_DELAY_SRI & flags) != 0U;
+
+	if ((flags_mbz & flags) != 0U) {
+		dlog_verbose("%s: caller shouldn't set bits that MBZ.\n",
+			     __func__);
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	/* Global notifications must target any vCPU. */
+	if (!is_per_vcpu && vcpu_id != 0U) {
+		dlog_verbose(
+			"For global notifications vCPU ID MBZ in call to set "
+			"notifications.\n");
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
 
 	if (!plat_ffa_is_notification_set_valid(current, sender_vm_id,
 						receiver_vm_id)) {
@@ -3851,6 +4313,17 @@ struct ffa_value api_ffa_notification_set(
 
 	if (notifications == 0U) {
 		dlog_verbose("No notifications have been specified.\n");
+		return ffa_error(FFA_INVALID_PARAMETERS);
+	}
+
+	/*
+	 * The 'Delay Schedule Receiver interrupt flag' only applies to the
+	 * secure virtual FF-A instance.
+	 */
+	if (!vm_id_is_current_world(sender_vm_id) && delay_sri) {
+		dlog_verbose(
+			"The delay SRI flag can only be set at the secure "
+			"virtual FF-A instance.\n");
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
@@ -3877,6 +4350,20 @@ struct ffa_value api_ffa_notification_set(
 	}
 
 	/*
+	 * Check the if the notifications are bound as global if per-vCPU flag
+	 * is set, or if they are bound as per-vCPU and caller setting as
+	 * global. In either case, return FFA_INVALID_PARAMETERS.
+	 */
+	if (vm_notifications_validate_binding(
+		    receiver_locked, ffa_is_vm_id(sender_vm_id), sender_vm_id,
+		    notifications, !is_per_vcpu)) {
+		dlog_verbose("Notifications in %lx are %s\n", notifications,
+			     !is_per_vcpu ? "global" : "per-vCPU");
+		ret = ffa_error(FFA_INVALID_PARAMETERS);
+		goto out;
+	}
+
+	/*
 	 * If notifications are not bound to the sender, they wouldn't be
 	 * enabled either for the receiver.
 	 */
@@ -3899,14 +4386,14 @@ struct ffa_value api_ffa_notification_set(
 		receiver_locked, ffa_is_vm_id(sender_vm_id), notifications,
 		vcpu_id, is_per_vcpu);
 
-	dlog_verbose("Set the notifications: %x.\n", notifications);
+	dlog_verbose("Set the notifications: %lx.\n", notifications);
 
-	if ((FFA_NOTIFICATIONS_FLAG_DELAY_SRI & flags) == 0) {
+	if (!delay_sri) {
 		dlog_verbose("SRI was NOT delayed. vcpu: %u!\n",
 			     vcpu_index(current));
 		plat_ffa_sri_trigger_not_delayed(current->cpu);
 	} else {
-		plat_ffa_sri_state_set(DELAYED);
+		plat_ffa_sri_set_delayed(current->cpu);
 	}
 
 	ret = (struct ffa_value){.func = FFA_SUCCESS_32};
@@ -3978,11 +4465,10 @@ struct ffa_value api_ffa_notification_get(ffa_id_t receiver_vm_id,
 	 */
 	CHECK(receiver_locked.vm != NULL);
 
-	if (receiver_locked.vm->vcpu_count <= vcpu_id ||
-	    (receiver_locked.vm->vcpu_count != 1 &&
-	     cpu_index(current->cpu) != vcpu_id)) {
+	if (receiver_locked.vm->vcpu_count <= vcpu_id) {
 		dlog_verbose(
-			"Invalid VCPU ID %u. vcpu count %u current core: %u!\n",
+			"Invalid VCPU ID %u. vcpu count %u current core: "
+			"%zu!\n",
 			vcpu_id, receiver_locked.vm->vcpu_count,
 			cpu_index(current->cpu));
 		ret = ffa_error(FFA_INVALID_PARAMETERS);
@@ -4017,14 +4503,6 @@ struct ffa_value api_ffa_notification_get(ffa_id_t receiver_vm_id,
 
 	ret = api_ffa_notification_get_success_return(
 		sp_notifications, vm_notifications, framework_notifications);
-
-	/*
-	 * If there are no more pending notifications, change `sri_state` to
-	 * handled.
-	 */
-	if (vm_is_notifications_pending_count_zero()) {
-		plat_ffa_sri_state_set(HANDLED);
-	}
 
 	if (!receiver_locked.vm->el0_partition &&
 	    !vm_are_global_notifications_pending(receiver_locked)) {
@@ -4098,7 +4576,8 @@ struct ffa_value api_ffa_notification_info_get(struct vcpu *current)
 	 * In the SPM, following check passes if call has been forwarded from
 	 * the hypervisor.
 	 */
-	if (current->vm->id != HF_PRIMARY_VM_ID) {
+
+	if (!vm_is_primary(current->vm)) {
 		dlog_verbose(
 			"Only the receiver's scheduler can use this "
 			"interface\n");
@@ -4143,8 +4622,6 @@ struct ffa_value api_ffa_notification_info_get(struct vcpu *current)
 			ids, ids_count, lists_sizes, lists_count);
 	}
 
-	plat_ffa_sri_state_set(HANDLED);
-
 	return result;
 }
 
@@ -4156,7 +4633,7 @@ struct ffa_value api_ffa_mem_perm_get(vaddr_t base_addr, struct vcpu *current)
 	uint32_t mode = 0;
 
 	if (!plat_ffa_is_mem_perm_get_valid(current)) {
-		return ffa_error(FFA_NOT_SUPPORTED);
+		return ffa_error(FFA_DENIED);
 	}
 
 	if (!(current->vm->el0_partition)) {
@@ -4221,7 +4698,7 @@ struct ffa_value api_ffa_mem_perm_set(vaddr_t base_addr, uint32_t page_count,
 	struct mpool local_page_pool;
 
 	if (!plat_ffa_is_mem_perm_set_valid(current)) {
-		return ffa_error(FFA_NOT_SUPPORTED);
+		return ffa_error(FFA_DENIED);
 	}
 
 	if (!(current->vm->el0_partition)) {
@@ -4334,77 +4811,131 @@ out:
 }
 
 /**
- * Helper function for FFA_CONSOLE_LOG ABI.
- * Writes number of characters to a given VM buffer.
+ * Send the contents of the given vCPU's log buffer to the log, preceded
+ * by the VM ID and followed by a newline.
  */
-static rsize_t arg_to_char_helper(struct vm_locked from_locked,
-				  const uint64_t src, rsize_t src_size,
-				  rsize_t to_write)
+void api_flush_log_buffer(struct vcpu_locked *vcpu_locked)
 {
-	bool flush = false;
-	char c;
-	rsize_t size = src_size < to_write ? src_size : to_write;
-	rsize_t written = 0;
+	/*
+	 * NOTE: This line is parsed by `hftest.py`.
+	 * If you change the format, make sure to update
+	 * `HFTEST_CTRL_JSON_REGEX` as well.
+	 */
+	struct vcpu *vcpu = vcpu_locked->vcpu;
+	struct log_buffer *buffer = &vcpu->log_buffer;
+	ffa_id_t vm_id = vcpu->vm->id;
+	ffa_id_t vcpu_id = vcpu_index(vcpu);
 
-	if (size == 0) {
-		return 0;
-	}
-
-	while (written < size) {
-		c = ((char *)&src)[written++];
-		if (c == '\n' || c == '\0') {
-			flush = true;
-		} else {
-			from_locked.vm->log_buffer
-				[from_locked.vm->log_buffer_length++] = c;
-			flush = (from_locked.vm->log_buffer_length ==
-				 LOG_BUFFER_SIZE);
-		}
-
-		if (flush) {
-			dlog_flush_vm_buffer(from_locked.vm->id,
-					     from_locked.vm->log_buffer,
-					     from_locked.vm->log_buffer_length);
-			from_locked.vm->log_buffer_length = 0;
-		}
-	}
-
-	return written;
+	buffer->chars[buffer->len] = '\0';
+	dlog("[%x %u] %s\n", vm_id, vcpu_id, buffer->chars);
+	buffer->len = 0;
 }
 
 /**
- * Implements FFA_CONSOLE_LOG buffered logging.
+ * Implements FF-A v1.2 FFA_CONSOLE_LOG ABI for buffered logging.
  */
 struct ffa_value api_ffa_console_log(const struct ffa_value args,
 				     struct vcpu *current)
 {
-	struct vm *vm = current->vm;
-	struct vm_locked vm_locked;
-	size_t chars_in_param = args.func == FFA_CONSOLE_LOG_32
-					? sizeof(uint32_t)
-					: sizeof(uint64_t);
-	size_t total_to_write = args.arg1;
+	/* Maximum number of characters is 128: 16 registers of 8 bytes each. */
+	char chars[128] = {0};
+	const bool v1_2 = current->vm->ffa_version >= FFA_VERSION_1_2;
+	const bool log32 = args.func == FFA_CONSOLE_LOG_32;
 
-	if (total_to_write == 0 || total_to_write > chars_in_param * 6) {
+	/*
+	 * 32bit: always 6 registers
+	 * 64bit and less than v1.2: 6 registers
+	 * 64bit and v1.2 or greater: 16 registers
+	 */
+	/* NOLINTNEXTLINE(readability-avoid-nested-conditional-operator) */
+	const size_t registers_max = log32 ? 6 : (v1_2 ? 16 : 6);
+	const size_t chars_max =
+		registers_max * (log32 ? sizeof(uint32_t) : sizeof(uint64_t));
+	const size_t chars_count = args.arg1;
+	struct vcpu_locked vcpu_locked;
+	struct log_buffer *log_buffer;
+
+	assert(args.func == FFA_CONSOLE_LOG_32 ||
+	       args.func == FFA_CONSOLE_LOG_64);
+
+	if (chars_count == 0 || chars_count > chars_max) {
 		return ffa_error(FFA_INVALID_PARAMETERS);
 	}
 
-	vm_locked = vm_lock(vm);
+	if (log32) {
+		uint32_t *registers = (uint32_t *)chars;
 
-	total_to_write -= arg_to_char_helper(vm_locked, args.arg2,
-					     chars_in_param, total_to_write);
-	total_to_write -= arg_to_char_helper(vm_locked, args.arg3,
-					     chars_in_param, total_to_write);
-	total_to_write -= arg_to_char_helper(vm_locked, args.arg4,
-					     chars_in_param, total_to_write);
-	total_to_write -= arg_to_char_helper(vm_locked, args.arg5,
-					     chars_in_param, total_to_write);
-	total_to_write -= arg_to_char_helper(vm_locked, args.arg6,
-					     chars_in_param, total_to_write);
-	arg_to_char_helper(vm_locked, args.arg7, chars_in_param,
-			   total_to_write);
+		registers[0] = args.arg2 & 0xffffffff;
+		registers[1] = args.arg3 & 0xffffffff;
+		registers[2] = args.arg4 & 0xffffffff;
+		registers[3] = args.arg5 & 0xffffffff;
+		registers[4] = args.arg6 & 0xffffffff;
+		registers[5] = args.arg7 & 0xffffffff;
+	} else {
+		uint64_t *registers = (uint64_t *)chars;
 
-	vm_unlock(&vm_locked);
+		registers[0] = args.arg2;
+		registers[1] = args.arg3;
+		registers[2] = args.arg4;
+		registers[3] = args.arg5;
+		registers[4] = args.arg6;
+		registers[5] = args.arg7;
+		if (v1_2) {
+			registers[6] = args.extended_val.arg8;
+			registers[7] = args.extended_val.arg9;
+			registers[8] = args.extended_val.arg10;
+			registers[9] = args.extended_val.arg11;
+			registers[10] = args.extended_val.arg12;
+			registers[11] = args.extended_val.arg13;
+			registers[12] = args.extended_val.arg14;
+			registers[13] = args.extended_val.arg15;
+			registers[14] = args.extended_val.arg16;
+			registers[15] = args.extended_val.arg17;
+		}
+	}
 
+	vcpu_locked = vcpu_lock(current);
+	log_buffer = &current->log_buffer;
+
+	for (size_t i = 0; i < chars_count; i++) {
+		bool flush = false;
+		const char c = chars[i];
+
+		if (c == '\n' || c == '\0') {
+			flush = true;
+		} else {
+			log_buffer->chars[log_buffer->len++] = c;
+			flush = log_buffer->len == LOG_BUFFER_SIZE;
+		}
+
+		if (flush) {
+			api_flush_log_buffer(&vcpu_locked);
+		}
+	}
+
+	vcpu_unlock(&vcpu_locked);
 	return (struct ffa_value){.func = FFA_SUCCESS_32};
+}
+
+/**
+ * Send an IPI interrupt to a target vcpu belonging to the
+ * sender that isn't itself.
+ */
+int64_t api_hf_interrupt_send_ipi(uint32_t target_vcpu_id, struct vcpu *current)
+{
+	struct vm *vm = current->vm;
+	ffa_vcpu_index_t target_vcpu_index = vcpu_id_to_index(target_vcpu_id);
+
+	if (target_vcpu_index >= vm->vcpu_count ||
+	    target_vcpu_index == cpu_index(current->cpu)) {
+		dlog_verbose("Invalid vCPU %d for IPI.\n", target_vcpu_id);
+		return -1;
+	}
+
+	dlog_verbose("Injecting IPI to target vCPU%d for %#x\n", target_vcpu_id,
+		     vm->id);
+
+	hf_ipi_send_interrupt(vm, target_vcpu_index);
+
+	return 0;
 }

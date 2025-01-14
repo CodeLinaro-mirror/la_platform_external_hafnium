@@ -20,8 +20,8 @@ execute_test() {
   shift
 
   command="${runner[@]} $@" # The rest of arguments are extra parameters
-  ${command} || true # execute test
   if [ "$CODE_COVERAGE" = true ];then
+    ${command} || true
     move_log_files ${WORKSPACE} trace_folder
     # If one of the parameters of the executed command was spmc or hypervisor
     # we need to extract the path to the binary to get the elf files
@@ -31,6 +31,8 @@ execute_test() {
     if [[ "${command}" =~ ^.+?--hypervisor[[:space:]]([^[:space:]]+?).+$ ]]; then
       append_elf_file "${WORKSPACE}/$(dirname ${BASH_REMATCH[1]})/hafnium.elf" $trace_folder
     fi
+  else
+    ${command}
   fi
 
 }
@@ -38,7 +40,7 @@ execute_test() {
 KOKORO_DIR="$(dirname "$0")"
 source $KOKORO_DIR/test_common.sh
 
-HFTEST=(${TIMEOUT[@]} 600s ./test/hftest/hftest.py)
+HFTEST=(${TIMEOUT[@]} 1200s ./test/hftest/hftest.py)
 
 SPMC_PATH="$OUT/secure_aem_v8a_fvp_vhe_clang"
 HYPERVISOR_PATH="$OUT/aem_v8a_fvp_vhe_clang"
@@ -110,6 +112,9 @@ execute_test HFTEST --hypervisor "$HYPERVISOR_PATH/hafnium.bin" \
 
 execute_test HFTEST --hypervisor "$HYPERVISOR_PATH/hafnium.bin" \
                  --partitions_json test/vmapi/ffa_secure_partitions/ffa_both_world_partitions_vhe_test.json
+
+execute_test HFTEST --hypervisor "$HYPERVISOR_PATH/hafnium.bin" \
+                 --partitions_json test/vmapi/ffa_secure_partitions/ffa_both_world_partitions_sel1_up_test.json
 
 if [ "$CODE_COVERAGE" = true ]; then
   create_configuration_file

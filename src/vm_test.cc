@@ -10,7 +10,9 @@
 
 extern "C" {
 #include "hf/check.h"
+#include "hf/list.h"
 #include "hf/mpool.h"
+#include "hf/timer_mgmt.h"
 #include "hf/vm.h"
 }
 
@@ -75,7 +77,7 @@ TEST_F(vm, vm_unmap_hypervisor_not_mapped)
 	struct vm_locked vm_locked;
 
 	/* TODO: check ptable usage (security state?) */
-	EXPECT_TRUE(vm_init_next(1, &ppool, &vm, false));
+	EXPECT_TRUE(vm_init_next(1, &ppool, &vm, false, 0));
 	vm_locked = vm_lock(vm);
 	ASSERT_TRUE(mm_vm_init(&vm->ptable, vm->id, &ppool));
 	EXPECT_TRUE(vm_unmap_hypervisor(vm_locked, &ppool));
@@ -96,13 +98,11 @@ TEST_F(vm, vm_boot_order)
 	struct_vcpu *vcpu;
 	std::list<struct_vm *> expected_final_order;
 
-	EXPECT_TRUE(vcpu_get_boot_vcpu() == NULL);
-
 	/*
 	 * Insertion when no call to "vcpu_update_boot" has been made yet.
 	 * The "boot_list" is expected to be empty.
 	 */
-	EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false));
+	EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false, 0));
 	vm_cur->boot_order = 3;
 	vcpu = vm_get_vcpu(vm_cur, 0);
 	vcpu_update_boot(vcpu);
@@ -111,7 +111,7 @@ TEST_F(vm, vm_boot_order)
 	EXPECT_EQ(vcpu_get_boot_vcpu()->vm->id, vm_cur->id);
 
 	/* Insertion at the head of the boot list */
-	EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false));
+	EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false, 0));
 	vm_cur->boot_order = 1;
 	vcpu = vm_get_vcpu(vm_cur, 0);
 	vcpu_update_boot(vcpu);
@@ -121,7 +121,7 @@ TEST_F(vm, vm_boot_order)
 
 	/* Insertion of two in the middle of the boot list */
 	for (uint32_t i = 0; i < 2; i++) {
-		EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false));
+		EXPECT_TRUE(vm_init_next(1, &ppool, &vm_cur, false, 0));
 		vm_cur->boot_order = 2;
 		vcpu = vm_get_vcpu(vm_cur, 0);
 		vcpu_update_boot(vcpu);
@@ -156,8 +156,84 @@ TEST_F(vm, vm_boot_order)
 	     it != expected_final_order.end(); it++) {
 		EXPECT_TRUE(vcpu != NULL);
 		EXPECT_EQ((*it)->id, vcpu->vm->id);
-		vcpu = vcpu->next_boot;
+		vcpu = vcpu_get_next_boot(vcpu);
 	}
+}
+
+TEST_F(vm, vcpu_arch_timer)
+{
+	const cpu_id_t cpu_ids[2] = {0, 1};
+	struct_vcpu *vm0_vcpu;
+	struct_vcpu *vm1_vcpu;
+	struct_vcpu *deadline_vcpu;
+	struct_vcpu *target_vcpu;
+	struct vcpu_locked vcpu_locked;
+	struct cpu *cpu0;
+	struct cpu *cpu1;
+
+	/* Initialie CPU module with two physical CPUs. */
+	cpu_module_init(cpu_ids, 2);
+	cpu0 = cpu_find_index(0);
+	cpu1 = cpu_find_index(1);
+
+	/* Two UP endpoints are deployed for this test. */
+	CHECK(vm_get_count() >= 2);
+	vm0_vcpu = vm_get_vcpu(vm_find_index(0), 0);
+	vm1_vcpu = vm_get_vcpu(vm_find_index(1), 0);
+
+	/* The execution context of each VM is scheduled on CPU0. */
+	vm0_vcpu->cpu = cpu0;
+	vm1_vcpu->cpu = cpu0;
+
+	/*
+	 * Enable the timer peripheral for each vCPU and setup an arbitraty
+	 * countdown value.
+	 */
+	vm0_vcpu->regs.arch_timer.cval = 555555;
+	vm1_vcpu->regs.arch_timer.cval = 999999;
+	vm0_vcpu->regs.arch_timer.ctl = 1;
+	vm1_vcpu->regs.arch_timer.ctl = 1;
+
+	/* No vCPU is being tracked through either timer list. */
+	deadline_vcpu = timer_find_vcpu_nearest_deadline(cpu0);
+	EXPECT_TRUE(deadline_vcpu == NULL);
+	deadline_vcpu = timer_find_vcpu_nearest_deadline(cpu1);
+	EXPECT_TRUE(deadline_vcpu == NULL);
+
+	/* vCPU of VM0 and VM1 are being added to the list. */
+	timer_vcpu_manage(vm0_vcpu);
+	timer_vcpu_manage(vm1_vcpu);
+
+	deadline_vcpu = timer_find_vcpu_nearest_deadline(cpu0);
+	EXPECT_EQ(deadline_vcpu, vm0_vcpu);
+
+	/* Remove one of the vCPUs from the CPU0 list. */
+	vm0_vcpu->regs.arch_timer.cval = 0;
+	vm0_vcpu->regs.arch_timer.ctl = 0;
+	timer_vcpu_manage(vm0_vcpu);
+
+	/* This leaves one vCPU entry on CPU0 list. */
+	deadline_vcpu = timer_find_vcpu_nearest_deadline(cpu0);
+	EXPECT_EQ(deadline_vcpu, vm1_vcpu);
+
+	/* Attempt to migrate VM1 vCPU from CPU0 to CPU1. */
+	vcpu_locked = vcpu_lock(vm1_vcpu);
+	timer_migrate_to_other_cpu(cpu1, vcpu_locked);
+	vcpu_unlock(&vcpu_locked);
+
+	/*
+	 * After migration, ensure the list is empty on CPU0 but non-empty on
+	 * CPU1.
+	 */
+	deadline_vcpu = timer_find_vcpu_nearest_deadline(cpu0);
+	EXPECT_TRUE(deadline_vcpu == NULL);
+
+	/*
+	 * vCPU of VM1 is now running on CPU1. It must be the target vCPU when
+	 * the timer has expired.
+	 */
+	target_vcpu = timer_find_target_vcpu(vm1_vcpu);
+	EXPECT_EQ(target_vcpu, vm1_vcpu);
 }
 
 /**
@@ -514,7 +590,7 @@ TEST_F(vm, vm_notifications_info_get_per_vcpu_all_vcpus)
 	uint32_t lists_count = 0;
 	enum notifications_info_get_state current_state = INIT;
 
-	EXPECT_TRUE(vm_init_next(vcpu_count, &ppool, &current_vm, false));
+	EXPECT_TRUE(vm_init_next(vcpu_count, &ppool, &current_vm, false, 0));
 	current_vm_locked = vm_lock(current_vm);
 	notifications = &current_vm->notifications.from_sp;
 
@@ -727,4 +803,174 @@ TEST_F(vm, vm_notifications_info_get_from_framework)
 	vm_unlock(&vm_locked);
 }
 
+/**
+ * Validates simple getting of notifications info for pending IPI.
+ */
+TEST_F(vm, vm_notifications_info_get_ipi)
+{
+	/*
+	 * Following set of variables that are also expected to be used when
+	 * handling ffa_notification_info_get.
+	 */
+	uint16_t ids[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t ids_count = 0;
+	uint32_t lists_sizes[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t lists_count = 0;
+	enum notifications_info_get_state current_state = INIT;
+	struct_vm *current_vm = vm_find_index(5);
+	struct vcpu *target_vcpu = vm_get_vcpu(current_vm, 1);
+	struct interrupts *interrupts = &target_vcpu->interrupts;
+	const bool is_from_vm = false;
+	struct vm_locked current_vm_locked = vm_lock(current_vm);
+
+	EXPECT_TRUE(current_vm->vcpu_count >= 2);
+
+	vcpu_virt_interrupt_set_pending(interrupts, HF_IPI_INTID);
+
+	vm_notifications_info_get_pending(current_vm_locked, is_from_vm, ids,
+					  &ids_count, lists_sizes, &lists_count,
+					  FFA_NOTIFICATIONS_INFO_GET_MAX_IDS,
+					  &current_state);
+
+	EXPECT_EQ(ids_count, 2);
+	EXPECT_EQ(lists_count, 1);
+	EXPECT_EQ(lists_sizes[0], 1);
+	EXPECT_EQ(ids[0], current_vm->id);
+	EXPECT_EQ(ids[1], 1);
+	EXPECT_EQ(target_vcpu->ipi_info_get_retrieved, true);
+
+	/* Check it is not retrieved multiple times. */
+	current_state = INIT;
+	ids[0] = 0;
+	ids[1] = 0;
+	ids_count = 0;
+	lists_sizes[0] = 0;
+	lists_count = 0;
+
+	vm_notifications_info_get_pending(current_vm_locked, is_from_vm, ids,
+					  &ids_count, lists_sizes, &lists_count,
+					  FFA_NOTIFICATIONS_INFO_GET_MAX_IDS,
+					  &current_state);
+	EXPECT_EQ(ids_count, 0);
+	EXPECT_EQ(lists_count, 0);
+	EXPECT_EQ(lists_sizes[0], 0);
+
+	vm_unlock(&current_vm_locked);
+}
+
+/**
+ * Validates simple getting of notifications info for pending with IPI when
+ * notification for the same vcpu is also pending.
+ */
+TEST_F(vm, vm_notifications_info_get_ipi_with_per_vcpu)
+{
+	/*
+	 * Following set of variables that are also expected to be used when
+	 * handling ffa_notification_info_get.
+	 */
+	uint16_t ids[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t ids_count = 0;
+	uint32_t lists_sizes[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t lists_count = 0;
+	enum notifications_info_get_state current_state = INIT;
+	struct_vm *current_vm = vm_find_index(5);
+	struct vcpu *target_vcpu = vm_get_vcpu(current_vm, 1);
+	struct interrupts *interrupts = &target_vcpu->interrupts;
+	const bool is_from_vm = false;
+	struct vm_locked current_vm_locked = vm_lock(current_vm);
+
+	EXPECT_TRUE(current_vm->vcpu_count >= 2);
+
+	vcpu_virt_interrupt_set_pending(interrupts, HF_IPI_INTID);
+
+	vm_notifications_partition_set_pending(current_vm_locked, is_from_vm,
+					       true, 1, true);
+	vm_notifications_info_get_pending(current_vm_locked, is_from_vm, ids,
+					  &ids_count, lists_sizes, &lists_count,
+					  FFA_NOTIFICATIONS_INFO_GET_MAX_IDS,
+					  &current_state);
+
+	EXPECT_EQ(ids_count, 2);
+	EXPECT_EQ(lists_count, 1);
+	EXPECT_EQ(lists_sizes[0], 1);
+	EXPECT_EQ(ids[0], current_vm->id);
+	EXPECT_EQ(ids[1], 1);
+	EXPECT_EQ(target_vcpu->ipi_info_get_retrieved, true);
+
+	/* Reset the state and values. */
+	current_state = INIT;
+	ids[0] = 0;
+	ids[1] = 0;
+	ids_count = 0;
+	lists_sizes[0] = 0;
+	lists_count = 0;
+
+	vm_notifications_info_get_pending(current_vm_locked, is_from_vm, ids,
+					  &ids_count, lists_sizes, &lists_count,
+					  FFA_NOTIFICATIONS_INFO_GET_MAX_IDS,
+					  &current_state);
+	EXPECT_EQ(ids_count, 0);
+	EXPECT_EQ(lists_count, 0);
+	EXPECT_EQ(lists_sizes[0], 0);
+
+	vm_unlock(&current_vm_locked);
+}
+
+/**
+ * Validate that a mix of a pending IPI and notifcations are correctly
+ * reported across vcpus.
+ */
+TEST_F(vm, vm_notifications_info_get_per_vcpu_all_vcpus_and_ipi)
+{
+	struct_vm *current_vm = vm_find_index(5);
+	ffa_vcpu_count_t vcpu_count = current_vm->vcpu_count;
+	CHECK(vcpu_count > 1);
+
+	struct vm_locked current_vm_locked = vm_lock(current_vm);
+
+	/*
+	 * Following set of variables that are also expected to be used when
+	 * handling ffa_notification_info_get.
+	 */
+	const bool is_from_vm = false;
+	uint16_t ids[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t ids_count = 0;
+	uint32_t lists_sizes[FFA_NOTIFICATIONS_INFO_GET_MAX_IDS] = {0};
+	uint32_t lists_count = 0;
+	enum notifications_info_get_state current_state = INIT;
+	struct vcpu *target_vcpu = vm_get_vcpu(current_vm, 0);
+	struct interrupts *interrupts = &target_vcpu->interrupts;
+
+	vcpu_virt_interrupt_set_pending(interrupts, HF_IPI_INTID);
+
+	for (unsigned int i = 1; i < vcpu_count; i++) {
+		vm_notifications_partition_set_pending(
+			current_vm_locked, is_from_vm, FFA_NOTIFICATION_MASK(i),
+			i, true);
+	}
+
+	vm_notifications_info_get_pending(current_vm_locked, is_from_vm, ids,
+					  &ids_count, lists_sizes, &lists_count,
+					  FFA_NOTIFICATIONS_INFO_GET_MAX_IDS,
+					  &current_state);
+
+	/*
+	 * This test has been conceived for the expected MAX_CPUS 4.
+	 * All VCPUs have notifications of the same VM, to be broken down in 2
+	 * lists with 3 VCPU IDs, and 1 VCPU ID respectively.
+	 * The list of IDs should look like: {<vm_id>, 0, 1, 2, <vm_id>, 3}.
+	 */
+	EXPECT_EQ(ids_count, 6U);
+	EXPECT_EQ(lists_count, 2U);
+	EXPECT_EQ(lists_sizes[0], 3);
+	EXPECT_EQ(lists_sizes[1], 1);
+	EXPECT_EQ(ids[0], current_vm->id);
+	EXPECT_EQ(ids[1], 0);
+	EXPECT_EQ(ids[2], 1);
+	EXPECT_EQ(ids[3], 2);
+	EXPECT_EQ(ids[4], current_vm->id);
+	EXPECT_EQ(ids[5], 3);
+
+	vm_unlock(&current_vm_locked);
+}
 } /* namespace */

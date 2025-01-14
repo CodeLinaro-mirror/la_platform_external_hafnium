@@ -10,10 +10,16 @@
 
 #include "hf/cpu.h"
 #include "hf/mpool.h"
+#include "hf/vcpu.h"
 #include "hf/vm.h"
 
 #include "vmapi/hf/call.h"
 #include "vmapi/hf/ffa.h"
+
+static inline struct ffa_value api_ffa_interrupt_return(uint32_t id)
+{
+	return (struct ffa_value){.func = FFA_INTERRUPT_32, .arg2 = id};
+}
 
 void api_init(struct mpool *ppool);
 struct vcpu *api_ffa_get_vm_vcpu(struct vm *vm, struct vcpu *current);
@@ -35,7 +41,7 @@ struct vcpu *api_wake_up(struct vcpu *current, struct vcpu *target_vcpu);
 
 int64_t api_interrupt_enable(uint32_t intid, bool enable,
 			     enum interrupt_type type, struct vcpu *current);
-uint32_t api_interrupt_get(struct vcpu *current);
+uint32_t api_interrupt_get(struct vcpu_locked current_locked);
 int64_t api_interrupt_inject(ffa_id_t target_vm_id,
 			     ffa_vcpu_index_t target_vcpu_idx, uint32_t intid,
 			     struct vcpu *current, struct vcpu **next);
@@ -43,7 +49,8 @@ int64_t api_interrupt_inject_locked(struct vcpu_locked target_locked,
 				    uint32_t intid,
 				    struct vcpu_locked current_locked,
 				    struct vcpu **next);
-void api_sri_send_if_delayed(struct vcpu *current);
+int64_t api_hf_interrupt_send_ipi(uint32_t target_vcpu_id,
+				  struct vcpu *current);
 
 struct ffa_value api_ffa_msg_send(ffa_id_t sender_vm_id,
 				  ffa_id_t receiver_vm_id, uint32_t size,
@@ -66,20 +73,21 @@ struct ffa_value api_ffa_version(struct vcpu *current,
 				 uint32_t requested_version);
 struct ffa_value api_ffa_partition_info_get(struct vcpu *current,
 					    const struct ffa_uuid *uuid,
-					    const uint32_t flags);
+					    uint32_t flags);
 bool api_ffa_fill_partition_info_from_regs(
 	struct ffa_value ret, uint16_t start_index,
 	struct ffa_partition_info *partitions, uint16_t partitions_len,
 	ffa_vm_count_t *ret_count);
 struct ffa_value api_ffa_partition_info_get_regs(struct vcpu *current,
 						 const struct ffa_uuid *uuid,
-						 const uint16_t start_index,
-						 const uint16_t tag);
+						 uint16_t start_index,
+						 uint16_t tag);
 struct ffa_value api_ffa_id_get(const struct vcpu *current);
 struct ffa_value api_ffa_spm_id_get(void);
 struct ffa_value api_ffa_feature_success(uint32_t arg2);
-struct ffa_value api_ffa_features(uint32_t function_id, uint32_t input_property,
-				  uint32_t ffa_version);
+struct ffa_value api_ffa_features(uint32_t function_or_feature_id,
+				  uint32_t input_property,
+				  struct vcpu *current);
 struct ffa_value api_ffa_msg_wait(struct vcpu *current, struct vcpu **next,
 				  struct ffa_value *args);
 struct ffa_value api_ffa_run(ffa_id_t vm_id, ffa_vcpu_index_t vcpu_idx,
@@ -103,14 +111,10 @@ struct ffa_value api_ffa_mem_frag_tx(ffa_memory_handle_t handle,
 				     uint32_t fragment_length,
 				     ffa_id_t sender_vm_id,
 				     struct vcpu *current);
-struct ffa_value api_ffa_msg_send_direct_req(ffa_id_t sender_vm_id,
-					     ffa_id_t receiver_vm_id,
-					     struct ffa_value args,
+struct ffa_value api_ffa_msg_send_direct_req(struct ffa_value args,
 					     struct vcpu *current,
 					     struct vcpu **next);
-struct ffa_value api_ffa_msg_send_direct_resp(ffa_id_t sender_vm_id,
-					      ffa_id_t receiver_vm_id,
-					      struct ffa_value args,
+struct ffa_value api_ffa_msg_send_direct_resp(struct ffa_value args,
 					      struct vcpu *current,
 					      struct vcpu **next);
 struct ffa_value api_ffa_secondary_ep_register(ipaddr_t entry_point,
@@ -143,7 +147,8 @@ struct ffa_value api_ffa_mem_perm_get(vaddr_t base_addr, struct vcpu *current);
 struct ffa_value api_ffa_mem_perm_set(vaddr_t base_addr, uint32_t page_count,
 				      uint32_t mem_perm, struct vcpu *current);
 
-struct ffa_value api_ffa_console_log(const struct ffa_value args,
+void api_flush_log_buffer(struct vcpu_locked *vcpu_locked);
+struct ffa_value api_ffa_console_log(struct ffa_value args,
 				     struct vcpu *current);
 
 void api_ffa_resume_direct_resp_target(struct vcpu_locked current_locked,
@@ -151,3 +156,5 @@ void api_ffa_resume_direct_resp_target(struct vcpu_locked current_locked,
 				       ffa_id_t receiver_vm_id,
 				       struct ffa_value to_ret,
 				       bool is_nwd_call_chain);
+
+bool api_extended_args_are_zero(struct ffa_value *args);

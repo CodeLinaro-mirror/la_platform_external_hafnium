@@ -58,47 +58,63 @@ typedef struct {
 
 static inline io8_t io8_c(uintpaddr_t addr, uintpaddr_t offset)
 {
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io8_t){.ptr = (volatile uint8_t *)(addr + offset)};
 }
 
 static inline io8_array_t io8_array_c(uintpaddr_t addr, uintpaddr_t offset,
 				      uint32_t count)
 {
+	(void)offset;
+
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io8_array_t){.base = (volatile uint8_t *)addr, .count = count};
 }
 
 static inline io16_t io16_c(uintpaddr_t addr, uintpaddr_t offset)
 {
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io16_t){.ptr = (volatile uint16_t *)(addr + offset)};
 }
 
 static inline io16_array_t io16_array_c(uintpaddr_t addr, uintpaddr_t offset,
 					uint32_t count)
 {
+	(void)offset;
+
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io16_array_t){.base = (volatile uint16_t *)addr,
 			      .count = count};
 }
 
 static inline io32_t io32_c(uintpaddr_t addr, uintpaddr_t offset)
 {
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io32_t){.ptr = (volatile uint32_t *)(addr + offset)};
 }
 
 static inline io32_array_t io32_array_c(uintpaddr_t addr, uintpaddr_t offset,
 					uint32_t count)
 {
+	(void)offset;
+
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io32_array_t){.base = (volatile uint32_t *)addr,
 			      .count = count};
 }
 
 static inline io64_t io64_c(uintpaddr_t addr, uintpaddr_t offset)
 {
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io64_t){.ptr = (volatile uint64_t *)(addr + offset)};
 }
 
 static inline io64_array_t io64_array_c(uintpaddr_t addr, uintpaddr_t offset,
 					uint32_t count)
 {
+	(void)offset;
+
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
 	return (io64_array_t){.base = (volatile uint64_t *)addr,
 			      .count = count};
 }

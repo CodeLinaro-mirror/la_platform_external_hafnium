@@ -12,6 +12,7 @@
 
 #include "hf/addr.h"
 #include "hf/interrupt_desc.h"
+#include "hf/list.h"
 #include "hf/spinlock.h"
 
 #include "vmapi/hf/ffa.h"
@@ -20,6 +21,9 @@
 #define NS_ACTION_QUEUED 0
 #define NS_ACTION_ME 1
 #define NS_ACTION_SIGNALED 2
+
+/** Maximum number of pending virtual interrupts in the queue per vCPU. */
+#define VINT_QUEUE_MAX 5
 
 enum vcpu_state {
 	/** The vCPU is switched off. */
@@ -69,6 +73,16 @@ enum schedule_mode {
 	SPMC_MODE,
 };
 
+/*
+ * This queue is implemented as a circular buffer. The entries are managed on
+ * a First In First Out basis.
+ */
+struct interrupt_queue {
+	uint32_t vint_buffer[VINT_QUEUE_MAX];
+	uint16_t head;
+	uint16_t tail;
+};
+
 struct interrupts {
 	/** Bitfield keeping track of which interrupts are enabled. */
 	struct interrupt_bitmap interrupt_enabled;
@@ -84,6 +98,11 @@ struct interrupts {
 	 */
 	uint32_t enabled_and_pending_irq_count;
 	uint32_t enabled_and_pending_fiq_count;
+
+	/**
+	 * Partition Manager maintains a queue of pending virtual interrupts.
+	 */
+	struct interrupt_queue vint_q;
 };
 
 struct vcpu_fault_info {
@@ -101,6 +120,13 @@ struct call_chain {
 	struct vcpu *next_node;
 };
 
+#define LOG_BUFFER_SIZE 256
+
+struct log_buffer {
+	char chars[LOG_BUFFER_SIZE];
+	uint16_t len;
+};
+
 struct vcpu {
 	struct spinlock lock;
 
@@ -116,6 +142,8 @@ struct vcpu {
 	struct arch_regs regs;
 	struct interrupts interrupts;
 
+	struct log_buffer log_buffer;
+
 	/*
 	 * Determine whether the 'regs' field is available for use. This is set
 	 * to false when a vCPU is about to run on a physical CPU, and is set
@@ -128,38 +156,27 @@ struct vcpu {
 
 	/*
 	 * If the current vCPU is executing as a consequence of a
-	 * FFA_MSG_SEND_DIRECT_REQ invocation, then this member holds the
+	 * direct request invocation, then this member holds the
 	 * originating VM ID from which the call originated.
 	 * The value HF_INVALID_VM_ID implies the vCPU is not executing as
-	 * a result of a prior FFA_MSG_SEND_DIRECT_REQ invocation.
+	 * a result of a prior direct request invocation.
 	 */
-	ffa_id_t direct_request_origin_vm_id;
+	struct {
+		ffa_id_t vm_id;
+		/** Indicate whether request is via FFA_MSG_SEND_DIRECT_REQ2. */
+		bool is_ffa_req2;
+		/** Indicate whether request is a framework message. */
+		bool is_framework;
+	} direct_request_origin;
 
 	/** Determine whether partition is currently handling managed exit. */
 	bool processing_managed_exit;
-
-	/**
-	 * Determine whether vCPU is currently handling secure interrupt.
-	 */
-	bool processing_secure_interrupt;
-	bool secure_interrupt_deactivated;
-
-	/**
-	 * INTID of the current secure interrupt being processed by this vCPU.
-	 */
-	uint32_t current_sec_interrupt_id;
 
 	/**
 	 * Track current vCPU which got pre-empted when secure interrupt
 	 * triggered.
 	 */
 	struct vcpu *preempted_vcpu;
-
-	/**
-	 * Current value of the Priority Mask register which is saved/restored
-	 * during secure interrupt handling.
-	 */
-	uint8_t priority_mask;
 
 	/**
 	 * Per FF-A v1.1-Beta0 spec section 8.3, an SP can use multiple
@@ -172,10 +189,16 @@ struct vcpu {
 	 * while running). This variable helps SPMC to keep a track of such
 	 * mechanism and perform appropriate bookkeeping.
 	 */
-	bool implicit_completion_signal;
+	bool requires_deactivate_call;
 
 	/** SP call chain. */
 	struct call_chain call_chain;
+
+	/**
+	 * Track if the pending IPI has been retrieved by
+	 * FFA_NOTIFICATION_INFO_GET.
+	 */
+	bool ipi_info_get_retrieved;
 
 	/**
 	 * Indicates if the current vCPU is running in SPMC scheduled
@@ -193,16 +216,17 @@ struct vcpu {
 	/** Partition Runtime Model. */
 	enum partition_runtime_model rt_model;
 
+	/* List entry pointing to the next vCPU in the boot order list. */
+	struct list_entry boot_list_node;
+
 	/**
-	 * Direct response message has been intercepted to handle virtual
-	 * secure interrupt for a S-EL0 partition.
+	 * An entry in a list maintained by Hafnium for pending arch timers.
+	 * It exists in the list on behalf of its parent vCPU. The `prev` and
+	 * `next` fields point to the adjacent entries in the list. The list
+	 * itself is protected by a spinlock therefore timer entry is
+	 * safeguarded from concurrent accesses.
 	 */
-	bool direct_resp_intercepted;
-
-	/** Save direct response message args to be resumed later. */
-	struct ffa_value direct_resp_ffa_value;
-
-	struct vcpu *next_boot;
+	struct list_entry timer_node;
 };
 
 /** Encapsulates a vCPU whose lock is held. */
@@ -234,6 +258,7 @@ void vcpu_set_boot_info_gp_reg(struct vcpu *vcpu);
 
 void vcpu_update_boot(struct vcpu *vcpu);
 struct vcpu *vcpu_get_boot_vcpu(void);
+struct vcpu *vcpu_get_next_boot(struct vcpu *vcpu);
 
 static inline bool vcpu_is_virt_interrupt_enabled(struct interrupts *interrupts,
 						  uint32_t intid)
@@ -368,10 +393,47 @@ static inline void vcpu_call_chain_remove_node(struct vcpu_locked vcpu1_locked,
 	vcpu2_locked.vcpu->call_chain.next_node = NULL;
 }
 
-void vcpu_set_running(struct vcpu_locked target_locked, struct ffa_value args);
+void vcpu_interrupt_clear_decrement(struct vcpu_locked vcpu_locked,
+				    uint32_t intid);
+
+void vcpu_set_running(struct vcpu_locked target_locked,
+		      const struct ffa_value *args);
+
+static inline void vcpu_ipi_set_info_get_retrieved(
+	struct vcpu_locked vcpu_locked)
+{
+	vcpu_locked.vcpu->ipi_info_get_retrieved = true;
+}
+
+static inline bool vcpu_ipi_is_info_get_retrieved(
+	struct vcpu_locked vcpu_locked)
+{
+	return vcpu_locked.vcpu->ipi_info_get_retrieved;
+}
+
+/**
+ * Clear the flag tracking if the IPI has been retrieved by
+ * FFA_NOTIFCATION_INFO_GET.
+ */
+static inline void vcpu_ipi_clear_info_get_retrieved(
+	struct vcpu_locked vcpu_locked)
+{
+	vcpu_locked.vcpu->ipi_info_get_retrieved = false;
+}
+
 void vcpu_save_interrupt_priority(struct vcpu_locked vcpu_locked,
 				  uint8_t priority);
 void vcpu_interrupt_inject(struct vcpu_locked target_locked, uint32_t intid);
-void vcpu_set_processing_interrupt(struct vcpu_locked vcpu_locked,
-				   uint32_t intid, struct vcpu *preempted);
 void vcpu_enter_secure_interrupt_rtm(struct vcpu_locked vcpu_locked);
+
+bool vcpu_interrupt_queue_push(struct vcpu_locked vcpu_locked,
+			       uint32_t vint_id);
+bool vcpu_interrupt_queue_pop(struct vcpu_locked vcpu_locked,
+			      uint32_t *vint_id);
+bool vcpu_interrupt_queue_peek(struct vcpu_locked vcpu_locked,
+			       uint32_t *vint_id);
+bool vcpu_is_interrupt_in_queue(struct vcpu_locked vcpu_locked,
+				uint32_t vint_id);
+bool vcpu_is_interrupt_queue_empty(struct vcpu_locked vcpu_locked);
+
+void vcpu_secure_interrupt_complete(struct vcpu_locked vcpu_locked);

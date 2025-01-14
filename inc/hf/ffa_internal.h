@@ -11,12 +11,11 @@
 #include <stdint.h>
 
 #include "hf/check.h"
+#include "hf/vm.h"
 
 #include "vmapi/hf/ffa.h"
 
-#define FFA_VERSION_RESERVED_BIT (UINT32_C(1) << 31)
-
-static inline struct ffa_value ffa_error(int32_t error_code)
+static inline struct ffa_value ffa_error(enum ffa_error error_code)
 {
 	return (struct ffa_value){.func = FFA_ERROR_32,
 				  .arg2 = (uint32_t)error_code};

@@ -9,29 +9,12 @@
 #include "hf/std.h"
 
 #include "hf/check.h"
+#include "hf/panic.h"
 
 /* Declare unsafe functions locally so they are not available globally. */
 void *memset(void *s, int c, size_t n);
-void *memcpy(void *dst, const void *src, size_t n);
+void *memcpy(void *restrict dst, const void *src, size_t n);
 void *memmove(void *dst, const void *src, size_t n);
-
-/*
- * As per the C11 specification, mem*_s() operations fill the destination buffer
- * if runtime constraint validation fails, assuming that `dest` and `destsz`
- * are both valid.
- */
-#define CHECK_OR_FILL(cond, dest, destsz, ch)                               \
-	do {                                                                \
-		if (!(cond)) {                                              \
-			if ((dest) != NULL && (destsz) <= RSIZE_MAX) {      \
-				memset_s((dest), (destsz), (ch), (destsz)); \
-			}                                                   \
-			panic("%s failed: " #cond, __func__);               \
-		}                                                           \
-	} while (0)
-
-#define CHECK_OR_ZERO_FILL(cond, dest, destsz) \
-	CHECK_OR_FILL(cond, dest, destsz, '\0')
 
 void memset_s(void *dest, rsize_t destsz, int ch, rsize_t count)
 {
@@ -48,26 +31,52 @@ void memset_s(void *dest, rsize_t destsz, int ch, rsize_t count)
 	memset(dest, ch, (count <= destsz ? count : destsz));
 }
 
-void memcpy_s(void *dest, rsize_t destsz, const void *src, rsize_t count)
+/* Check the preconditions for memcpy and panic if they are not upheld. */
+void memcpy_check_preconditions(void *dest, rsize_t destsz, const void *src,
+				rsize_t count, size_t alignment)
 {
 	uintptr_t d = (uintptr_t)dest;
 	uintptr_t s = (uintptr_t)src;
 
-	CHECK_OR_ZERO_FILL(dest != NULL, dest, destsz);
-	CHECK_OR_ZERO_FILL(src != NULL, dest, destsz);
+	if (dest == NULL) {
+		panic("memcpy: dest == NULL\n");
+	}
+	if (src == NULL) {
+		panic("memcpy: src == NULL\n");
+	}
 
 	/* Check count <= destsz <= RSIZE_MAX. */
-	CHECK_OR_ZERO_FILL(destsz <= RSIZE_MAX, dest, destsz);
-	CHECK_OR_ZERO_FILL(count <= destsz, dest, destsz);
+	if (destsz > RSIZE_MAX) {
+		panic("memcpy: destsz > RSIZE_MAX (%u > %u)\n", destsz,
+		      RSIZE_MAX);
+	}
+	if (count > destsz) {
+		panic("memcpy: destsz > count (%u > %u)\n", destsz, count);
+	}
 
 	/*
 	 * Buffer overlap test.
 	 * case a) `d < s` implies `s >= d+count`
 	 * case b) `d > s` implies `d >= s+count`
 	 */
-	CHECK_OR_ZERO_FILL(d != s, dest, destsz);
-	CHECK_OR_ZERO_FILL(d < s || d >= (s + count), dest, destsz);
-	CHECK_OR_ZERO_FILL(d > s || s >= (d + count), dest, destsz);
+	if (d == s || !(d < s || d >= (s + count)) ||
+	    !(d > s || s >= (d + count))) {
+		panic("memcpy: dest and src overlap\n");
+	}
+
+	if (!is_aligned(dest, alignment)) {
+		panic("memcpy: dest not aligned (%p %% %u == %u)\n", dest,
+		      alignment, d % alignment);
+	}
+	if (!is_aligned(src, alignment)) {
+		panic("memcpy: src not aligned (%p %% %u == %u)\n", src,
+		      alignment, s % alignment);
+	}
+}
+
+void memcpy_s(void *dest, rsize_t destsz, const void *src, rsize_t count)
+{
+	memcpy_check_preconditions(dest, destsz, src, count, 1);
 
 	/*
 	 * Clang analyzer doesn't like us calling unsafe memory functions, so
@@ -79,12 +88,21 @@ void memcpy_s(void *dest, rsize_t destsz, const void *src, rsize_t count)
 
 void memmove_s(void *dest, rsize_t destsz, const void *src, rsize_t count)
 {
-	CHECK_OR_ZERO_FILL(dest != NULL, dest, destsz);
-	CHECK_OR_ZERO_FILL(src != NULL, dest, destsz);
+	if (dest == NULL) {
+		panic("memove: dest == NULL\n");
+	}
+	if (src == NULL) {
+		panic("memove: src == NULL\n");
+	}
 
 	/* Check count <= destsz <= RSIZE_MAX. */
-	CHECK_OR_ZERO_FILL(destsz <= RSIZE_MAX, dest, destsz);
-	CHECK_OR_ZERO_FILL(count <= destsz, dest, destsz);
+	if (destsz > RSIZE_MAX) {
+		panic("memmove: destsz > RSIZE_MAX (%u > %u)\n", destsz,
+		      RSIZE_MAX);
+	}
+	if (count > destsz) {
+		panic("memmove: count > destsz (%u > %u)\n", count, destsz);
+	}
 
 	/*
 	 * Clang analyzer doesn't like us calling unsafe memory functions, so

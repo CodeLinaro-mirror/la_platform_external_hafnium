@@ -12,23 +12,49 @@
 #include "hf/memiter.h"
 #include "hf/mm.h"
 #include "hf/std.h"
+#include "hf/stdout.h"
 
 #include "vmapi/hf/call.h"
 
+#include "../msr.h"
 #include "test/hftest.h"
 #include "test/hftest_impl.h"
+#include "test/vmapi/arch/exception_handler.h"
 #include "test/vmapi/ffa.h"
-
-HFTEST_ENABLE();
 
 extern struct hftest_test hftest_begin[];
 extern struct hftest_test hftest_end[];
 
 static struct hftest_context global_context;
 
+static alignas(PAGE_SIZE) uint8_t secondary_ec_stack[MAX_CPUS][PAGE_SIZE];
+
+uint8_t *hftest_get_secondary_ec_stack(size_t id)
+{
+	assert(id < MAX_CPUS);
+	return secondary_ec_stack[id];
+}
+
 struct hftest_context *hftest_get_context(void)
 {
 	return &global_context;
+}
+
+static bool uint32list_has_next(const struct memiter *list)
+{
+	return memiter_size(list) > 0;
+}
+
+static void uint32list_get_next(struct memiter *list, uint32_t *out)
+{
+	uint64_t num;
+
+	CHECK(uint32list_has_next(list));
+	if (!fdt_parse_number(list, sizeof(uint32_t), &num)) {
+		return;
+	}
+
+	*out = (uint32_t)num;
 }
 
 noreturn void abort(void)
@@ -76,12 +102,16 @@ void hftest_context_init(struct hftest_context *ctx, void *send, void *recv)
  * initialized.
  * TODO: Parse other fields as needed.
  */
-static void hftest_parse_ffa_manifest(struct hftest_context *ctx,
-				      struct fdt *fdt)
+void hftest_parse_ffa_manifest(struct hftest_context *ctx, struct fdt *fdt)
 {
 	struct fdt_node root;
 	struct fdt_node ffa_node;
 	struct string mem_region_node_name = STRING_INIT("memory-regions");
+	struct string dev_region_node_name = STRING_INIT("device-regions");
+	struct memiter uuid;
+	uint32_t uuid_word = 0;
+	uint16_t j = 0;
+	uint16_t i = 0;
 	uint64_t number;
 
 	CHECK(ctx != NULL);
@@ -92,6 +122,37 @@ static void hftest_parse_ffa_manifest(struct hftest_context *ctx,
 	ASSERT_TRUE(fdt_read_number(&root, "load-address",
 				    &ctx->partition_manifest.load_addr));
 	EXPECT_TRUE(fdt_read_number(&root, "ffa-version", &number));
+	ctx->partition_manifest.ffa_version = number;
+
+	EXPECT_TRUE(fdt_read_number(&root, "execution-ctx-count", &number));
+	ctx->partition_manifest.execution_ctx_count = (uint16_t)number;
+
+	EXPECT_TRUE(fdt_read_number(&root, "exception-level", &number));
+	ctx->partition_manifest.run_time_el = (uint16_t)number;
+
+	EXPECT_TRUE(fdt_read_property(&root, "uuid", &uuid));
+
+	/* Parse UUIDs and populate uuid count.*/
+	while (uint32list_has_next(&uuid) && j < PARTITION_MAX_UUIDS) {
+		while (uint32list_has_next(&uuid) && i < 4) {
+			uint32list_get_next(&uuid, &uuid_word);
+			ctx->partition_manifest.uuids[j].uuid[i] = uuid_word;
+			i++;
+		}
+
+		EXPECT_FALSE(
+			ffa_uuid_is_null(&ctx->partition_manifest.uuids[j]));
+
+		dlog_verbose("  UUID %#x-%x-%x-%x\n",
+			     ctx->partition_manifest.uuids[j].uuid[0],
+			     ctx->partition_manifest.uuids[j].uuid[1],
+			     ctx->partition_manifest.uuids[j].uuid[2],
+			     ctx->partition_manifest.uuids[j].uuid[3]);
+		j++;
+		i = 0;
+	}
+
+	ctx->partition_manifest.uuid_count = j;
 
 	ffa_node = root;
 
@@ -109,9 +170,10 @@ static void hftest_parse_ffa_manifest(struct hftest_context *ctx,
 
 			if (!fdt_read_number(&ffa_node, "base-address",
 					     &cur_region->base_address)) {
-				EXPECT_TRUE(fdt_read_number(&ffa_node,
-							    "relative-address",
-							    &number));
+				EXPECT_TRUE(fdt_read_number(
+					&ffa_node,
+					"load-address-relative-offset",
+					&number));
 				cur_region->base_address =
 					ctx->partition_manifest.load_addr +
 					number;
@@ -128,10 +190,47 @@ static void hftest_parse_ffa_manifest(struct hftest_context *ctx,
 		ctx->partition_manifest.mem_region_count = mem_count;
 	}
 
+	ffa_node = root;
+
+	/* Look for the device region node. */
+	if (fdt_find_child(&ffa_node, &dev_region_node_name) &&
+	    fdt_first_child(&ffa_node)) {
+		uint32_t dev_region_count = 0;
+
+		do {
+			struct device_region *cur_region =
+				&ctx->partition_manifest
+					 .dev_regions[dev_region_count];
+			EXPECT_TRUE(fdt_read_number(&ffa_node, "pages-count",
+						    &number));
+			cur_region->page_count = (uint32_t)number;
+
+			if (!fdt_read_number(&ffa_node, "base-address",
+					     &cur_region->base_address)) {
+				EXPECT_TRUE(fdt_read_number(
+					&ffa_node,
+					"load-address-relative-offset",
+					&number));
+				cur_region->base_address =
+					ctx->partition_manifest.load_addr +
+					number;
+			}
+
+			EXPECT_TRUE(fdt_read_number(&ffa_node, "attributes",
+						    &number));
+			cur_region->attributes = (uint32_t)number;
+			dev_region_count++;
+		} while (fdt_next_sibling(&ffa_node));
+
+		assert(dev_region_count < PARTITION_MAX_DEVICE_REGIONS);
+
+		ctx->partition_manifest.dev_region_count = dev_region_count;
+	}
+
 	ctx->is_ffa_manifest_parsed = true;
 }
 
-static void run_service_set_up(struct hftest_context *ctx, struct fdt *fdt)
+void hftest_service_set_up(struct hftest_context *ctx, struct fdt *fdt)
 {
 	struct fdt_node node;
 	struct hftest_test *hftest_info;
@@ -170,19 +269,24 @@ static void run_service_set_up(struct hftest_context *ctx, struct fdt *fdt)
 
 noreturn void hftest_service_main(const void *fdt_ptr)
 {
+	struct hftest_context *ctx;
 	struct memiter args;
 	hftest_test_fn service;
-	struct hftest_context *ctx;
 	struct ffa_value ret;
 	struct fdt fdt;
-	ffa_id_t own_id = hf_vm_get_id();
-	struct mailbox_buffers mb = set_up_mailbox();
+	const ffa_id_t own_id = hf_vm_get_id();
 	ffa_notifications_bitmap_t bitmap;
-	struct ffa_partition_msg *message = (struct ffa_partition_msg *)mb.recv;
+	struct ffa_partition_msg *message;
+	uint32_t vcpu = get_current_vcpu_index();
 
-	/* Clean the context. */
 	ctx = hftest_get_context();
-	hftest_context_init(ctx, mb.send, mb.recv);
+
+	/* If boot vcpu, set up mailbox and intialize context abort function. */
+	if (vcpu == 0) {
+		struct mailbox_buffers mb;
+		mb = set_up_mailbox();
+		hftest_context_init(ctx, mb.send, mb.recv);
+	}
 
 	if (!fdt_struct_from_ptr(fdt_ptr, &fdt)) {
 		HFTEST_LOG(HFTEST_LOG_INDENT "Unable to access the FDT");
@@ -206,22 +310,28 @@ noreturn void hftest_service_main(const void *fdt_ptr)
 		 * manifest for the SP.
 		 */
 		hftest_parse_ffa_manifest(ctx, &fdt);
+		stdout_init(ctx->partition_manifest.ffa_version);
 
 		/* TODO: Determine memory size referring to the SP Pkg. */
 		ctx->memory_size = 1048576;
 	}
 
-	run_service_set_up(ctx, &fdt);
+	/* If boot vcpu, it means it is running in RTM_INIT. */
+	if (vcpu == 0) {
+		run_service_set_up(ctx, &fdt);
+	}
 
 	/* Receive the name of the service to run. */
 	ret = ffa_msg_wait();
 	EXPECT_EQ(ret.func, FFA_RUN_32);
 
+	message = (struct ffa_partition_msg *)SERVICE_RECV_BUFFER();
+
 	/*
 	 * Expect to wake up with indirect message related to the next service
 	 * to be executed.
 	 */
-	ret = ffa_notification_get(own_id, 0,
+	ret = ffa_notification_get(own_id, vcpu,
 				   FFA_NOTIFICATION_FLAG_BITMAP_SPM |
 					   FFA_NOTIFICATION_FLAG_BITMAP_HYP);
 	ASSERT_EQ(ret.func, FFA_SUCCESS_32);
@@ -229,6 +339,12 @@ noreturn void hftest_service_main(const void *fdt_ptr)
 	ASSERT_TRUE(is_ffa_spm_buffer_full_notification(bitmap) ||
 		    is_ffa_hyp_buffer_full_notification(bitmap));
 	ASSERT_EQ(own_id, ffa_rxtx_header_receiver(&message->header));
+
+	if (ctx->is_ffa_manifest_parsed &&
+	    ctx->partition_manifest.run_time_el == S_EL1) {
+		ASSERT_EQ(hf_interrupt_get(), HF_NOTIFICATION_PENDING_INTID);
+	}
+
 	memiter_init(&args, message->payload, message->header.size);
 
 	/* Find service handler. */
@@ -269,4 +385,31 @@ void hftest_set_dir_req_source_id(ffa_id_t id)
 {
 	struct hftest_context *ctx = hftest_get_context();
 	ctx->dir_req_source_id = id;
+}
+
+void hftest_map_device_regions(struct hftest_context *ctx)
+{
+	struct device_region *dev_region;
+	uint32_t dev_region_count;
+
+	/*
+	 * The running partition must have received and parsed its own
+	 * partition manifest by now.
+	 */
+	if (!ctx || !ctx->is_ffa_manifest_parsed) {
+		panic("Partition manifest not parsed.\n");
+	}
+
+	dev_region_count = ctx->partition_manifest.dev_region_count;
+
+	/* Map the MMIO address space of the devices. */
+	for (uint32_t i = 0; i < dev_region_count; i++) {
+		dev_region = &ctx->partition_manifest.dev_regions[i];
+
+		hftest_mm_identity_map(
+			// NOLINTNEXTLINE(performance-no-int-to-ptr)
+			(const void *)dev_region->base_address,
+			dev_region->page_count * PAGE_SIZE,
+			dev_region->attributes);
+	}
 }

@@ -9,9 +9,9 @@ third_party {
     type: "Git"
     value: "https://git.trustedfirmware.org/hafnium/hafnium.git"
     primary_source: true
-    version: "v2.10"
+    version: "v2.12"
   }
-  version: "v2.10"
-  last_upgrade_date { year: 2024 month: 12 day: 30 }
+  version: "v2.12"
+  last_upgrade_date { year: 2025 month: 01 day: 13 }
   license_type: NOTICE
 }

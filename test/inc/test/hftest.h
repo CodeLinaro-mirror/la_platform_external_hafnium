@@ -13,9 +13,13 @@
 #include <stdint.h>
 #include <stdnoreturn.h>
 
+#include "hf/arch/types.h"
+
+#include "hf/call.h"
 #include "hf/dlog.h"
 #include "hf/fdt.h"
 #include "hf/memiter.h"
+#include "hf/spinlock.h"
 
 /*
  * Define a set up function to be run before every test in a test suite.
@@ -78,6 +82,12 @@
 #define ASSERT_GE(x, y) HFTEST_ASSERT_OP(x, y, >=, true)
 #define ASSERT_GT(x, y) HFTEST_ASSERT_OP(x, y, >, true)
 
+#define ASSERT_STRING_EQ(x, y) HFTEST_ASSERT_STRING_OP(x, y, ==, true)
+#define EXPECT_STRING_EQ(x, y) HFTEST_ASSERT_STRING_OP(x, y, ==, false)
+
+#define ASSERT_STRING_NE(x, y) HFTEST_ASSERT_STRING_OP(x, y, !=, true)
+#define EXPECT_STRING_NE(x, y) HFTEST_ASSERT_STRING_OP(x, y, !=, false)
+
 #define ASSERT_TRUE(x) ASSERT_EQ(x, true)
 #define ASSERT_FALSE(x) ASSERT_EQ(x, false)
 
@@ -98,17 +108,13 @@
 /* Service utilities. */
 #define SERVICE_NAME_MAX_LENGTH 64
 #define SERVICE_SELECT(vm_id, service, send_buffer) \
-	HFTEST_SERVICE_SELECT(vm_id, service, send_buffer)
+	HFTEST_SERVICE_SELECT(vm_id, service, send_buffer, 0)
+#define SERVICE_SELECT_MP(vm_id, service, send_buffer, vcpu_id) \
+	HFTEST_SERVICE_SELECT(vm_id, service, send_buffer, vcpu_id)
 
 #define SERVICE_SEND_BUFFER() HFTEST_SERVICE_SEND_BUFFER()
 #define SERVICE_RECV_BUFFER() HFTEST_SERVICE_RECV_BUFFER()
 #define SERVICE_MEMORY_SIZE() HFTEST_SERVICE_MEMORY_SIZE()
-
-/*
- * This must be used exactly once in a test image to signal to the linker that
- * the .hftest section is allowed to be included in the generated image.
- */
-#define HFTEST_ENABLE() __attribute__((used)) int hftest_enable
 
 /*
  * Prefixed to log lines from tests for easy filtering in the console.
@@ -171,10 +177,18 @@ void hftest_device_exit_test_environment(void);
  * with the provided argument. It is a wrapper around the generic cpu_start()
  * and takes care of MMU initialization.
  */
-bool hftest_cpu_start(uintptr_t id, void *stack, size_t stack_size,
+bool hftest_cpu_start(cpu_id_t id, const uint8_t *secondary_ec_stack,
 		      void (*entry)(uintptr_t arg), uintptr_t arg);
 
-uintptr_t hftest_get_cpu_id(size_t index);
+cpu_id_t hftest_get_cpu_id(size_t index);
+
+uint8_t *hftest_get_secondary_ec_stack(size_t id);
+
+/*
+ * The type of CPU entry points: a function that takes one `uintptr_t` argument
+ * and returns `void`.
+ */
+typedef void(cpu_entry_point)(uintptr_t);
 
 noreturn void hftest_service_main(const void *fdt_ptr);
 
@@ -192,3 +206,11 @@ void hftest_set_dir_req_source_id(ffa_id_t id);
 #include "hftest_impl.h"
 
 void hftest_context_init(struct hftest_context *ctx, void *send, void *recv);
+
+void hftest_parse_ffa_manifest(struct hftest_context *ctx, struct fdt *fdt);
+
+void hftest_map_device_regions(struct hftest_context *ctx);
+
+void hftest_service_set_up(struct hftest_context *ctx, struct fdt *fdt);
+
+void run_service_set_up(struct hftest_context *ctx, struct fdt *fdt);

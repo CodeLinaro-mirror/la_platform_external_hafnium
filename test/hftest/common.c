@@ -19,13 +19,13 @@
 #define HFTEST_CTRL_JSON_START "[hftest_ctrl:json_start]"
 #define HFTEST_CTRL_JSON_END "[hftest_ctrl:json_end]"
 
-HFTEST_ENABLE();
-
 static struct hftest_test hftest_constructed[HFTEST_MAX_TESTS];
 static size_t hftest_count;
 static struct hftest_test *hftest_list;
 
 static struct hftest_context global_context;
+
+static alignas(PAGE_SIZE) uint8_t secondary_ec_stack[MAX_CPUS][PAGE_SIZE];
 
 struct hftest_context *hftest_get_context(void)
 {
@@ -295,10 +295,16 @@ static uintptr_t vcpu_index_to_id(size_t index)
 	return index;
 }
 
+uint8_t *hftest_get_secondary_ec_stack(size_t id)
+{
+	assert(id < MAX_CPUS);
+	return secondary_ec_stack[id];
+}
+
 /**
  * Get the ID of the CPU with the given index.
  */
-uintptr_t hftest_get_cpu_id(size_t index)
+cpu_id_t hftest_get_cpu_id(size_t index)
 {
 	struct boot_params params;
 	const struct fdt *fdt = hftest_get_context()->fdt;
@@ -310,6 +316,12 @@ uintptr_t hftest_get_cpu_id(size_t index)
 		 */
 		return vcpu_index_to_id(index);
 	}
+
+	/*
+	 * VM is primary VM. Convert vCPU ids to the linear cpu id as passed to
+	 * the primary VM in the FDT structure.
+	 */
+	index = MAX_CPUS - index;
 
 	/* Find physical CPU ID from FDT. */
 	fdt_find_cpus(fdt, params.cpu_ids, &params.cpu_count);

@@ -12,6 +12,7 @@
 
 #include "vmapi/hf/call.h"
 
+#include "ffa_secure_partitions.h"
 #include "partition_services.h"
 #include "test/hftest.h"
 #include "test/vmapi/ffa.h"
@@ -43,8 +44,9 @@ static void check_v1_1_partition_info_descriptors(
 	ffa_uuid_init(0x9458bb2d, 0x353b4ee2, 0xaa25710c, 0x99b73ddc, &uuid);
 	EXPECT_TRUE(ffa_uuid_equal(&partitions[1].uuid, &uuid));
 	EXPECT_EQ(partitions[1].properties,
-		  FFA_PARTITION_AARCH64_EXEC | FFA_PARTITION_NOTIFICATION |
-			  FFA_PARTITION_DIRECT_REQ_RECV);
+		  FFA_PARTITION_AARCH64_EXEC | FFA_PARTITION_DIRECT_REQ_RECV |
+			  FFA_PARTITION_VM_CREATED |
+			  FFA_PARTITION_VM_DESTROYED);
 
 	/* Expect a secondary SP as third partition. */
 	EXPECT_EQ(partitions[2].vm_id, SP_ID(2));
@@ -53,8 +55,12 @@ static void check_v1_1_partition_info_descriptors(
 	ffa_uuid_init(0xa609f132, 0x6b4f, 0x4c14, 0x9489, &uuid);
 	EXPECT_TRUE(ffa_uuid_equal(&partitions[2].uuid, &uuid));
 	EXPECT_EQ(partitions[2].properties,
-		  FFA_PARTITION_AARCH64_EXEC | FFA_PARTITION_NOTIFICATION |
-			  FFA_PARTITION_DIRECT_REQ_RECV);
+		  FFA_PARTITION_DIRECT_REQ_RECV | FFA_PARTITION_INDIRECT_MSG |
+			  FFA_PARTITION_NOTIFICATION |
+			  FFA_PARTITION_AARCH64_EXEC |
+			  FFA_PARTITION_VM_CREATED |
+			  FFA_PARTITION_VM_DESTROYED |
+			  FFA_PARTITION_DIRECT_REQ2_RECV);
 
 	/* Expect a tertiary SP as fourth partition. */
 	EXPECT_EQ(partitions[3].vm_id, SP_ID(3));
@@ -63,7 +69,8 @@ static void check_v1_1_partition_info_descriptors(
 	EXPECT_TRUE(ffa_uuid_equal(&partitions[3].uuid, &uuid));
 	EXPECT_EQ(partitions[3].properties,
 		  FFA_PARTITION_AARCH64_EXEC | FFA_PARTITION_NOTIFICATION |
-			  FFA_PARTITION_DIRECT_REQ_RECV);
+			  FFA_PARTITION_DIRECT_REQ_RECV |
+			  FFA_PARTITION_INDIRECT_MSG);
 }
 
 TEST(ffa, ffa_partition_info_get_regs_sp_test)
@@ -228,8 +235,12 @@ TEST(ffa, ffa_partition_info_get_uuid_fixed)
 	EXPECT_TRUE(partitions[0].vcpu_count == 8 ||
 		    partitions[0].vcpu_count == 1);
 	EXPECT_EQ(partitions[0].properties,
-		  FFA_PARTITION_AARCH64_EXEC | FFA_PARTITION_NOTIFICATION |
-			  FFA_PARTITION_DIRECT_REQ_RECV);
+		  FFA_PARTITION_DIRECT_REQ_RECV | FFA_PARTITION_INDIRECT_MSG |
+			  FFA_PARTITION_NOTIFICATION |
+			  FFA_PARTITION_AARCH64_EXEC |
+			  FFA_PARTITION_VM_CREATED |
+			  FFA_PARTITION_VM_DESTROYED |
+			  FFA_PARTITION_DIRECT_REQ2_RECV);
 
 	/*
 	 * If a uuid is specified (not null) ensure the uuid returned in the
@@ -259,13 +270,13 @@ TEST(ffa, ffa_partition_info_get_v1_0_descriptors)
 	struct ffa_value ret;
 	const struct ffa_partition_info_v1_0 *partitions_v1_0;
 	struct ffa_uuid uuid;
-	uint32_t version;
+	enum ffa_version version;
 
 	/*
 	 * First call FF-A version to tell the SPMC our version
 	 * is v1.0.
 	 */
-	version = ffa_version(MAKE_FFA_VERSION(1, 0));
+	version = ffa_version(FFA_VERSION_1_0);
 	EXPECT_EQ(version, FFA_VERSION_COMPILED);
 
 	/* Setup the mailbox (which holds the RX buffer). */
@@ -297,7 +308,7 @@ TEST(ffa, ffa_partition_info_get_v1_0_descriptors)
 	EXPECT_TRUE(partitions_v1_0[0].vcpu_count == 8 ||
 		    partitions_v1_0[0].vcpu_count == 1);
 	EXPECT_EQ(partitions_v1_0[0].properties,
-		  FFA_PARTITION_INDIRECT_MSG | FFA_PARTITION_DIRECT_REQ_SEND);
+		  FFA_PARTITION_DIRECT_REQ_SEND | FFA_PARTITION_INDIRECT_MSG);
 	EXPECT_EQ(partitions_v1_0[0].properties & FFA_PARTITION_v1_0_RES_MASK,
 		  0);
 
@@ -312,14 +323,16 @@ TEST(ffa, ffa_partition_info_get_v1_0_descriptors)
 	EXPECT_EQ(partitions_v1_0[2].vm_id, SP_ID(2));
 	EXPECT_TRUE(partitions_v1_0[2].vcpu_count == 8 ||
 		    partitions_v1_0[2].vcpu_count == 1);
-	EXPECT_EQ(partitions_v1_0[2].properties, FFA_PARTITION_DIRECT_REQ_RECV);
+	EXPECT_EQ(partitions_v1_0[2].properties,
+		  FFA_PARTITION_DIRECT_REQ_RECV | FFA_PARTITION_INDIRECT_MSG);
 	EXPECT_EQ(partitions_v1_0[2].properties & FFA_PARTITION_v1_0_RES_MASK,
 		  0);
 
 	/* Expect a tertiary SP as fourth partition. */
 	EXPECT_EQ(partitions_v1_0[3].vm_id, SP_ID(3));
 	EXPECT_EQ(partitions_v1_0[3].vcpu_count, 8);
-	EXPECT_EQ(partitions_v1_0[3].properties, FFA_PARTITION_DIRECT_REQ_RECV);
+	EXPECT_EQ(partitions_v1_0[3].properties,
+		  FFA_PARTITION_DIRECT_REQ_RECV | FFA_PARTITION_INDIRECT_MSG);
 	EXPECT_EQ(partitions_v1_0[3].properties & FFA_PARTITION_v1_0_RES_MASK,
 		  0);
 
@@ -338,4 +351,44 @@ TEST(ffa, ffa_spm_id_get)
 
 	/* Expect the SPMC FF-A ID at NS virtual FF-A instance. */
 	EXPECT_EQ(ret.arg2, HF_SPMC_VM_ID);
+}
+
+TEST_PRECONDITION(ffa, npi_not_supported, service2_is_el0)
+{
+	const ffa_id_t own_id = hf_vm_get_id();
+	/* SP is expected to be S-EL0 partition */
+	const ffa_id_t receiver_id = SP_ID(2);
+	struct ffa_value res;
+
+	res = sp_ffa_features_cmd_send(own_id, receiver_id, FFA_FEATURE_NPI);
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(res.arg3, FFA_ERROR_32);
+	EXPECT_EQ((int32_t)res.arg4, FFA_NOT_SUPPORTED);
+}
+
+TEST_PRECONDITION(ffa, secondary_ep_register_supported, service2_is_mp_sp)
+{
+	const ffa_id_t own_id = hf_vm_get_id();
+	/* SP is expected to be S-EL0 partition */
+	const ffa_id_t receiver_id = SP_ID(2);
+	struct ffa_value res;
+
+	res = sp_ffa_features_cmd_send(own_id, receiver_id,
+				       FFA_SECONDARY_EP_REGISTER_64);
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(res.arg3, FFA_SUCCESS_32);
+}
+
+TEST_PRECONDITION(ffa, secondary_ep_register_not_supported, service2_is_up_sp)
+{
+	const ffa_id_t own_id = hf_vm_get_id();
+	/* SP is expected to be S-EL0 partition */
+	const ffa_id_t receiver_id = SP_ID(2);
+	struct ffa_value res;
+
+	res = sp_ffa_features_cmd_send(own_id, receiver_id,
+				       FFA_SECONDARY_EP_REGISTER_64);
+	EXPECT_EQ(res.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(res.arg3, FFA_ERROR_32);
+	EXPECT_EQ((int32_t)res.arg4, FFA_NOT_SUPPORTED);
 }

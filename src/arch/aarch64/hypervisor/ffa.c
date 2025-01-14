@@ -18,14 +18,6 @@
 static ffa_id_t spmc_id = HF_INVALID_VM_ID;
 
 /**
- * Returns information for features with arch specific implementation.
- */
-struct ffa_value arch_ffa_features(uint32_t function_feature_id)
-{
-	return plat_ffa_features(function_feature_id);
-}
-
-/**
  * Returns the SPMC ID returned from the SPMD.
  */
 ffa_id_t arch_ffa_spmc_id_get(void)
@@ -44,7 +36,7 @@ void arch_ffa_init(void)
 
 	if (ret.func == FFA_SUCCESS_32) {
 		spmc_id = ret.arg2;
-	} else if (ret.func == SMCCC_ERROR_UNKNOWN ||
+	} else if (ret.func == (uint64_t)SMCCC_ERROR_UNKNOWN ||
 		   (ret.func == FFA_ERROR_32 &&
 		    ffa_error_code(ret) == FFA_NOT_SUPPORTED)) {
 		spmc_id = HF_SPMC_VM_ID;

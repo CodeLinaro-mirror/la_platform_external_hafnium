@@ -31,6 +31,33 @@ struct ffa_partition_info_v1_0 {
 };
 
 /**
+ * This corresponds to table 5.16 of the FF-A v1.0 specification,
+ * "Endpoint memory access descriptor".
+ */
+struct ffa_memory_access_v1_0 {
+	struct ffa_memory_region_attributes receiver_permissions;
+	/**
+	 * Offset in bytes from the start of the outer `ffa_memory_region` to
+	 * an `ffa_composite_memory_region` struct.
+	 */
+	uint32_t composite_memory_region_offset;
+	uint64_t reserved_0;
+};
+
+typedef struct {
+	uint8_t shareability : 2;
+	uint8_t cacheability : 2;
+	uint8_t type : 2;
+	uint8_t security : 2;
+} ffa_memory_attributes_v1_0;
+
+ffa_memory_attributes_v1_0 ffa_memory_attributes_truncate(
+	ffa_memory_attributes_t attrs);
+
+ffa_memory_attributes_t ffa_memory_attributes_extend(
+	ffa_memory_attributes_v1_0 attrs);
+
+/**
  * Information about a set of pages which are being shared. This corresponds to
  * table 45 of the FF-A 1.0 EAC specification, "Lend, donate or share memory
  * transaction descriptor". Note that it is also used for retrieve requests and
@@ -42,7 +69,7 @@ struct ffa_memory_region_v1_0 {
 	 * owner.
 	 */
 	ffa_id_t sender;
-	uint8_t attributes;
+	ffa_memory_attributes_v1_0 attributes;
 	/** Reserved field, must be 0. */
 	uint8_t reserved_0;
 	/** Flags to control behaviour of the transaction. */
@@ -66,7 +93,7 @@ struct ffa_memory_region_v1_0 {
 	 * attributes with which this memory region should be mapped in that
 	 * endpoint's page table.
 	 */
-	struct ffa_memory_access receivers[];
+	struct ffa_memory_access_v1_0 receivers[];
 };
 
 /**
@@ -93,10 +120,16 @@ void ffa_memory_region_init_header_v1_0(
 	ffa_memory_attributes_t attributes, ffa_memory_region_flags_t flags,
 	ffa_memory_handle_t handle, uint32_t tag, uint32_t receiver_count);
 
+void ffa_memory_access_init_v1_0(struct ffa_memory_access_v1_0 *receiver,
+				 ffa_id_t receiver_id,
+				 enum ffa_data_access data_access,
+				 enum ffa_instruction_access instruction_access,
+				 ffa_memory_receiver_flags_t flags);
+
 uint32_t ffa_memory_region_init_v1_0(
 	struct ffa_memory_region_v1_0 *memory_region,
 	size_t memory_region_max_size, ffa_id_t sender,
-	struct ffa_memory_access receivers[], uint32_t receiver_count,
+	struct ffa_memory_access_v1_0 receivers[], uint32_t receiver_count,
 	const struct ffa_memory_region_constituent constituents[],
 	uint32_t constituent_count, uint32_t tag,
 	ffa_memory_region_flags_t flags, enum ffa_memory_type type,
@@ -107,7 +140,7 @@ uint32_t ffa_memory_region_init_v1_0(
 uint32_t ffa_memory_retrieve_request_init_v1_0(
 	struct ffa_memory_region_v1_0 *memory_region,
 	ffa_memory_handle_t handle, ffa_id_t sender,
-	struct ffa_memory_access receivers[], uint32_t receiver_count,
+	struct ffa_memory_access_v1_0 receivers[], uint32_t receiver_count,
 	uint32_t tag, ffa_memory_region_flags_t flags,
 	enum ffa_memory_type type, enum ffa_memory_cacheability cacheability,
 	enum ffa_memory_shareability shareability);

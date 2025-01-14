@@ -15,19 +15,21 @@
 
 #define DLOG_BUFFER_SIZE 8192
 
-#define LOG_LEVEL_NONE UINT32_C(0)
-#define LOG_LEVEL_ERROR UINT32_C(1)
-#define LOG_LEVEL_NOTICE UINT32_C(2)
-#define LOG_LEVEL_WARNING UINT32_C(3)
-#define LOG_LEVEL_INFO UINT32_C(4)
-#define LOG_LEVEL_VERBOSE UINT32_C(5)
+enum log_level {
+	LOG_LEVEL_NONE = 0,
+	LOG_LEVEL_ERROR = 1,
+	LOG_LEVEL_NOTICE = 2,
+	LOG_LEVEL_WARNING = 3,
+	LOG_LEVEL_INFO = 4,
+	LOG_LEVEL_VERBOSE = 5,
+};
 
 extern size_t dlog_buffer_offset;
 extern char dlog_buffer[];
 
 void dlog_enable_lock(void);
-void dlog(const char *fmt, ...);
-void vdlog(const char *fmt, va_list args);
+__attribute__((format(printf, 1, 2))) size_t dlog(const char *fmt, ...);
+size_t vdlog(const char *fmt, va_list args);
 
 /*
  * The do { ... } while (0) syntax is used to ensure that callers of
@@ -73,5 +75,3 @@ void vdlog(const char *fmt, va_list args);
 			dlog("VERBOSE: " __VA_ARGS__); \
 		}                                      \
 	} while (0)
-
-void dlog_flush_vm_buffer(ffa_id_t id, char buffer[], size_t length);

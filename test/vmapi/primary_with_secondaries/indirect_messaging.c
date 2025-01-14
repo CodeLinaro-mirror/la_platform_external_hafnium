@@ -19,8 +19,11 @@
 
 SET_UP(indirect_messaging)
 {
-	/* Call FFA_VERSION to inform the hypervisor we are v1.1. */
-	ffa_version(MAKE_FFA_VERSION(1, 1));
+	/*
+	 * Call FFA_VERSION to inform the hypervisor of the compiled FF-A
+	 * Version.
+	 */
+	EXPECT_EQ(ffa_version(FFA_VERSION_COMPILED), FFA_VERSION_COMPILED);
 }
 
 /**

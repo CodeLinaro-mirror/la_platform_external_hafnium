@@ -13,7 +13,12 @@
 
 /* Return values for the test commands. */
 #define SP_SUCCESS 0
-#define SP_ERROR -1
+#define SP_ERROR (-1)
+
+/* Various fields encoded in `options` parameter. */
+#define OPTIONS_MASK_INTERRUPTS (1 << 0)
+#define OPTIONS_HINT_INTERRUPTED (1 << 1)
+#define OPTIONS_YIELD_DIR_REQ (1 << 2)
 
 static inline struct ffa_value sp_success(ffa_id_t sender, ffa_id_t receiver,
 					  uint64_t val)
@@ -23,7 +28,7 @@ static inline struct ffa_value sp_success(ffa_id_t sender, ffa_id_t receiver,
 }
 
 static inline struct ffa_value sp_error(ffa_id_t sender, ffa_id_t receiver,
-					uint32_t error_code)
+					enum ffa_error error_code)
 {
 	return ffa_msg_send_direct_resp(sender, receiver, SP_ERROR, error_code,
 					0, 0, 0);
@@ -46,16 +51,161 @@ static inline int sp_get_cmd(struct ffa_value res)
 	return (int)res.arg3;
 }
 
-static inline int sp_resp_value(struct ffa_value res)
+static inline uint32_t sp_resp_value(struct ffa_value res)
 {
-	return (int)res.arg4;
+	return res.arg4;
 }
+
+ffa_id_t sp_find_next_endpoint(ffa_id_t self_id);
+
+enum sp_cmd {
+	/**
+	 * Command to request SP to echo payload back to the sender.
+	 */
+	SP_ECHO_CMD = 1,
+
+	/**
+	 * Command to request SP to run echo test with second SP.
+	 */
+	SP_REQ_ECHO_CMD,
+
+	/**
+	 * Command to request SP to run echo busy test with second SP.
+	 */
+	SP_REQ_ECHO_BUSY_CMD,
+
+	/**
+	 * Command to request SP to set notifications.
+	 */
+	SP_NOTIF_SET_CMD,
+
+	/**
+	 * Command to request SP to get notifications.
+	 */
+	SP_NOTIF_GET_CMD,
+
+	/**
+	 * Command to request SP to bind notifications to the specified sender.
+	 */
+	SP_NOTIF_BIND_CMD,
+
+	/**
+	 * Command to request SP to unbind notifications from the specified
+	 * sender.
+	 */
+	SP_NOTIF_UNBIND_CMD,
+
+	/**
+	 * Command to request SP to validate if core index passed to the SP is
+	 * as expected.
+	 */
+	SP_CHECK_CPU_IDX_CMD,
+
+	/**
+	 * Command to request SP to actively wait in a busy loop.
+	 */
+	SP_WAIT_BUSY_LOOP_CMD,
+
+	/**
+	 * Command to request an SP to perform various state transitions through
+	 * FF-A ABIs.
+	 */
+	SP_CHECK_STATE_TRANSITIONS_CMD,
+
+	/**
+	 * Command to request SP to enable/disable a secure virtual interrupt.
+	 */
+	SP_VIRTUAL_INTERRUPT_CMD,
+
+	/**
+	 * Request to start trusted watchdog timer.
+	 */
+	SP_TWDOG_START_CMD,
+
+	/**
+	 * Request SP to return the last serviced secure virtual interrupt.
+	 */
+	SP_LAST_INTERRUPT_SERVICED_CMD,
+
+	/**
+	 * Request SP to clear the last serviced secure virtual interrupt.
+	 */
+	SP_CLEAR_LAST_INTERRUPT_CMD,
+
+	/**
+	 * Command to request SP to sleep for the given time in ms.
+	 */
+	SP_SLEEP_CMD,
+
+	/**
+	 * Command to request SP to forward sleep command for the given time in
+	 * ms.
+	 *
+	 * The sender of this command expects to receive SP_SUCCESS if the
+	 * request to forward sleep command was handled successfully, or
+	 * SP_ERROR otherwise. Moreover, the sender can send a hint to the
+	 * destination SP to expect that the forwaded sleep command could be
+	 * preempted by a non-secure interrupt.
+	 */
+	SP_FWD_SLEEP_CMD,
+
+	/**
+	 * Command to request SP to resume the task requested by current
+	 * endpoint after managed exit.
+	 */
+	SP_RESUME_AFTER_MANAGED_EXIT,
+
+	/**
+	 * Command to request an SP to perform checks using
+	 * ffa_partition_info_get_regs ABI.
+	 */
+	SP_CHECK_PARTITION_INFO_GET_REGS_CMD,
+
+	/**
+	 * Command to request an SP to yield while handling a secure interrupt.
+	 */
+	SP_YIELD_SEC_INTERRUPT_HANDLING_CMD,
+
+	/**
+	 * Command to request an SP to prepare to initiate an SPMC call chain.
+	 */
+	SP_PREPARE_SPMC_CALL_CHAIN_CMD,
+
+	/**
+	 * Command to request an SP to prepare to preempt itself while handling
+	 * a virtual interrupt.
+	 */
+	SP_PREPARE_PREEMPT_INT_HANDLING,
+
+	/**
+	 * Command to request an SP to reconfigure the secure interrupt to be
+	 * targetted to a given vCPU identified by its linear id.
+	 */
+	SP_ROUTE_SEC_INT_TARGET_VCPU_CMD,
+
+	/**
+	 * Command to request SP to pend an interrupt in the extended SPI range.
+	 */
+	SP_TRIGGER_ESPI_CMD,
+
+	SP_FFA_FEATURES_CMD,
+	SP_FFA_MEM_RETRIEVE_CMD,
+
+	/**
+	 * Request to start generic timer.
+	 */
+	SP_GENERIC_TIMER_START_CMD,
+	SP_PAUTH_FAULT_CMD,
+
+	/**
+	 * Request to start arch timer and sleep as necessary.
+	 */
+	SP_ARCH_TIMER_CMD,
+};
 
 /**
  * Command to request SP to echo payload back to the sender.
  */
-#define SP_ECHO_CMD 0x6563686f
-
 static inline struct ffa_value sp_echo_cmd_send(ffa_id_t sender,
 						ffa_id_t receiver,
 						uint32_t val1, uint32_t val2,
@@ -71,8 +221,6 @@ struct ffa_value sp_echo_cmd(ffa_id_t receiver, uint32_t val1, uint32_t val2,
 /**
  * Command to request SP to run echo test with second SP.
  */
-#define SP_REQ_ECHO_CMD 0x65636870
-
 static inline struct ffa_value sp_req_echo_cmd_send(
 	ffa_id_t sender, ffa_id_t receiver, uint32_t val1, uint32_t val2,
 	uint32_t val3, uint32_t val4)
@@ -85,24 +233,20 @@ struct ffa_value sp_req_echo_cmd(ffa_id_t test_source, uint32_t val1,
 				 uint32_t val2, uint32_t val3, uint32_t val4);
 
 /**
- * Command to request SP to run echo denied test with second SP.
+ * Command to request SP to run echo busy test with second SP.
  */
-#define SP_REQ_ECHO_DENIED_CMD 0x65636871
-
-static inline struct ffa_value sp_req_echo_denied_cmd_send(ffa_id_t sender,
-							   ffa_id_t receiver)
+static inline struct ffa_value sp_req_echo_busy_cmd_send(ffa_id_t sender,
+							 ffa_id_t receiver)
 {
-	return ffa_msg_send_direct_req(sender, receiver, SP_REQ_ECHO_DENIED_CMD,
+	return ffa_msg_send_direct_req(sender, receiver, SP_REQ_ECHO_BUSY_CMD,
 				       0, 0, 0, 0);
 }
 
-struct ffa_value sp_req_echo_denied_cmd(ffa_id_t test_source);
+struct ffa_value sp_req_echo_busy_cmd(ffa_id_t test_source);
 
 /**
  * Command to request SP to set notifications.
  */
-#define SP_NOTIF_SET_CMD 0x736574U
-
 static inline struct ffa_value sp_notif_set_cmd_send(
 	ffa_id_t sender, ffa_id_t receiver, ffa_id_t notif_receiver,
 	uint32_t flags, ffa_notifications_bitmap_t bitmap)
@@ -135,8 +279,6 @@ struct ffa_value sp_notif_set_cmd(ffa_id_t test_source, ffa_id_t notif_receiver,
 /**
  * Command to request SP to get notifications.
  */
-#define SP_NOTIF_GET_CMD 0x676574U
-
 static inline struct ffa_value sp_notif_get_cmd_send(ffa_id_t test_source,
 						     ffa_id_t receiver,
 						     uint16_t vcpu_id,
@@ -180,8 +322,6 @@ static inline ffa_notifications_bitmap_t sp_notif_get_from_vm(
 /**
  * Command to request SP to bind notifications to the specified sender.
  */
-#define SP_NOTIF_BIND_CMD 0x42494e44U
-
 static inline struct ffa_value sp_notif_bind_cmd_send(
 	ffa_id_t sender, ffa_id_t receiver, ffa_id_t notif_sender,
 	uint32_t flags, ffa_notifications_bitmap_t bitmap)
@@ -204,8 +344,6 @@ struct ffa_value sp_notif_bind_cmd(ffa_id_t test_source, ffa_id_t notif_sender,
 /**
  * Command to request SP to unbind notifications from the specified sender.
  */
-#define SP_NOTIF_UNBIND_CMD SP_NOTIF_BIND_CMD + 1
-
 static inline struct ffa_value sp_notif_unbind_cmd_send(
 	ffa_id_t sender, ffa_id_t receiver, ffa_id_t notif_sender,
 	ffa_notifications_bitmap_t bitmap)
@@ -227,8 +365,6 @@ struct ffa_value sp_check_ffa_return_resp(ffa_id_t test_source, ffa_id_t own_id,
  * Command to request SP to validate if core index passed to the SP is as
  * expected.
  */
-#define SP_CHECK_CPU_IDX_CMD 0x76637075U
-
 static inline struct ffa_value sp_check_cpu_idx_cmd_send(
 	ffa_id_t test_source, ffa_id_t receiver, ffa_vcpu_index_t cpu_idx)
 {
@@ -247,8 +383,6 @@ struct ffa_value sp_check_cpu_idx_cmd(ffa_id_t test_source,
 /**
  * Command to request SP to actively wait in a busy loop.
  */
-#define SP_WAIT_BUSY_LOOP_CMD 0x42555359
-
 static inline struct ffa_value sp_busy_loop_cmd_send(ffa_id_t test_source,
 						     ffa_id_t receiver,
 						     uint64_t loop_count)
@@ -262,7 +396,6 @@ static inline struct ffa_value sp_busy_loop_cmd_send(ffa_id_t test_source,
  * Command to request an SP to perform various state transitions through FF-A
  * ABIs.
  */
-#define SP_CHECK_STATE_TRANSITIONS_CMD 0x5052544dU
 static inline struct ffa_value sp_check_state_transitions_cmd_send(
 	ffa_id_t test_source, ffa_id_t receiver, ffa_id_t companion_sp)
 {
@@ -277,8 +410,6 @@ struct ffa_value sp_check_state_transitions_cmd(ffa_id_t test_source,
 /**
  * Command to request SP to enable/disable a secure virtual interrupt.
  */
-#define SP_VIRTUAL_INTERRUPT_CMD 0x696e7472U
-
 static inline struct ffa_value sp_virtual_interrupt_cmd_send(
 	ffa_id_t source, ffa_id_t dest, uint32_t interrupt_id, bool enable,
 	uint32_t pin)
@@ -308,10 +439,7 @@ struct ffa_value sp_virtual_interrupt_cmd(ffa_id_t source,
 
 /**
  * Request to start trusted watchdog timer.
- * The command id is the hex representaton of the string "WDOG".
  */
-#define SP_TWDOG_START_CMD 0x57444f47U
-
 static inline struct ffa_value sp_twdog_cmd_send(ffa_id_t source, ffa_id_t dest,
 						 uint64_t time)
 {
@@ -322,28 +450,8 @@ static inline struct ffa_value sp_twdog_cmd_send(ffa_id_t source, ffa_id_t dest,
 struct ffa_value sp_twdog_cmd(ffa_id_t source, uint64_t time);
 
 /**
- * Request SP to map MMIO region of Trusted Watchdog peripheral into it's
- * Stage-1 address space.
- * The command id is the hex representaton of the string "MAPW".
- */
-#define SP_TWDOG_MAP_CMD 0x4D415057U
-
-static inline struct ffa_value sp_twdog_map_cmd_send(ffa_id_t source,
-						     ffa_id_t dest)
-{
-	return ffa_msg_send_direct_req(source, dest, SP_TWDOG_MAP_CMD, 0, 0, 0,
-				       0);
-}
-
-struct ffa_value sp_twdog_map_cmd(ffa_id_t source);
-
-/**
  * Request SP to return the last serviced secure virtual interrupt.
- *
- * The command id is the hex representaton of the string "vINT".
  */
-#define SP_LAST_INTERRUPT_SERVICED_CMD 0x76494e54U
-
 static inline struct ffa_value sp_get_last_interrupt_cmd_send(ffa_id_t source,
 							      ffa_id_t dest)
 {
@@ -356,8 +464,6 @@ struct ffa_value sp_get_last_interrupt_cmd(ffa_id_t source);
 /**
  * Request SP to clear the last serviced secure virtual interrupt.
  */
-#define SP_CLEAR_LAST_INTERRUPT_CMD (SP_LAST_INTERRUPT_SERVICED_CMD + 1)
-
 static inline struct ffa_value sp_clear_last_interrupt_cmd_send(ffa_id_t source,
 								ffa_id_t dest)
 {
@@ -369,19 +475,22 @@ struct ffa_value sp_clear_last_interrupt_cmd(ffa_id_t source);
 
 /**
  * Command to request SP to sleep for the given time in ms.
- *
- * The command id is the hex representation of string "slep".
  */
-#define SP_SLEEP_CMD 0x736c6570U
-
 static inline struct ffa_value sp_sleep_cmd_send(ffa_id_t source, ffa_id_t dest,
-						 uint32_t sleep_time)
+						 uint32_t sleep_time,
+						 uint32_t options)
 {
 	return ffa_msg_send_direct_req(source, dest, SP_SLEEP_CMD, sleep_time,
-				       0, 0, 0);
+				       options, 0, 0);
 }
 
-struct ffa_value sp_sleep_cmd(ffa_id_t source, uint32_t sleep_ms);
+struct ffa_value sp_sleep_cmd(ffa_id_t source, uint32_t sleep_ms,
+			      uint32_t options, uint64_t func);
+
+static inline uint32_t sp_get_sleep_options(struct ffa_value ret)
+{
+	return (uint32_t)ret.arg5;
+}
 
 /**
  * Command to request SP to forward sleep command for the given time in ms.
@@ -391,17 +500,14 @@ struct ffa_value sp_sleep_cmd(ffa_id_t source, uint32_t sleep_ms);
  * Moreover, the sender can send a hint to the destination SP to expect that
  * the forwaded sleep command could be preempted by a non-secure interrupt.
  */
-#define SP_FWD_SLEEP_CMD (SP_SLEEP_CMD + 1)
-
 static inline struct ffa_value sp_fwd_sleep_cmd_send(ffa_id_t source,
 						     ffa_id_t dest,
 						     ffa_id_t fwd_dest,
 						     uint32_t busy_wait,
-						     bool hint_interrupted)
+						     uint32_t options)
 {
 	return ffa_msg_send_direct_req(source, dest, SP_FWD_SLEEP_CMD,
-				       busy_wait, fwd_dest, hint_interrupted,
-				       0);
+				       busy_wait, fwd_dest, options, 0);
 }
 
 static inline uint32_t sp_get_sleep_time(struct ffa_value ret)
@@ -414,23 +520,18 @@ static inline ffa_id_t sp_get_fwd_sleep_dest(struct ffa_value ret)
 	return (ffa_id_t)ret.arg5;
 }
 
-static inline bool sp_get_fwd_sleep_interrupted_hint(struct ffa_value ret)
+static inline uint32_t sp_get_fwd_sleep_options(struct ffa_value ret)
 {
-	return (bool)ret.arg6;
+	return (uint32_t)ret.arg6;
 }
 
 struct ffa_value sp_fwd_sleep_cmd(ffa_id_t source, uint32_t sleep_ms,
-				  ffa_id_t fwd_dest, bool hint_interrupted);
+				  ffa_id_t fwd_dest, uint32_t options);
 
 /**
  * Command to request SP to resume the task requested by current endpoint after
  * managed exit.
- *
- * The command id is the hex representation of the string "RAME" which denotes
- * (R)esume (A)fter (M)anaged (E)xit.
  */
-#define SP_RESUME_AFTER_MANAGED_EXIT 0x52414d45U
-
 static inline struct ffa_value sp_resume_after_managed_exit_send(
 	ffa_id_t source, ffa_id_t dest)
 {
@@ -449,7 +550,6 @@ static inline void sp_wait_loop(uint32_t iterations)
  * Command to request an SP to perform checks using ffa_partition_info_get_regs
  * ABI.
  */
-#define SP_CHECK_PARTITION_INFO_GET_REGS_CMD 0x5054567DU
 static inline struct ffa_value sp_check_partition_info_get_regs_cmd_send(
 	ffa_id_t test_source, ffa_id_t receiver)
 {
@@ -462,10 +562,7 @@ struct ffa_value sp_check_partition_info_get_regs_cmd(ffa_id_t test_source);
 
 /**
  * Command to request an SP to yield while handling a secure interrupt.
- * The command id is the hex representaton of the string "YSIH".
  */
-#define SP_YIELD_SEC_INTERRUPT_HANDLING_CMD 0x59534948U
-
 static inline struct ffa_value sp_yield_secure_interrupt_handling_cmd_send(
 	ffa_id_t source, ffa_id_t dest, bool yield)
 {
@@ -480,10 +577,7 @@ struct ffa_value sp_yield_secure_interrupt_handling_cmd(ffa_id_t source,
 /**
  * Command to request an SP to reconfigure the secure interrupt to be targetted
  * to a given vCPU identified by its linear id.
- * The command id is the hex representaton of the string "RSTV".
  */
-#define SP_ROUTE_SEC_INT_TARGET_VCPU_CMD 0x52535456U
-
 static inline struct ffa_value sp_route_interrupt_to_target_vcpu_cmd_send(
 	ffa_id_t source, ffa_id_t dest, ffa_vcpu_index_t target_vcpu_id,
 	uint32_t int_id)
@@ -498,10 +592,7 @@ struct ffa_value sp_route_interrupt_to_target_vcpu_cmd(
 
 /**
  * Command to request SP to pend an interrupt in the extended SPI range.
- * The command is the hex representation of the string "espi".
  */
-#define SP_TRIGGER_ESPI_CMD 0x65737069U
-
 static inline struct ffa_value sp_trigger_espi_cmd_send(ffa_id_t source,
 							ffa_id_t dest,
 							uint32_t espi_id)
@@ -511,3 +602,107 @@ static inline struct ffa_value sp_trigger_espi_cmd_send(ffa_id_t source,
 }
 
 struct ffa_value sp_trigger_espi_cmd(ffa_id_t source, uint32_t espi_id);
+
+static inline struct ffa_value sp_ffa_features_cmd_send(
+	ffa_id_t sender, ffa_id_t receiver, uint32_t feature_func_id)
+{
+	return ffa_msg_send_direct_req(sender, receiver, SP_FFA_FEATURES_CMD,
+				       feature_func_id, 0, 0, 0);
+}
+
+struct ffa_value sp_ffa_features_cmd(ffa_id_t source, uint32_t feature_func_id);
+
+static inline struct ffa_value sp_ffa_mem_retrieve_cmd_send(
+	ffa_id_t sender, ffa_id_t receiver, ffa_memory_handle_t handle,
+	enum ffa_version ffa_version)
+{
+	return ffa_msg_send_direct_req(sender, receiver,
+				       SP_FFA_MEM_RETRIEVE_CMD, handle,
+				       ffa_version, 0, 0);
+}
+
+struct ffa_value sp_ffa_mem_retrieve_cmd(ffa_id_t sender_id,
+					 ffa_memory_handle_t handle,
+					 enum ffa_version ffa_version);
+
+/**
+ * Request to start generic timer.
+ */
+static inline struct ffa_value sp_generic_timer_cmd_send(ffa_id_t source,
+							 ffa_id_t dest,
+							 uint64_t time)
+{
+	return ffa_msg_send_direct_req(source, dest, SP_GENERIC_TIMER_START_CMD,
+				       time, 0, 0, 0);
+}
+
+struct ffa_value sp_generic_timer_cmd(ffa_id_t source, uint64_t time);
+
+static inline struct ffa_value sp_pauth_fault_cmd_send(ffa_id_t sender,
+						       ffa_id_t receiver)
+{
+	return ffa_msg_send_direct_req(sender, receiver, SP_PAUTH_FAULT_CMD, 0,
+				       0, 0, 0);
+}
+
+void sp_pauth_fault_cmd(void);
+
+/**
+ * Command to request an SP to prepare to initiate an SPMC call chain.
+ */
+static inline struct ffa_value sp_prepare_spmc_call_chain_cmd_send(
+	ffa_id_t source, ffa_id_t dest, bool initiate)
+{
+	return ffa_msg_send_direct_req(source, dest,
+				       SP_PREPARE_SPMC_CALL_CHAIN_CMD, initiate,
+				       0, 0, 0);
+}
+
+struct ffa_value sp_prepare_spmc_call_chain_cmd(ffa_id_t source, bool initiate);
+
+/**
+ * Command to request an SP to prepare to preempt itself while handling a
+ * virtual interrupt.
+ */
+static inline struct ffa_value sp_prepare_preempt_interrupt_handling_cmd_send(
+	ffa_id_t source, ffa_id_t dest, bool preempt)
+{
+	return ffa_msg_send_direct_req(source, dest,
+				       SP_PREPARE_PREEMPT_INT_HANDLING, preempt,
+				       0, 0, 0);
+}
+
+struct ffa_value sp_prepare_preempt_interrupt_handling_cmd(ffa_id_t source,
+							   bool preempt);
+
+/**
+ * Command to request SP to program timer with delay and sleep for the given
+ * time in ms.
+ */
+static inline struct ffa_value sp_program_arch_timer_sleep_cmd_send(
+	ffa_id_t source, ffa_id_t dest, uint32_t timer_delay,
+	uint32_t sleep_time, uint32_t fwd)
+{
+	return ffa_msg_send_direct_req(source, dest, SP_ARCH_TIMER_CMD,
+				       timer_delay, sleep_time, fwd, 0);
+}
+
+struct ffa_value sp_program_arch_timer_sleep_cmd(ffa_id_t source,
+						 uint32_t timer_delay_ms,
+						 uint32_t sleep_ms,
+						 uint32_t fwd);
+
+static inline uint32_t sp_get_arch_timer_delay(struct ffa_value ret)
+{
+	return (uint32_t)ret.arg4;
+}
+
+static inline uint32_t sp_get_arch_timer_sleep(struct ffa_value ret)
+{
+	return (uint32_t)ret.arg5;
+}
+
+static inline uint32_t sp_get_arch_timer_fwd_call(struct ffa_value ret)
+{
+	return (uint32_t)ret.arg6;
+}

@@ -86,22 +86,6 @@ source_set("boot") {
   deps = [ "//test/vmapi/common:ffa" ]
 }
 
-# Service that can be interrupted.
-source_set("interruptible") {
-  testonly = true
-  public_configs = [
-    "..:config",
-    "//test/hftest:hftest_config",
-  ]
-
-  sources = [
-    "interruptible.c",
-    "interruptible_echo.c",
-  ]
-
-  deps = [ "//src/arch/aarch64/hftest:interrupts" ]
-}
-
 # Service to check that hf_mailbox_receive can't block when there are pending
 # interrupts.
 source_set("receive_block") {
@@ -170,8 +154,31 @@ source_set("ffa_check") {
   ]
 }
 
-# Group services together into VMs.
+# Services related to SMCCC compliance.
+source_set("smccc") {
+  testonly = true
+  public_configs = [
+    "..:config",
+    "//test/hftest:hftest_config",
+  ]
+  deps = [ "//test/vmapi/common:ffa" ]
 
+  sources = [ "smccc.c" ]
+}
+
+# Services related to RX buffer ownership.
+source_set("rx_ownership") {
+  testonly = true
+  public_configs = [
+    "..:config",
+    "//test/hftest:hftest_config",
+  ]
+  deps = [ "//test/vmapi/common:ffa" ]
+
+  sources = [ "rx_ownership.c" ]
+}
+
+# Group services together into VMs.
 vm_kernel("service_vm1") {
   testonly = true
 
@@ -182,12 +189,13 @@ vm_kernel("service_vm1") {
     ":echo",
     ":ffa_check",
     ":floating_point",
-    ":interruptible",
     ":memory",
     ":perfmon",
     ":receive_block",
     ":relay",
     ":run_waiting",
+    ":rx_ownership",
+    ":smccc",
     ":unmapped",
     ":wfi",
     "//src/arch/aarch64/hftest:interrupts",
@@ -204,7 +212,6 @@ vm_kernel("service_vm2") {
   deps = [
     ":echo",
     ":ffa_check",
-    ":interruptible",
     ":memory",
     ":relay",
     "//src/arch/aarch64/hftest:interrupts",

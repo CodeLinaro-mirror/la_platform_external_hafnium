@@ -35,22 +35,23 @@
  */
 #if GIC_EXT_INTID
 /* GICv3.1 */
-#define GICD_OFFSET_8(REG, id)                                  \
-	(((id) <= MAX_SPI_ID) ? GICD_##REG##R + (uintptr_t)(id) \
-			      : GICD_##REG##RE + (uintptr_t)(id)-MIN_ESPI_ID)
+#define GICD_OFFSET_8(REG, id)                     \
+	(((id) <= MAX_SPI_ID)                      \
+		 ? GICD_##REG##R + (uintptr_t)(id) \
+		 : GICD_##REG##RE + (uintptr_t)(id) - MIN_ESPI_ID)
 
-#define GICD_OFFSET(REG, id)                                                \
-	(((id) <= MAX_SPI_ID)                                               \
-		 ? GICD_##REG##R + (((uintptr_t)(id) >> REG##R_SHIFT) << 2) \
-		 : GICD_##REG##RE +                                         \
-			   ((((uintptr_t)(id)-MIN_ESPI_ID) >> REG##R_SHIFT) \
+#define GICD_OFFSET(REG, id)                                                  \
+	(((id) <= MAX_SPI_ID)                                                 \
+		 ? GICD_##REG##R + (((uintptr_t)(id) >> REG##R_SHIFT) << 2)   \
+		 : GICD_##REG##RE +                                           \
+			   ((((uintptr_t)(id) - MIN_ESPI_ID) >> REG##R_SHIFT) \
 			    << 2))
 
-#define GICD_OFFSET_64(REG, id)                                             \
-	(((id) <= MAX_SPI_ID)                                               \
-		 ? GICD_##REG##R + (((uintptr_t)(id) >> REG##R_SHIFT) << 3) \
-		 : GICD_##REG##RE +                                         \
-			   ((((uintptr_t)(id)-MIN_ESPI_ID) >> REG##R_SHIFT) \
+#define GICD_OFFSET_64(REG, id)                                               \
+	(((id) <= MAX_SPI_ID)                                                 \
+		 ? GICD_##REG##R + (((uintptr_t)(id) >> REG##R_SHIFT) << 3)   \
+		 : GICD_##REG##RE +                                           \
+			   ((((uintptr_t)(id) - MIN_ESPI_ID) >> REG##R_SHIFT) \
 			    << 3))
 
 #else /* GICv3 */
@@ -176,7 +177,7 @@ static inline uint64_t gicd_irouter_val_from_mpidr(uint64_t mpidr,
 }
 
 /**
- * GIC Distributor interface register accessors that are common to GICv3 & GICv2
+ * GIC Distributor interface register accessors
  */
 static inline unsigned int gicd_read_ctlr(uintptr_t base)
 {
@@ -190,12 +191,6 @@ static inline void gicd_write_ctlr(uintptr_t base, unsigned int val)
 
 /**
  * GIC Distributor interface accessors
- */
-/*
- * Wait for updates to:
- * GICD_CTLR[2:0] - the Group Enables
- * GICD_CTLR[7:4] - the ARE bits, E1NWF bit and DS bit
- * GICD_ICENABLER<n> - the clearing of enable state for SPIs
  */
 static inline void gicd_wait_for_pending_write(uintptr_t gicd_base)
 {
@@ -213,6 +208,23 @@ static inline void gicd_write_irouter(uintptr_t base, unsigned int id,
 {
 	CHECK(id >= MIN_SPI_ID);
 	GICD_WRITE_64(IROUTE, base, id, affinity);
+}
+
+/*
+ * Any function that intends to update the following fields of GICD_CTLR
+ * memory mapped register must prefer gicd_set_ctlr() helper over
+ * gicd_write_ctlr().
+ * 1. GICD_CTLR[2:0] - the Group Enables
+ * 2. GICD_CTLR[7:4] - the ARE bits, E1NWF bit and DS bit
+ * 3. GICD_ICENABLER<n> - the clearing of enable state for SPIs
+ */
+static inline void gicd_set_ctlr(uintptr_t base, uint32_t bitmap, uint32_t rwp)
+{
+	gicd_write_ctlr(base, gicd_read_ctlr(base) | bitmap);
+
+	if (rwp != RWP_FALSE) {
+		gicd_wait_for_pending_write(base);
+	}
 }
 
 /**

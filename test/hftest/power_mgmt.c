@@ -9,13 +9,15 @@
 #include "hf/arch/vm/power_mgmt.h"
 
 #include "hf/arch/mm.h"
+#include "hf/arch/types.h"
 
+#include "hf/mm.h"
 #include "hf/spinlock.h"
 
 #include "test/hftest.h"
 
 struct cpu_start_state {
-	void (*entry)(uintptr_t arg);
+	cpu_entry_point *entry;
 	uintreg_t arg;
 	struct spinlock lock;
 };
@@ -48,8 +50,8 @@ static noreturn void cpu_entry(uintptr_t arg)
 	arch_cpu_stop();
 }
 
-bool hftest_cpu_start(uintptr_t id, void *stack, size_t stack_size,
-		      void (*entry)(uintptr_t arg), uintptr_t arg)
+bool hftest_cpu_start(cpu_id_t id, const uint8_t *secondary_ec_stack,
+		      cpu_entry_point *entry, uintptr_t arg)
 {
 	struct cpu_start_state s;
 	struct arch_cpu_start_state s_arch;
@@ -59,7 +61,7 @@ bool hftest_cpu_start(uintptr_t id, void *stack, size_t stack_size,
 	 * immediately jump to cpu_entry(). This function must guarantee that
 	 * the state struct is not be freed until cpu_entry() is called.
 	 */
-	s_arch.initial_sp = (uintptr_t)stack + stack_size;
+	s_arch.initial_sp = (uintptr_t)secondary_ec_stack;
 	s_arch.entry = cpu_entry;
 	s_arch.arg = (uintptr_t)&s;
 
@@ -94,6 +96,7 @@ bool hftest_cpu_start(uintptr_t id, void *stack, size_t stack_size,
 
 	/* Try to start the given CPU. */
 	if (!arch_cpu_start(id, &s_arch)) {
+		HFTEST_LOG("Couldn't start cpu %lu", id);
 		return false;
 	}
 

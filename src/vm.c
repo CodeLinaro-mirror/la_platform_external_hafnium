@@ -8,6 +8,7 @@
 
 #include "hf/vm.h"
 
+#include "hf/arch/spinlock.h"
 #include "hf/arch/vm.h"
 
 #include "hf/api.h"
@@ -17,6 +18,7 @@
 #include "hf/dlog.h"
 #include "hf/ffa.h"
 #include "hf/layout.h"
+#include "hf/plat/iommu.h"
 #include "hf/std.h"
 
 #include "vmapi/hf/call.h"
@@ -42,11 +44,12 @@ static struct {
 
 static bool vm_init_mm(struct vm *vm, struct mpool *ppool)
 {
-	return arch_vm_init_mm(vm, ppool);
+	return arch_vm_init_mm(vm, ppool) && arch_vm_iommu_init_mm(vm, ppool);
 }
 
 struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
-		   struct mpool *ppool, bool el0_partition)
+		   struct mpool *ppool, bool el0_partition,
+		   uint8_t dma_device_count)
 {
 	uint32_t i;
 	struct vm *vm;
@@ -67,8 +70,6 @@ struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
 
 	memset_s(vm, sizeof(*vm), 0, sizeof(*vm));
 
-	list_init(&vm->mailbox.waiter_list);
-	list_init(&vm->mailbox.ready_list);
 	sl_init(&vm->lock);
 
 	vm->id = id;
@@ -81,16 +82,10 @@ struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
 	vm->mailbox.state = MAILBOX_STATE_EMPTY;
 	atomic_init(&vm->aborting, false);
 	vm->el0_partition = el0_partition;
+	vm->dma_device_count = dma_device_count;
 
 	if (!vm_init_mm(vm, ppool)) {
 		return NULL;
-	}
-
-	/* Initialise waiter entries. */
-	for (i = 0; i < MAX_VMS; i++) {
-		vm->wait_entries[i].waiting_vm = vm;
-		list_init(&vm->wait_entries[i].wait_links);
-		list_init(&vm->wait_entries[i].ready_links);
 	}
 
 	/* Do basic initialization of vCPUs. */
@@ -103,7 +98,8 @@ struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
 }
 
 bool vm_init_next(ffa_vcpu_count_t vcpu_count, struct mpool *ppool,
-		  struct vm **new_vm, bool el0_partition)
+		  struct vm **new_vm, bool el0_partition,
+		  uint8_t dma_device_count)
 {
 	if (vm_count >= MAX_VMS) {
 		return false;
@@ -111,7 +107,7 @@ bool vm_init_next(ffa_vcpu_count_t vcpu_count, struct mpool *ppool,
 
 	/* Generate IDs based on an offset, as low IDs e.g., 0, are reserved */
 	*new_vm = vm_init(vm_count + HF_VM_ID_OFFSET, vcpu_count, ppool,
-			  el0_partition);
+			  el0_partition, dma_device_count);
 	if (*new_vm == NULL) {
 		return false;
 	}
@@ -206,6 +202,34 @@ struct two_vm_locked vm_lock_both(struct vm *vm1, struct vm *vm2)
 }
 
 /**
+ * Locks two VMs ensuring that the locking order is according to the locks'
+ * addresses, given `vm1` is already locked.
+ */
+struct two_vm_locked vm_lock_both_in_order(struct vm_locked vm1, struct vm *vm2)
+{
+	struct spinlock *sl1 = &vm1.vm->lock;
+	struct spinlock *sl2 = &vm2->lock;
+
+	/*
+	 * Use `sl_lock`/`sl_unlock` directly rather than
+	 * `vm_lock`/`vm_unlock` because `vm_unlock` sets the vm field
+	 * to NULL.
+	 */
+	if (sl1 < sl2) {
+		sl_lock(sl2);
+	} else {
+		sl_unlock(sl1);
+		sl_lock(sl2);
+		sl_lock(sl1);
+	}
+
+	return (struct two_vm_locked){
+		.vm1 = vm1,
+		.vm2 = (struct vm_locked){.vm = vm2},
+	};
+}
+
+/**
  * Unlocks a VM previously locked with vm_lock, and updates `locked` to reflect
  * the fact that the VM is no longer locked.
  */
@@ -226,20 +250,6 @@ struct vcpu *vm_get_vcpu(struct vm *vm, ffa_vcpu_index_t vcpu_index)
 }
 
 /**
- * Gets `vm`'s wait entry for waiting on the `for_vm`.
- */
-struct wait_entry *vm_get_wait_entry(struct vm *vm, ffa_id_t for_vm)
-{
-	uint16_t index;
-
-	CHECK(for_vm >= HF_VM_ID_OFFSET);
-	index = for_vm - HF_VM_ID_OFFSET;
-	CHECK(index < MAX_VMS);
-
-	return &vm->wait_entries[index];
-}
-
-/**
  * Checks whether the given `to` VM's mailbox is currently busy.
  */
 bool vm_is_mailbox_busy(struct vm_locked to)
@@ -254,16 +264,6 @@ bool vm_is_mailbox_busy(struct vm_locked to)
 bool vm_is_mailbox_other_world_owned(struct vm_locked to)
 {
 	return to.vm->mailbox.state == MAILBOX_STATE_OTHER_WORLD_OWNED;
-}
-
-/**
- * Gets the ID of the VM which the given VM's wait entry is for.
- */
-ffa_id_t vm_id_for_wait_entry(struct vm *vm, struct wait_entry *entry)
-{
-	uint16_t index = entry - vm->wait_entries;
-
-	return index + HF_VM_ID_OFFSET;
 }
 
 /**
@@ -376,6 +376,14 @@ bool vm_mem_get_mode(struct vm_locked vm_locked, ipaddr_t begin, ipaddr_t end,
 		     uint32_t *mode)
 {
 	return arch_vm_mem_get_mode(vm_locked, begin, end, mode);
+}
+
+bool vm_iommu_mm_identity_map(struct vm_locked vm_locked, paddr_t begin,
+			      paddr_t end, uint32_t mode, struct mpool *ppool,
+			      ipaddr_t *ipa, uint8_t dma_device_id)
+{
+	return arch_vm_iommu_mm_identity_map(vm_locked, begin, end, mode, ppool,
+					     ipa, dma_device_id);
 }
 
 bool vm_mailbox_state_busy(struct vm_locked vm_locked)
@@ -806,32 +814,18 @@ ffa_notifications_bitmap_t vm_notifications_framework_get_pending(
 	return framework;
 }
 
-static void vm_notifications_state_info_get(
-	struct notifications_state *state, ffa_id_t vm_id, bool is_per_vcpu,
-	ffa_vcpu_index_t vcpu_id, uint16_t *ids, uint32_t *ids_count,
-	uint32_t *lists_sizes, uint32_t *lists_count,
-	const uint32_t ids_max_count,
+static bool vm_insert_notification_info_list(
+	ffa_id_t vm_id, bool is_per_vcpu, ffa_vcpu_index_t vcpu_id,
+	uint16_t *ids, uint32_t *ids_count, uint32_t *lists_sizes,
+	uint32_t *lists_count, const uint32_t ids_max_count,
 	enum notifications_info_get_state *info_get_state)
 {
-	ffa_notifications_bitmap_t pending_not_retrieved;
-
 	CHECK(*ids_count <= ids_max_count);
 	CHECK(*lists_count <= ids_max_count);
 
-	if (*info_get_state == FULL) {
-		return;
-	}
-
-	pending_not_retrieved = state->pending & ~state->info_get_retrieved;
-
-	/* No notifications pending that haven't been retrieved. */
-	if (pending_not_retrieved == 0U) {
-		return;
-	}
-
-	if (*ids_count == ids_max_count) {
+	if (*info_get_state == FULL || *ids_count == ids_max_count) {
 		*info_get_state = FULL;
-		return;
+		return false;
 	}
 
 	switch (*info_get_state) {
@@ -844,7 +838,7 @@ static void vm_notifications_state_info_get(
 		 */
 		if (is_per_vcpu && ids_max_count - *ids_count < 2) {
 			*info_get_state = FULL;
-			return;
+			return false;
 		}
 
 		*info_get_state = INSERTING;
@@ -880,9 +874,87 @@ static void vm_notifications_state_info_get(
 		panic("Notification info get action error!!\n");
 	}
 
+	return true;
+}
+
+/**
+ * Check if the notification is pending and hasn't being retrieved.
+ * If so attempt to add it to the notification info list.
+ * Returns true if successfully added to the list.
+ */
+static bool vm_notifications_state_info_get(
+	struct notifications_state *state, ffa_id_t vm_id, bool is_per_vcpu,
+	ffa_vcpu_index_t vcpu_id, uint16_t *ids, uint32_t *ids_count,
+	uint32_t *lists_sizes, uint32_t *lists_count,
+	const uint32_t ids_max_count,
+	enum notifications_info_get_state *info_get_state)
+{
+	ffa_notifications_bitmap_t pending_not_retrieved;
+
+	pending_not_retrieved = state->pending & ~state->info_get_retrieved;
+
+	/* No notifications pending that haven't been retrieved. */
+	if (pending_not_retrieved == 0U) {
+		return false;
+	}
+
+	if (!vm_insert_notification_info_list(
+		    vm_id, is_per_vcpu, vcpu_id, ids, ids_count, lists_sizes,
+		    lists_count, ids_max_count, info_get_state)) {
+		return false;
+	}
+
 	state->info_get_retrieved |= pending_not_retrieved;
 
 	vm_notifications_info_get_retrieved_count_add(pending_not_retrieved);
+
+	return true;
+}
+
+/**
+ * Check if the vcpu has a pending IPI that hasn't been retrieved.
+ * If so try add it to the notification info list.
+ * Returns true if successfully added to the list.
+ */
+static bool vm_ipi_state_info_get(
+	struct vcpu *vcpu, ffa_id_t vm_id, ffa_vcpu_index_t vcpu_id,
+	uint16_t *ids, uint32_t *ids_count, uint32_t *lists_sizes,
+	uint32_t *lists_count, const uint32_t ids_max_count,
+	enum notifications_info_get_state *info_get_state, bool per_vcpu_added)
+{
+	bool ret = true;
+	bool pending_not_retrieved;
+	struct vcpu_locked vcpu_locked = vcpu_lock(vcpu);
+	struct interrupts *interrupts = &vcpu_locked.vcpu->interrupts;
+
+	pending_not_retrieved =
+		vcpu_is_virt_interrupt_pending(interrupts, HF_IPI_INTID) &&
+		!vcpu_ipi_is_info_get_retrieved(vcpu_locked);
+
+	/* No notifications pending that haven't been retrieved. */
+	if (!pending_not_retrieved) {
+		ret = false;
+		goto out;
+	}
+
+	/*
+	 * If the per vCPU notification was added to the list we do not need
+	 * to add it again for the IPI.
+	 */
+	if (!per_vcpu_added &&
+	    !vm_insert_notification_info_list(
+		    vm_id, true, vcpu_id, ids, ids_count, lists_sizes,
+		    lists_count, ids_max_count, info_get_state)) {
+		ret = false;
+		goto out;
+	}
+
+	vcpu_ipi_set_info_get_retrieved(vcpu_locked);
+
+out:
+	vcpu_unlock(&vcpu_locked);
+
+	return ret;
 }
 
 /**
@@ -910,10 +982,23 @@ void vm_notifications_info_get_pending(
 					ids_max_count, info_get_state);
 
 	for (ffa_vcpu_count_t i = 0; i < vm_locked.vm->vcpu_count; i++) {
-		vm_notifications_state_info_get(
+		struct vcpu *vcpu = vm_get_vcpu(vm_locked.vm, i);
+		bool per_vcpu_added;
+
+		per_vcpu_added = vm_notifications_state_info_get(
 			&notifications->per_vcpu[i], vm_locked.vm->id, true, i,
 			ids, ids_count, lists_sizes, lists_count, ids_max_count,
 			info_get_state);
+		/*
+		 * IPIs can only be pending for partitions at the
+		 * current virtual FF-A instance.
+		 */
+		if (vm_id_is_current_world(vm_locked.vm->id)) {
+			vm_ipi_state_info_get(vcpu, vm_locked.vm->id, i, ids,
+					      ids_count, lists_sizes,
+					      lists_count, ids_max_count,
+					      info_get_state, per_vcpu_added);
+		}
 	}
 }
 
@@ -955,7 +1040,7 @@ bool vm_notifications_info_get(struct vm_locked vm_locked, uint16_t *ids,
 /**
  * Checks VM's messaging method support.
  */
-bool vm_supports_messaging_method(struct vm *vm, uint8_t msg_method)
+bool vm_supports_messaging_method(struct vm *vm, uint16_t msg_method)
 {
 	return (vm->messaging_method & msg_method) != 0;
 }
@@ -1018,7 +1103,8 @@ struct interrupt_descriptor *vm_interrupt_set_target_mpidr(
 	int_desc = vm_find_interrupt_descriptor(vm_locked, id);
 
 	if (int_desc != NULL) {
-		interrupt_desc_set_mpidr(int_desc, target_mpidr);
+		int_desc->mpidr_valid = true;
+		int_desc->mpidr = target_mpidr;
 	}
 
 	return int_desc;
@@ -1036,7 +1122,7 @@ struct interrupt_descriptor *vm_interrupt_set_sec_state(
 	int_desc = vm_find_interrupt_descriptor(vm_locked, id);
 
 	if (int_desc != NULL) {
-		interrupt_desc_set_sec_state(int_desc, sec_state);
+		int_desc->sec_state = sec_state;
 	}
 
 	return int_desc;
@@ -1053,7 +1139,7 @@ struct interrupt_descriptor *vm_interrupt_set_enable(struct vm_locked vm_locked,
 	int_desc = vm_find_interrupt_descriptor(vm_locked, id);
 
 	if (int_desc != NULL) {
-		interrupt_desc_set_enabled(int_desc, enable);
+		int_desc->enabled = enable;
 	}
 
 	return int_desc;

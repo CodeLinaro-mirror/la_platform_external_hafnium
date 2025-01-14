@@ -10,7 +10,18 @@ config("config") {
   include_dirs = [
     "inc",
     "//test/inc",
+    "//test/vmapi/common/arch/aarch64/inc/",
+    "//test/vmapi/common/arch/aarch64/secure/inc",
   ]
+}
+
+source_set("arch_timer") {
+  testonly = true
+  public_configs = [
+    ":config",
+    "//src/arch/aarch64:arch_config",
+  ]
+  sources = [ "arch_timer.c" ]
 }
 
 source_set("common") {
@@ -33,6 +44,14 @@ source_set("discovery") {
   deps = [ ":common" ]
 }
 
+source_set("pauth") {
+  testonly = true
+  public_configs = [ ":config" ]
+  sources = [ "pauth.c" ]
+
+  deps = [ ":common" ]
+}
+
 source_set("partition_services") {
   testonly = true
   public_configs = [
@@ -45,6 +64,7 @@ source_set("partition_services") {
     ":common",
     "//src/arch/aarch64:smc",
     "//test/vmapi/common:ffa",
+    "//vmlib",
   ]
 }
 
@@ -68,15 +88,6 @@ source_set("power_mgt") {
   sources = [ "power_mgt.c" ]
 }
 
-source_set("sp805") {
-  testonly = true
-  public_configs = [
-    ":config",
-    "//src/arch/aarch64:arch_config",
-  ]
-  sources = [ "sp805.c" ]
-}
-
 source_set("secure_interrupts") {
   testonly = true
   public_configs = [
@@ -96,9 +107,11 @@ source_set("message_loop") {
   sources = [ "message_loop.c" ]
 
   deps = [
+    ":arch_timer",
     ":discovery",
     ":notifications",
     ":partition_services",
+    ":pauth",
     ":power_mgt",
     ":secure_interrupts",
     "//test/vmapi/common:ffa",
@@ -133,12 +146,13 @@ vm_kernel("secure_partitions_services") {
 
   deps = [
     ":message_loop",
-    ":sp805",
     ":sp_helpers",
     "//src/arch/aarch64:arch",
     "//src/arch/aarch64/hftest:interrupts",
     "//test/hftest:hftest_secure_service",
     "//test/vmapi/common/arch/aarch64:exception_handler",
+    "//test/vmapi/common/arch/aarch64/secure:twdog",
+    "//test/vmapi/common/arch/aarch64/system_timer:ap_refclk",
     "//vmlib/${plat_arch}:call",
   ]
 }
@@ -164,6 +178,11 @@ manifest("partition_manifest_service_sp_first") {
 manifest("partition_manifest_service_sp_second") {
   source = "partition_manifest_service_sp_second.dts"
   output = "partition_manifest_service_sp_second.dtb"
+}
+
+manifest("partition_manifest_service_sp_second_up") {
+  source = "partition_manifest_service_sp_second_up.dts"
+  output = "partition_manifest_service_sp_second_up.dtb"
 }
 
 manifest("partition_manifest_service_sp_third") {
@@ -195,6 +214,19 @@ partition_package("service_sp_second_package") {
         ":secure_partitions_services",
       ] ]
   output = "service_sp_second_package.img"
+}
+
+partition_package("service_sp_second_package_up") {
+  testonly = true
+  pm_offset = "0x1000"
+  img_offset = "0x2000"
+  files = [ [
+        "partition_manifest_service_sp_second_up.dtb",
+        "secure_partitions_services.bin",
+        ":partition_manifest_service_sp_second_up",
+        ":secure_partitions_services",
+      ] ]
+  output = "service_sp_second_package_up.img"
 }
 
 partition_package("service_sp_third_package") {
