@@ -8,7 +8,10 @@
 
 #pragma once
 
+#if !defined(__TRUSTY__)
 #include "hf/ffa.h"
+#endif
+
 #include "hf/types.h"
 
 /* Keep macro alignment */
