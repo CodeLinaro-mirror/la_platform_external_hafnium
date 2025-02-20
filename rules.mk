@@ -58,11 +58,13 @@ HAFNIUM_SRCS += \
 	mm.c \
 	mpool.c \
 	panic.c \
+	partition_pkg.c \
 	sp_pkg.c \
 	std.c \
 	stdout.c \
 	string.c \
 	timer_mgmt.c \
+	transfer_list/transfer_list.c \
 	vcpu.c \
 	vm.c \
 
@@ -123,11 +125,21 @@ HAFNIUM_SRCS += \
 HAFNIUM_ARCH_SRCS += \
 	boot_flow/linux.S \
 	pl011/pl011.c \
-	plat/ffa/spmc.c \
 	plat/interrupts/gicv3.c \
 	plat/prng/prng_fake.c \
 	plat/psci/spmc.c \
 	plat/smc/absent.c \
+
+HAFNIUM_SRCS += \
+	ffa/spmc/cpu_cycles.c \
+	ffa/spmc/direct_messaging.c \
+	ffa/spmc/ffa_memory.c \
+	ffa/spmc/indirect_messaging.c \
+	ffa/spmc/init.c \
+	ffa/spmc/interrupts.c \
+	ffa/spmc/notifications.c \
+	ffa/spmc/setup_and_discovery.c \
+	ffa/spmc/vm.c \
 
 HAFNIUM_HYP_SRCS += \
 	simd.c \
@@ -206,7 +218,7 @@ endif
 
 HAFNIUM_FLAGS += \
 	-isystem $(HAFNIUM_CLANG_RESOURCE_DIR)/include \
-	-isystem $(LOCAL_DIR)/inc/system \
+	-isystem prebuilts/build-tools/sysroots/aarch64-unknown-linux-musl/include \
 	-I $(LOCAL_DIR)/inc \
 	-I $(LOCAL_DIR)/inc/vmapi \
 	-I $(LOCAL_DIR)/src/arch/$(HAFNIUM_ARCH) \
