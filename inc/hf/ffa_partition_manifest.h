@@ -33,11 +33,9 @@
 	 MANIFEST_REGION_ATTR_EXEC | MANIFEST_REGION_ATTR_SECURITY)
 
 #define MANIFEST_POWER_MANAGEMENT_CPU_OFF_SUPPORTED (UINT32_C(1) << 0)
-#define MANIFEST_POWER_MANAGEMENT_CPU_ON_SUPPORTED (UINT32_C(1) << 3)
 #define MANIFEST_POWER_MANAGEMENT_NONE_MASK (UINT32_C(0))
-#define MANIFEST_POWER_MANAGEMENT_ALL_MASK             \
-	(MANIFEST_POWER_MANAGEMENT_CPU_OFF_SUPPORTED | \
-	 MANIFEST_POWER_MANAGEMENT_CPU_ON_SUPPORTED)
+#define MANIFEST_POWER_MANAGEMENT_ALL_MASK \
+	MANIFEST_POWER_MANAGEMENT_CPU_OFF_SUPPORTED
 
 /* Highest possible value for the boot-order field. */
 #define DEFAULT_BOOT_ORDER 0xFFFF
@@ -56,6 +54,27 @@ enum run_time_el {
 enum execution_state { AARCH64 = 0, AARCH32 };
 
 enum xlat_granule { PAGE_4KB = 0, PAGE_16KB, PAGE_64KB };
+
+struct sri_interrupts_policy {
+	/**
+	 * When the partition is in waiting state at the moment one
+	 * of its interrupts fires, the SPMC will trigger an SRI
+	 * to the scheduler to explicitly provide CPU cycles, such that
+	 * the interrupt can be handled.
+	 */
+	bool intr_while_waiting : 1;
+
+	/**
+	 * If the SP is trying to go into a waiting state and it has
+	 * pending interrupts, leave interrupts pended and trigger
+	 * SRI to the scheduler of the system to explicitly provide
+	 * CPU cycles at a later instance, such that the interrupt
+	 * can be handled.
+	 */
+	bool intr_pending_entry_wait : 1;
+
+	uint8_t mbz : 6;
+};
 
 /**
  * Properties of the DMA capable device upstream of an SMMU as specified in the
@@ -78,12 +97,14 @@ struct dma_device_properties {
  * device that has access to this memory region.
  */
 struct memory_region {
-	struct string name;
+	struct string description;
 	/**
 	 * Specify PA, VA for S-EL0 partitions or IPA
 	 * for S-EL1 partitions - optional.
 	 */
 	uintptr_t base_address;
+	/** True if `load-address-relative-offset` was specified. */
+	bool is_relative;
 	/** Page count - mandatory */
 	uint32_t page_count;
 	/** Memory attributes - mandatory */
@@ -209,6 +230,10 @@ struct ffa_partition_manifest {
 	bool me_signal_virq;
 	/** optional - receipt of notifications. */
 	bool notification_support;
+
+	/** optional - request the scheduler cycles to handle interrupts. */
+	struct sri_interrupts_policy sri_policy;
+
 	/**
 	 * optional - VM availability messages bitfield.
 	 */

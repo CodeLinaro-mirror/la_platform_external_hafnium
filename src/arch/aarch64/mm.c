@@ -10,9 +10,12 @@
 
 #include "hf/arch/barriers.h"
 #include "hf/arch/cpu.h"
+#include "hf/arch/mm.h"
 #include "hf/arch/mmu.h"
 #include "hf/arch/std.h"
+#include "hf/arch/types.h"
 
+#include "hf/addr.h"
 #include "hf/check.h"
 #include "hf/dlog.h"
 
@@ -136,14 +139,14 @@ struct arch_mm_config {
 	uintreg_t vstcr_el2;
 } arch_mm_config;
 
-static uint8_t mm_s1_max_level;
-static uint8_t mm_s2_max_level;
+static mm_level_t mm_s1_root_level;
+static mm_level_t mm_s2_root_level;
 static uint8_t mm_s2_root_table_count;
 
 /**
  * Returns the encoding of a page table entry that isn't present.
  */
-pte_t arch_mm_absent_pte(uint8_t level)
+pte_t arch_mm_absent_pte(mm_level_t level)
 {
 	(void)level;
 	return 0;
@@ -155,7 +158,7 @@ pte_t arch_mm_absent_pte(uint8_t level)
  * The spec says that 'Table descriptors for stage 2 translations do not
  * include any attribute field', so we don't take any attributes as arguments.
  */
-pte_t arch_mm_table_pte(uint8_t level, paddr_t pa)
+pte_t arch_mm_table_pte(mm_level_t level, paddr_t pa)
 {
 	/* This is the same for all levels on aarch64. */
 	(void)level;
@@ -167,7 +170,7 @@ pte_t arch_mm_table_pte(uint8_t level, paddr_t pa)
  *
  * The level must allow block entries.
  */
-pte_t arch_mm_block_pte(uint8_t level, paddr_t pa, uint64_t attrs)
+pte_t arch_mm_block_pte(mm_level_t level, paddr_t pa, mm_attr_t attrs)
 {
 	pte_t pte = pa_addr(pa) | attrs;
 
@@ -183,90 +186,65 @@ pte_t arch_mm_block_pte(uint8_t level, paddr_t pa, uint64_t attrs)
  *
  * Level 0 must allow block entries.
  */
-bool arch_mm_is_block_allowed(uint8_t level)
+bool arch_mm_is_block_allowed(mm_level_t level)
 {
 	return level <= 2;
 }
 
-/**
- * Determines if the given pte is present, i.e., if it is valid or it is invalid
- * but still holds state about the memory so needs to be present in the table.
- */
-bool arch_mm_pte_is_present(pte_t pte, uint8_t level)
+enum mm_pte_type arch_mm_pte_type(pte_t pte, mm_level_t level)
 {
-	return arch_mm_pte_is_valid(pte, level) || (pte & STAGE2_SW_OWNED) != 0;
+	bool invalid = (pte & PTE_VALID) == 0;
+	bool unowned = (pte & STAGE2_SW_OWNED) == 0;
+	bool table = level != 0 && (pte & PTE_TABLE) != 0;
+
+	if (invalid) {
+		if (unowned) {
+			return PTE_TYPE_ABSENT;
+		}
+
+		return PTE_TYPE_INVALID_BLOCK;
+	}
+
+	if (table) {
+		return PTE_TYPE_TABLE;
+	}
+
+	return PTE_TYPE_VALID_BLOCK;
 }
 
-/**
- * Determines if the given pte is valid, i.e., if it points to another table,
- * to a page, or a block of pages that can be accessed.
- */
-bool arch_mm_pte_is_valid(pte_t pte, uint8_t level)
+static paddr_t pte_addr(pte_t pte)
 {
-	(void)level;
-	return (pte & PTE_VALID) != 0;
-}
-
-/**
- * Determines if the given pte references a block of pages.
- */
-bool arch_mm_pte_is_block(pte_t pte, uint8_t level)
-{
-	/* We count pages at level 0 as blocks. */
-	return arch_mm_is_block_allowed(level) &&
-	       (level == 0 ? (pte & PTE_LEVEL0_BLOCK) != 0
-			   : arch_mm_pte_is_present(pte, level) &&
-				     !arch_mm_pte_is_table(pte, level));
-}
-
-/**
- * Determines if the given pte references another table.
- */
-bool arch_mm_pte_is_table(pte_t pte, uint8_t level)
-{
-	return level != 0 && arch_mm_pte_is_valid(pte, level) &&
-	       (pte & PTE_TABLE) != 0;
-}
-
-static uint64_t pte_addr(pte_t pte)
-{
-	return pte & PTE_ADDR_MASK;
-}
-
-/**
- * Clears the given physical address, i.e., clears the bits of the address that
- * are not used in the pte.
- */
-paddr_t arch_mm_clear_pa(paddr_t pa)
-{
-	return pa_init(pte_addr(pa_addr(pa)));
+	return pa_init(pte & PTE_ADDR_MASK);
 }
 
 /**
  * Extracts the physical address of the block referred to by the given page
  * table entry.
  */
-paddr_t arch_mm_block_from_pte(pte_t pte, uint8_t level)
+paddr_t arch_mm_block_from_pte(pte_t pte, mm_level_t level)
 {
 	(void)level;
-	return pa_init(pte_addr(pte));
+
+	assert(arch_mm_pte_is_block(pte, level));
+	return pte_addr(pte);
 }
 
 /**
- * Extracts the physical address of the page table referred to by the given page
- * table entry.
+ * Extracts the page table referred to by the given page table entry.
  */
-paddr_t arch_mm_table_from_pte(pte_t pte, uint8_t level)
+struct mm_page_table *arch_mm_table_from_pte(pte_t pte, mm_level_t level)
 {
 	(void)level;
-	return pa_init(pte_addr(pte));
+
+	assert(arch_mm_pte_is_table(pte, level));
+	return ptr_from_pa(pte_addr(pte));
 }
 
 /**
  * Extracts the architecture-specific attributes applies to the given page table
  * entry.
  */
-uint64_t arch_mm_pte_attrs(pte_t pte, uint8_t level)
+mm_attr_t arch_mm_pte_attrs(pte_t pte, mm_level_t level)
 {
 	(void)level;
 	return pte & PTE_ATTR_MASK;
@@ -287,7 +265,7 @@ void arch_mm_sync_table_writes(void)
 /**
  * Invalidates stage-1 TLB entries referring to the given virtual address range.
  */
-void arch_mm_invalidate_stage1_range(uint16_t asid, vaddr_t va_begin,
+void arch_mm_invalidate_stage1_range(ffa_id_t asid, vaddr_t va_begin,
 				     vaddr_t va_end)
 {
 	uintvaddr_t begin = va_addr(va_begin);
@@ -444,9 +422,9 @@ void arch_mm_flush_dcache(void *base, size_t size)
 	dsb(sy);
 }
 
-uint64_t arch_mm_mode_to_stage1_attrs(uint32_t mode)
+mm_attr_t arch_mm_mode_to_stage1_attrs(mm_mode_t mode)
 {
-	uint64_t attrs = 0;
+	mm_attr_t attrs = 0;
 
 	attrs |= STAGE1_AF | STAGE1_SH(INNER_SHAREABLE);
 
@@ -530,9 +508,9 @@ uint64_t arch_mm_mode_to_stage1_attrs(uint32_t mode)
 	return attrs;
 }
 
-uint32_t arch_mm_stage1_attrs_to_mode(uint64_t attrs)
+mm_mode_t arch_mm_stage1_attrs_to_mode(mm_attr_t attrs)
 {
-	uint32_t mode = 0;
+	mm_mode_t mode = 0;
 
 #if SECURE_WORLD == 1
 	if (attrs & STAGE1_NS) {
@@ -584,10 +562,10 @@ uint32_t arch_mm_stage1_attrs_to_mode(uint64_t attrs)
 	return mode;
 }
 
-uint64_t arch_mm_mode_to_stage2_attrs(uint32_t mode)
+mm_attr_t arch_mm_mode_to_stage2_attrs(mm_mode_t mode)
 {
-	uint64_t attrs = 0;
-	uint64_t access = 0;
+	mm_attr_t attrs = 0;
+	mm_attr_t access = 0;
 
 	/*
 	 * Default shareability is inner shareable in stage 2 tables. Per
@@ -660,9 +638,9 @@ uint64_t arch_mm_mode_to_stage2_attrs(uint32_t mode)
 	return attrs;
 }
 
-uint32_t arch_mm_stage2_attrs_to_mode(uint64_t attrs)
+mm_mode_t arch_mm_stage2_attrs_to_mode(mm_attr_t attrs)
 {
-	uint32_t mode = 0;
+	mm_mode_t mode = 0;
 
 	if (attrs & STAGE2_S2AP(STAGE2_ACCESS_READ)) {
 		mode |= MM_MODE_R;
@@ -700,27 +678,27 @@ uint32_t arch_mm_stage2_attrs_to_mode(uint64_t attrs)
 	return mode;
 }
 
-void arch_mm_stage1_max_level_set(uint32_t pa_bits)
+void arch_mm_stage1_root_level_set(uint32_t pa_bits)
 {
 	/* Maximum supported PA range in bits is 48 */
 	CHECK(pa_bits <= 48);
 
 	if (pa_bits >= 40) {
-		mm_s1_max_level = 3;
+		mm_s1_root_level = 4;
 	} else {
-		/* Setting to 2 covers physical memory upto 512GB */
-		mm_s1_max_level = 2;
+		/* Setting to 3 covers physical memory upto 512GB */
+		mm_s1_root_level = 3;
 	}
 }
 
-uint8_t arch_mm_stage1_max_level(void)
+mm_level_t arch_mm_stage1_root_level(void)
 {
-	return mm_s1_max_level;
+	return mm_s1_root_level;
 }
 
-uint8_t arch_mm_stage2_max_level(void)
+mm_level_t arch_mm_stage2_root_level(void)
 {
-	return mm_s2_max_level;
+	return mm_s2_root_level;
 }
 
 uint8_t arch_mm_stage1_root_table_count(void)
@@ -739,8 +717,8 @@ uint8_t arch_mm_stage2_root_table_count(void)
  * in that table, returns equivalent attrs to use for a block which will replace
  * the entire table.
  */
-uint64_t arch_mm_combine_table_entry_attrs(uint64_t table_attrs,
-					   uint64_t block_attrs)
+mm_attr_t arch_mm_combine_table_entry_attrs(mm_attr_t table_attrs,
+					    mm_attr_t block_attrs)
 {
 	/*
 	 * Only stage 1 table descriptors have attributes, but the bits are res0
@@ -772,7 +750,7 @@ uint64_t arch_mm_combine_table_entry_attrs(uint64_t table_attrs,
 /**
  * This is called early in initialization without MMU or caches enabled.
  */
-bool arch_mm_init(paddr_t table)
+bool arch_mm_init(const struct mm_ptable *ptable)
 {
 	uint64_t mm_features = read_msr(id_aa64mmfr0_el1);
 	uint64_t pe_features = read_msr(id_aa64pfr0_el1);
@@ -803,22 +781,18 @@ bool arch_mm_init(paddr_t table)
 	 * of bits. The value is chosen to give the shallowest tree by making
 	 * use of concatenated translation tables.
 	 *
-	 *  - 0 => start at level 1
-	 *  - 1 => start at level 2
-	 *  - 2 => start at level 3
 	 */
 	if (pa_bits >= 44) {
-		sl0 = 2;
-		mm_s2_max_level = 3;
+		mm_s2_root_level = 4;
 	} else if (pa_bits >= 35) {
-		sl0 = 1;
-		mm_s2_max_level = 2;
+		mm_s2_root_level = 3;
 	} else {
-		sl0 = 0;
-		mm_s2_max_level = 1;
+		mm_s2_root_level = 2;
 	}
 
-	arch_mm_stage1_max_level_set(pa_bits);
+	sl0 = mm_s2_root_level - 2;
+
+	arch_mm_stage1_root_level_set(pa_bits);
 
 	/*
 	 * Since the shallowest possible tree is used, the maximum number of
@@ -834,11 +808,11 @@ bool arch_mm_init(paddr_t table)
 
 	dlog_info(
 		"Stage 2 has %d page table levels with %d pages at the root.\n",
-		mm_s2_max_level + 1, mm_s2_root_table_count);
+		mm_s2_root_level + 1, mm_s2_root_table_count);
 
 	dlog_info(
 		"Stage 1 has %d page table levels with %d pages at the root.\n",
-		mm_s1_max_level + 1, arch_mm_stage1_root_table_count());
+		mm_s1_root_level + 1, arch_mm_stage1_root_table_count());
 
 	/*
 	 * If the PE implements S-EL2 then VTCR_EL2.NSA/NSW bits are significant
@@ -858,7 +832,7 @@ bool arch_mm_init(paddr_t table)
 	}
 
 	arch_mm_config = (struct arch_mm_config){
-		.ttbr0_el2 = pa_addr(table),
+		.ttbr0_el2 = (uintpaddr_t)ptable->root_tables,
 
 		.vtcr_el2 = (1U << 31) |       /* RES1. */
 			    (nsa_nsw << 29) |  /* NSA/NSW. */
@@ -980,7 +954,7 @@ uint32_t arch_mm_get_pa_bits(uint64_t pa_range)
 /**
  * Return the arch specific mm mode for send/recv pages of given VM ID.
  */
-uint32_t arch_mm_extra_attributes_from_vm(ffa_id_t id)
+mm_mode_t arch_mm_extra_mode_from_vm(ffa_id_t id)
 {
 	return ((id & HF_VM_ID_WORLD_MASK) == HF_HYPERVISOR_VM_ID) ? MM_MODE_NS
 								   : 0;

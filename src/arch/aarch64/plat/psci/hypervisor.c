@@ -60,9 +60,10 @@ void plat_psci_cpu_suspend(uint32_t power_state)
 
 struct vcpu *plat_psci_cpu_resume(struct cpu *c)
 {
-	struct vcpu *vcpu = vcpu_get_boot_vcpu();
+	struct vm *vm = vm_get_boot_vm();
+	struct vcpu *vcpu;
 
-	vcpu = vm_get_vcpu(vcpu->vm, cpu_index(c));
+	vcpu = vm_get_vcpu(vm, cpu_index(c));
 	vcpu->cpu = c;
 
 	arch_cpu_init(c);
@@ -70,7 +71,7 @@ struct vcpu *plat_psci_cpu_resume(struct cpu *c)
 	/* Reset the registers to give a clean start for vCPU. */
 	arch_regs_reset(vcpu);
 
-	/* TODO: call plat_ffa_sri_init? */
+	/* TODO: call ffa_notifications_sri_init? */
 
 	return vcpu;
 }

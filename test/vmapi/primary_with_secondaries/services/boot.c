@@ -53,17 +53,17 @@ static void update_region_security_state(struct memory_region* mem_region)
 	size_t page_count = mem_region->page_count;
 	uint32_t attributes = mem_region->attributes;
 
-	uint32_t mode = 0;
-	uint32_t extra_attributes =
-		(attributes & MANIFEST_REGION_ATTR_SECURITY) != 0 ? MM_MODE_NS
-								  : 0U;
+	mm_mode_t mode = 0;
+	mm_mode_t extra_mode = (attributes & MANIFEST_REGION_ATTR_SECURITY) != 0
+				       ? MM_MODE_NS
+				       : 0U;
 
 	if (!hftest_mm_get_mode(address, FFA_PAGE_SIZE * page_count, &mode)) {
 		FAIL("Memory range has different modes.\n");
 	}
 
 	hftest_mm_identity_map(address, FFA_PAGE_SIZE * page_count,
-			       mode | extra_attributes);
+			       mode | extra_mode);
 }
 
 TEST_SERVICE(boot_memory)
@@ -167,5 +167,149 @@ TEST_SERVICE(boot_memory_manifest)
 			}
 		}
 	}
+	ffa_yield();
+}
+
+static void read_memory_region(const volatile struct memory_region* region)
+{
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+	const volatile uint8_t* ptr = (volatile uint8_t*)region->base_address;
+	size_t page_count = region->page_count;
+	uint64_t sum = 0;
+
+	for (size_t i = 0; i < page_count * PAGE_SIZE; ++i) {
+		sum += ptr[i];
+	}
+
+	ASSERT_NE(sum, 0);
+}
+
+static void write_memory_region(struct memory_region* region)
+{
+	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+	volatile uint8_t* ptr = (volatile uint8_t*)region->base_address;
+	size_t page_count = region->page_count;
+	uint8_t val;
+
+	for (size_t i = 0; i < page_count * PAGE_SIZE; ++i) {
+		val = ptr[i];
+		ptr[i] += 1;
+		ASSERT_EQ(ptr[i], val + 1);
+	}
+}
+
+/*
+ * Validate all memory regions provided to the SP.
+ */
+TEST_SERVICE(boot_memory_manifest_relative)
+{
+	struct hftest_context* ctx = hftest_get_context();
+	struct ffa_partition_manifest* manifest = &ctx->partition_manifest;
+	struct memory_region* mem_region;
+
+	if (!ctx->is_ffa_manifest_parsed) {
+		panic("This test requires the running partition to have "
+		      "received and parsed its own FF-A manifest.\n");
+	}
+
+	exception_setup(NULL, exception_handler_yield_data_abort);
+
+	EXPECT_EQ(manifest->load_addr, 0x6480000);
+	EXPECT_EQ(manifest->mem_region_count, 5);
+
+	mem_region = &manifest->mem_regions[0];
+	EXPECT_STREQ(mem_region->description.data, "test-memory-rw");
+	EXPECT_EQ(mem_region->base_address, manifest->load_addr + 0x300000);
+	EXPECT_EQ(mem_region->is_relative, true);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x3); /* read-write */
+	write_memory_region(mem_region);
+
+	mem_region = &manifest->mem_regions[1];
+	EXPECT_STREQ(mem_region->description.data, "test-memory-ro");
+	EXPECT_EQ(mem_region->base_address, manifest->load_addr + 0x400000);
+	EXPECT_EQ(mem_region->is_relative, true);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x1); /* read-only */
+	read_memory_region(mem_region);
+
+	mem_region = &manifest->mem_regions[2];
+	EXPECT_STREQ(mem_region->description.data, "secure-memory");
+	EXPECT_EQ(mem_region->base_address, 0x7100000);
+	EXPECT_EQ(mem_region->is_relative, false);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x3); /* read-write */
+	write_memory_region(mem_region);
+
+	mem_region = &manifest->mem_regions[3];
+	EXPECT_STREQ(mem_region->description.data, "ro-secure-memory");
+	EXPECT_EQ(mem_region->base_address, 0x7200000);
+	EXPECT_EQ(mem_region->is_relative, false);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x1); /* read-only */
+	read_memory_region(mem_region);
+
+	ffa_yield();
+}
+
+/*
+ * Validate that attempting to write to "test-memory-ro" causes a
+ * fault because it is read-only.
+ */
+TEST_SERVICE(boot_memory_manifest_relative_test_memory_ro)
+{
+	struct hftest_context* ctx = hftest_get_context();
+	struct ffa_partition_manifest* manifest = &ctx->partition_manifest;
+	struct memory_region* mem_region;
+
+	if (!ctx->is_ffa_manifest_parsed) {
+		panic("This test requires the running partition to have "
+		      "received and parsed its own FF-A manifest.\n");
+	}
+
+	exception_setup(NULL, exception_handler_yield_data_abort);
+
+	EXPECT_EQ(manifest->load_addr, 0x6480000);
+	EXPECT_EQ(manifest->mem_region_count, 5);
+
+	mem_region = &manifest->mem_regions[1];
+	EXPECT_STREQ(mem_region->description.data, "test-memory-ro");
+	EXPECT_EQ(mem_region->base_address, manifest->load_addr + 0x400000);
+	EXPECT_EQ(mem_region->is_relative, true);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x1); /* read-only */
+	write_memory_region(mem_region);
+
+	ffa_yield();
+}
+
+/*
+ * Validate that attempting to write to "ro-secure-memory" causes a
+ * fault because it is read-only.
+ */
+TEST_SERVICE(boot_memory_manifest_ro_secure_memory)
+{
+	struct hftest_context* ctx = hftest_get_context();
+	struct ffa_partition_manifest* manifest = &ctx->partition_manifest;
+	struct memory_region* mem_region;
+
+	if (!ctx->is_ffa_manifest_parsed) {
+		panic("This test requires the running partition to have "
+		      "received and parsed its own FF-A manifest.\n");
+	}
+
+	exception_setup(NULL, exception_handler_yield_data_abort);
+
+	EXPECT_EQ(manifest->load_addr, 0x6480000);
+	EXPECT_EQ(manifest->mem_region_count, 5);
+
+	mem_region = &manifest->mem_regions[3];
+	EXPECT_STREQ(mem_region->description.data, "ro-secure-memory");
+	EXPECT_EQ(mem_region->base_address, 0x7200000);
+	EXPECT_EQ(mem_region->is_relative, false);
+	EXPECT_EQ(mem_region->page_count, 0x1);
+	EXPECT_EQ(mem_region->attributes, 0x1); /* read-only */
+	write_memory_region(mem_region);
+
 	ffa_yield();
 }

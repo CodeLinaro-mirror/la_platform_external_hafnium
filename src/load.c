@@ -12,7 +12,6 @@
 
 #include "hf/arch/init.h"
 #include "hf/arch/other_world.h"
-#include "hf/arch/plat/ffa.h"
 #include "hf/arch/vm.h"
 
 #include "hf/api.h"
@@ -20,18 +19,19 @@
 #include "hf/check.h"
 #include "hf/dlog.h"
 #include "hf/fdt_patch.h"
+#include "hf/ffa/interrupts.h"
+#include "hf/ffa/notifications.h"
+#include "hf/ffa/setup_and_discovery.h"
 #include "hf/layout.h"
 #include "hf/manifest.h"
 #include "hf/memiter.h"
 #include "hf/mm.h"
 #include "hf/plat/console.h"
-#include "hf/plat/interrupts.h"
 #include "hf/plat/iommu.h"
 #include "hf/static_assert.h"
 #include "hf/std.h"
 #include "hf/vm.h"
 
-#include "vmapi/hf/call.h"
 #include "vmapi/hf/ffa.h"
 
 /**
@@ -256,11 +256,13 @@ static bool load_common(struct mm_stage1_locked stage1_locked,
 				ipa_init(manifest_vm->partition.load_addr);
 		}
 
+		vm_locked.vm->sri_policy = manifest_vm->partition.sri_policy;
+
 		/* Updating boot list according to boot_order */
-		vcpu_update_boot(vm_get_vcpu(vm_locked.vm, 0));
+		vm_update_boot(vm_locked.vm);
 
 		if (vm_locked_are_notifications_enabled(vm_locked) &&
-		    !plat_ffa_notifications_bitmap_create_call(
+		    !ffa_notifications_bitmap_create_call(
 			    vm_locked.vm->id, vm_locked.vm->vcpu_count)) {
 			return false;
 		}
@@ -408,8 +410,8 @@ static bool load_primary(struct mm_stage1_locked stage1_locked,
 	dlog_info("Loaded primary VM with %u vCPUs, entry at %#lx.\n",
 		  vm->vcpu_count, pa_addr(primary_begin));
 
-	/* Mark the first VM vCPU to be the first booted vCPU. */
-	vcpu_update_boot(vm_get_vcpu(vm, 0));
+	/* Mark the first VM to be the first booted VM. */
+	vm_update_boot(vm);
 
 	vcpu_locked = vcpu_lock(vm_get_vcpu(vm, 0));
 	vcpu_on(vcpu_locked, primary_entry, params->kernel_arg);
@@ -479,9 +481,9 @@ static bool load_secondary_fdt(struct mm_stage1_locked stage1_locked,
 /**
  * Convert the manifest memory region attributes to mode consumed by mm layer.
  */
-static uint32_t memory_region_attributes_to_mode(uint32_t attributes)
+static mm_mode_t memory_region_attributes_to_mode(uint32_t attributes)
 {
-	uint32_t mode = 0U;
+	mm_mode_t mode = 0U;
 
 	if ((attributes & MANIFEST_REGION_ATTR_READ) != 0U) {
 		mode |= MM_MODE_R;
@@ -499,7 +501,7 @@ static uint32_t memory_region_attributes_to_mode(uint32_t attributes)
 	       (mode == (MM_MODE_R | MM_MODE_X)));
 
 	if ((attributes & MANIFEST_REGION_ATTR_SECURITY) != 0U) {
-		mode |= arch_mm_extra_attributes_from_vm(HF_HYPERVISOR_VM_ID);
+		mode |= arch_mm_extra_mode_from_vm(HF_HYPERVISOR_VM_ID);
 	}
 
 	return mode;
@@ -508,9 +510,9 @@ static uint32_t memory_region_attributes_to_mode(uint32_t attributes)
 /**
  * Convert the manifest device region attributes to mode consumed by mm layer.
  */
-static uint32_t device_region_attributes_to_mode(uint32_t attributes)
+static mm_mode_t device_region_attributes_to_mode(uint32_t attributes)
 {
-	uint32_t mode = 0U;
+	mm_mode_t mode = 0U;
 
 	if ((attributes & MANIFEST_REGION_ATTR_READ) != 0U) {
 		mode |= MM_MODE_R;
@@ -523,7 +525,7 @@ static uint32_t device_region_attributes_to_mode(uint32_t attributes)
 	assert((mode == (MM_MODE_R | MM_MODE_W)) || (mode == MM_MODE_R));
 
 	if ((attributes & MANIFEST_REGION_ATTR_SECURITY) != 0U) {
-		mode |= arch_mm_extra_attributes_from_vm(HF_HYPERVISOR_VM_ID);
+		mode |= arch_mm_extra_mode_from_vm(HF_HYPERVISOR_VM_ID);
 	}
 
 	return mode | MM_MODE_D;
@@ -541,7 +543,7 @@ static bool ffa_map_memory_regions(const struct manifest_vm *manifest_vm,
 	paddr_t region_begin;
 	paddr_t region_end;
 	size_t size;
-	uint32_t map_mode;
+	mm_mode_t map_mode;
 	uint32_t attributes;
 
 	/* Map memory-regions */
@@ -667,13 +669,13 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 	struct vm_locked vm_locked;
 	struct vcpu_locked vcpu_locked;
 	struct vcpu *vcpu;
-	ipaddr_t secondary_entry;
+	ipaddr_t partition_primary_ep;
 	bool ret;
 	paddr_t fdt_addr;
 	bool has_fdt;
 	size_t kernel_size = 0;
 	const size_t mem_size = pa_difference(mem_begin, mem_end);
-	uint32_t map_mode;
+	mm_mode_t map_mode;
 	bool is_el0_partition = manifest_vm->partition.run_time_el == S_EL0 ||
 				manifest_vm->partition.run_time_el == EL0;
 	size_t n;
@@ -711,7 +713,7 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 		}
 
 		if (manifest_vm->is_ffa_partition) {
-			plat_ffa_parse_partition_manifest(
+			ffa_setup_parse_partition_manifest(
 				stage1_locked, fdt_addr, fdt_allocated_size,
 				manifest_vm, boot_params, ppool);
 		}
@@ -752,7 +754,7 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 	}
 
 	if (!vm_identity_map(vm_locked, mem_begin, mem_end, map_mode, ppool,
-			     &secondary_entry)) {
+			     &partition_primary_ep)) {
 		dlog_error("Unable to initialise memory.\n");
 		ret = false;
 		goto out;
@@ -765,9 +767,15 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 			ret = false;
 			goto out;
 		}
+		partition_primary_ep = ipa_add(
+			partition_primary_ep, manifest_vm->partition.ep_offset);
 
-		secondary_entry = ipa_add(secondary_entry,
-					  manifest_vm->partition.ep_offset);
+		/*
+		 * If MP endpoints dont specify the entrypoint for secondary
+		 * execution contexts, FF-A spec advises SPMC to reuse the
+		 * entrypoint computed for primary execution context.
+		 */
+		vm->secondary_ep = partition_primary_ep;
 	}
 
 	/*
@@ -810,16 +818,16 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 	vcpu_locked = vcpu_lock(vcpu);
 
 	if (has_fdt) {
-		vcpu_secondary_reset_and_start(vcpu_locked, secondary_entry,
-					       pa_addr(fdt_addr));
+		vcpu_secondary_reset_and_start(
+			vcpu_locked, partition_primary_ep, pa_addr(fdt_addr));
 	} else {
 		/*
 		 * Without an FDT, secondary VMs expect the memory size to be
 		 * passed in register x0, which is what
 		 * vcpu_secondary_reset_and_start does in this case.
 		 */
-		vcpu_secondary_reset_and_start(vcpu_locked, secondary_entry,
-					       mem_size);
+		vcpu_secondary_reset_and_start(vcpu_locked,
+					       partition_primary_ep, mem_size);
 	}
 
 	vcpu_unlock(&vcpu_locked);
@@ -836,7 +844,8 @@ static bool load_secondary(struct mm_stage1_locked stage1_locked,
 	for (n = 0; n < manifest_vm->secondary.vcpu_count; n++) {
 		vcpu = vm_get_vcpu(vm, n);
 		vcpu_locked = vcpu_lock(vcpu);
-		plat_ffa_enable_virtual_interrupts(vcpu_locked, vm_locked);
+		ffa_interrupts_enable_virtual_interrupts(vcpu_locked,
+							 vm_locked);
 		vcpu_unlock(&vcpu_locked);
 	}
 
@@ -961,7 +970,6 @@ bool load_vms(struct mm_stage1_locked stage1_locked,
 	struct vm *primary;
 	struct mem_range mem_ranges_available[MAX_MEM_RANGES];
 	struct vm_locked primary_vm_locked;
-	size_t i;
 	bool success = true;
 
 	/**
@@ -991,7 +999,7 @@ bool load_vms(struct mm_stage1_locked stage1_locked,
 		 params->mem_ranges, sizeof(params->mem_ranges));
 
 	/* Round the last addresses down to the page size. */
-	for (i = 0; i < params->mem_ranges_count; ++i) {
+	for (size_t i = 0UL; i < params->mem_ranges_count; ++i) {
 		mem_ranges_available[i].end = pa_init(align_down(
 			pa_addr(mem_ranges_available[i].end), PAGE_SIZE));
 	}
@@ -999,9 +1007,9 @@ bool load_vms(struct mm_stage1_locked stage1_locked,
 	primary = vm_find(HF_PRIMARY_VM_ID);
 	primary_vm_locked = vm_lock(primary);
 
-	for (i = 0; i < manifest->vm_count; ++i) {
+	for (size_t i = 0UL; i < manifest->vm_count; ++i) {
 		const struct manifest_vm *manifest_vm = &manifest->vm[i];
-		ffa_id_t vm_id = HF_VM_ID_OFFSET + i;
+		ffa_id_t vm_id = (ffa_id_t)(HF_VM_ID_OFFSET + i);
 		uint64_t mem_size;
 		paddr_t secondary_mem_begin;
 		paddr_t secondary_mem_end;

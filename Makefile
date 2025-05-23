@@ -58,8 +58,28 @@ NINJA ?= $(PREBUILTS)/ninja/ninja
 
 CHECKPATCH_SCRIPT:=$(CURDIR)/out/checkpatch/checkpatch.pl
 
+CHECKPATCH_IGNORE_LINTS :="\
+	AVOID_EXTERNS,\
+	BRACES,\
+	EMBEDDED_FUNCTION_NAME,\
+	FILE_PATH_CHANGES,\
+	INDENTED_LABEL,\
+	INITIALISED_STATIC,\
+	MACRO_WITH_FLOW_CONTROL,\
+	NEW_TYPEDEFS,\
+	PREFER_DEFINED_ATTRIBUTE_MACRO,\
+	SINGLE_STATEMENT_DO_WHILE_MACRO,\
+	SPACING,\
+	SPDX_LICENSE_TAG,\
+	SPLIT_STRING,\
+	USE_SPINLOCK_T,\
+	VOLATILE,\
+"
+
 CHECKPATCH := $(CHECKPATCH_SCRIPT) \
-	--ignore BRACES,SPDX_LICENSE_TAG,VOLATILE,SPLIT_STRING,AVOID_EXTERNS,USE_SPINLOCK_T,NEW_TYPEDEFS,INITIALISED_STATIC,FILE_PATH_CHANGES,EMBEDDED_FUNCTION_NAME,SINGLE_STATEMENT_DO_WHILE_MACRO,MACRO_WITH_FLOW_CONTROL,PREFER_PACKED,PREFER_ALIGNED,INDENTED_LABEL,SPACING,PREFER_PRINTF --quiet
+	--show-types \
+ 	--quiet \
+	--ignore $(CHECKPATCH_IGNORE_LINTS)
 
 # Specifies the grep pattern for ignoring specific files in checkpatch.
 # C++ headers, *.hh, are automatically excluded.
@@ -68,7 +88,7 @@ CHECKPATCH := $(CHECKPATCH_SCRIPT) \
 # perfmon.c : uses XMACROS, which checkpatch doesn't understand.
 # feature_id.c : uses XMACROS, which checkpatch doesn't understand.
 # el1_physical_timer.c : uses XMACROS, which checkpatch doesn't understand.
-CHECKPATCH_IGNORE := "src/arch/aarch64/hypervisor/debug_el1.c\|src/arch/aarch64/hypervisor/perfmon.c\|src/arch/aarch64/hypervisor/feature_id.c\|src/arch/aarch64/stack_protector.c\|src/arch/aarch64/inc/hf/arch/sve.h\|inc/hf/dlog.h\|inc/hf/arch/std.h\|inc/hf/panic.h\|inc/system/sys/cdefs.h\|inc/hf/bits.h\|src/arch/aarch64/hypervisor/el1_physical_timer.c"
+CHECKPATCH_IGNORE := "src/arch/aarch64/hypervisor/debug_el1.c\|src/arch/aarch64/hypervisor/perfmon.c\|src/arch/aarch64/hypervisor/feature_id.c\|src/arch/aarch64/stack_protector.c\|src/arch/aarch64/hypervisor/el1_physical_timer.c"
 
 # el1_physical_timer.c : Use of macros causes a fail due to identical consecutive branches in switch.
 TIDY_IGNORE := "src/arch/aarch64/hypervisor/el1_physical_timer.c"
@@ -94,6 +114,20 @@ doc:
 	@echo "  BUILD DOCUMENTATION"
 	make --no-print-directory -C docs html
 
+# Named `test_` rather than `test` because make will not run the target if the
+# `test` directory has not changed.
+.PHONY: test_
+test_: all
+	./kokoro/test.sh
+
+.PHONY: test_spmc
+test_spmc: all
+	./kokoro/test_spmc.sh
+
+.PHONY: test_el3_spmc
+test_el3_spmc: all
+	./kokoro/test_el3_spmc.sh
+
 .PHONY: clean
 clean:
 	@$(NINJA) -C $(OUT_DIR) -t clean
@@ -106,19 +140,13 @@ clobber:
 .PHONY: format
 format:
 	@echo "Formatting..."
-	@find src/ -name \*.c -o -name \*.cc -o -name \*.h | xargs -r clang-format -style file -i
-	@find inc/ -name \*.c -o -name \*.cc -o -name \*.h | xargs -r clang-format -style file -i
-	@find test/ -name \*.c -o -name \*.cc -o -name \*.h | xargs -r clang-format -style file -i
-	@find project/ -name \*.c -o -name \*.cc -o -name \*.h | xargs -r clang-format -style file -i
-	@find vmlib/ -name \*.c -o -name \*.cc -o -name \*.h | xargs -r clang-format -style file -i
-	@find . \( -name \*.gn -o -name \*.gni \) | xargs -n1 $(GN) format
+	@find src/ inc/ test/ project/ vmlib/ -name '*.c' -o -name '*.cc' -o -name '*.h' | xargs -n1 -P0 clang-format -style file -i
+	@find . -name '*.gn' -o -name '*.gni' | xargs -n1 -P0 $(GN) format
 
 .PHONY: checkpatch
 checkpatch: $(CHECKPATCH_SCRIPT)
-	@find src/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
-	@find inc/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
 	# TODO: enable for test/
-	@find project/ -name \*.c -o -name \*.h | grep -v $(CHECKPATCH_IGNORE) | xargs $(CHECKPATCH) -f --no-tree
+	@find src/ inc/ project/ -name '*.c' -o -name '*.h' | grep -v $(CHECKPATCH_IGNORE) | xargs -n1 -P0 $(CHECKPATCH) -f --no-tree
 
 $(CHECKPATCH_SCRIPT):
 	@build/setup_checkpatch.sh
@@ -130,18 +158,14 @@ tidy: $(OUT_DIR)/build.ninja
 	@echo "Tidying..."
 	# TODO: enable readability-magic-numbers once there are fewer violations.
 	# TODO: enable for c++ tests as it currently gives spurious errors.
-	@find src/ test/ -name '*.c' | grep -v $(TIDY_IGNORE) | xargs run-clang-tidy -quiet -p $(OUT_DIR) -fix
+	@find src/ test/ -name '*.c' | grep -v $(TIDY_IGNORE) | xargs run-clang-tidy -quiet -p $(OUT_DIR) -fix 2> /dev/null # silence useless "999 warnings generated." messages
 
-.PHONY: license
-license:
-	@find build/ -name \*.S -o -name \*.c -o -name \*.cc -o -name \*.h -o -name \*.dts -o -name \*.ld | xargs -n1 python3 build/license.py --style c
-	@find inc/ -name \*.S -o -name \*.c -o -name \*.cc -o -name \*.h -o -name \*.dts | xargs -n1 python3 build/license.py --style c
-	@find src/ -name \*.S -o -name \*.c -o -name \*.cc -o -name \*.h -o -name \*.dts | xargs -n1 python3 build/license.py --style c
-	@find test/ -name \*.S -o -name \*.c -o -name \*.cc -o -name \*.h -o -name \*.dts | xargs -n1 python3 build/license.py --style c
-	@find vmlib/ -name \*.S -o -name \*.c -o -name \*.cc -o -name \*.h -o -name \*.dts | xargs -n1 python3 build/license.py --style c
-	@find build/ -name \*.py -o -name \*.sh -o -name \*.inc -o -name Dockerfile* | xargs -n1 python3 build/license.py --style hash
-	@find kokoro/ -name \*.sh -o -name \*.cfg | xargs -n1 python3 build/license.py --style hash
-	@find test/ -name \*.py| xargs -n1 python3 build/license.py --style hash
+# Named `license_` rather than `license_` because make will not run the target if the
+# `LICENSE` file has not changed.
+.PHONY: license_
+license_:
+	@find build/ inc/ src/ test/ vmlib/ -name '*.S' -o -name '*.c' -o -name '*.cc' -o -name '*.h' -o -name '*.dts' -o -name '*.ld' | xargs -n1 python3 build/license.py --style c
+	@find build/ kokoro/ test/ -name '*.py' -o -name '*.sh' -o -name '*.inc' -o -name 'Dockerfile*' | xargs -n1 python3 build/license.py --style hash
 
 .PHONY: list
 list:

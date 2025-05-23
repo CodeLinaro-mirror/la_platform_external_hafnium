@@ -21,38 +21,60 @@ int strncmp(const char *a, const char *b, size_t n);
 
 #define ctz(x) __builtin_ctz(x)
 
-/* Compatibility with old compilers */
-#ifndef __has_builtin
-#define __has_builtin(x) 0
-#endif
-
 /**
  * Check whether the value `v` is aligned to the boundary `a`,
  * with `a` power of 2.
  */
-#if __has_builtin(__builtin_is_aligned)
 #define is_aligned(v, a) __builtin_is_aligned((v), (a))
-#else
-#define is_aligned(v, a) (((uintptr_t)(v) & ((a) - 1)) == 0)
-#endif
 
 /**
  * Align up the value `v` to the boundary `a`, with `a` power of 2.
  */
-#if __has_builtin(__builtin_align_up)
 #define align_up(v, a) __builtin_align_up((v), (a))
-#else
-#define align_up(v, a) (((uintptr_t)(v) + ((a) - 1)) & ~((a) - 1))
-#endif
 
 /**
  * Align down the value `v` to the boundary `a`, with `a` power of 2.
  */
-#if __has_builtin(__builtin_align_down)
 #define align_down(v, a) __builtin_align_down((v), (a))
-#else
-#define align_down(v, a) ((uintptr_t)(v) & ~((a) - 1))
-#endif
+
+/*
+ * Calculate the sum `a + b` and write the result to `*res`.
+ * Returns whether the operation overflowed.
+ */
+#define add_overflow(a, b, res) __builtin_add_overflow((a), (b), (res))
+
+/*
+ * Calculate product `a * b` and write the result to `*res`.
+ * Returns whether the operation overflowed.
+ */
+#define mul_overflow(a, b, res) __builtin_mul_overflow((a), (b), (res))
+
+/*
+ * Round up a value to align with a given size and
+ * check whether overflow happens.
+ * The rounded value is '*res', return false on success and true on overflow.
+ */
+#define align_up_overflow(v, size, res)         \
+	__extension__({                         \
+		typedef __typeof(v) v_t;        \
+		v_t __v = (v);                  \
+		__typeof(size) __size = (size); \
+		__typeof(res) __res = (res);    \
+		*__res = align_up(__v, __size); \
+		__v > *__res;                   \
+	})
+
+/*
+ * Add a with b, then round up the result to align with a given size and
+ * check whether overflow happens.
+ * The rounded value is '*res', return false on success and true on overflow.
+ */
+#define add_with_round_up_overflow(a, b, size, res)                  \
+	(__extension__({                                             \
+		__typeof__(a) __add_res = 0;                         \
+		add_overflow((a), (b), &__add_res) ||                \
+			align_up_overflow(__add_res, (size), (res)); \
+	}))
 
 #ifndef be16toh
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__

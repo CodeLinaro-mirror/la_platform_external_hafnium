@@ -11,13 +11,19 @@
 
 #include "vmapi/hf/call.h"
 
-#include "interrupt_status.h"
+#include "sysregs.h"
 #include "test/hftest.h"
 #include "test/vmapi/ffa.h"
 #include "twdog.h"
+#include "twdog_state.h"
 
 #define ITERATIONS_PER_MS 15000
 #define TWDOG_DELAY 50
+
+/**
+ * Encoding for CTR_EL0 register. Used here for stress test only.
+ */
+#define MSR_CTR_EL0 S3_3_C0_C0_1
 
 static inline uint64_t physicalcounter_read(void)
 {
@@ -60,8 +66,8 @@ TEST_SERVICE(sec_interrupt_preempt_msg)
 	/* Enable the Secure Watchdog timer interrupt. */
 	EXPECT_EQ(hf_interrupt_enable(IRQ_TWDOG_INTID, true, 0), 0);
 
-	receive_indirect_message((void *)&delay, sizeof(delay), recv_buf,
-				 &echo_sender);
+	echo_sender = receive_indirect_message(&delay, sizeof(delay), recv_buf)
+			      .sender;
 
 	HFTEST_LOG("Message received: %#x", delay);
 
@@ -82,9 +88,7 @@ TEST_SERVICE(sec_interrupt_preempt_msg)
 
 	/* SPMC signals the secure interrupt through FFA_INTERRUPT interface. */
 	EXPECT_EQ(res.func, FFA_INTERRUPT_32);
-
-	/* S-EL0 partitions require this to be disabled after the FF-A call. */
-	ASSERT_EQ(hf_interrupt_deactivate(IRQ_TWDOG_INTID), 0);
+	EXPECT_EQ(res.arg2, IRQ_TWDOG_INTID);
 
 	/* Secure interrupt has been serviced by now. Relinquish cycles. */
 	ffa_msg_wait();
@@ -100,15 +104,15 @@ TEST_SERVICE(send_direct_req_yielded_and_resumed)
 				0x88889999};
 
 	receive_indirect_message((void *)&target_vm_id, sizeof(target_vm_id),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	ret = ffa_msg_wait();
 	EXPECT_EQ(ret.func, FFA_RUN_32);
 
 	/* Get the shared page used for interrupt status coordination and track
 	 * it. */
-	hftest_interrupt_status_page_setup(recv_buf, send_buf);
-	EXPECT_EQ(hftest_interrupt_status_get(), INTR_RESET);
+	hftest_twdog_state_page_setup(recv_buf, send_buf);
+	ASSERT_TRUE(hftest_twdog_state_is(INIT));
 
 	ret = ffa_msg_wait();
 	EXPECT_EQ(ret.func, FFA_RUN_32);
@@ -118,15 +122,15 @@ TEST_SERVICE(send_direct_req_yielded_and_resumed)
 
 	EXPECT_EQ(ret.func, FFA_YIELD_32);
 
-	EXPECT_EQ(hftest_interrupt_status_get(), INTR_PROGRAMMED);
+	ASSERT_TRUE(hftest_twdog_state_is(SENT));
 
 	/* Wait for TWDOG secure physical interrupt to trigger. */
 	sp_wait(TWDOG_DELAY + 5);
-	EXPECT_EQ(hftest_interrupt_status_get(), INTR_PROGRAMMED);
+	ASSERT_TRUE(hftest_twdog_state_is(SENT));
 
 	ret = ffa_run(target_vm_id, 0);
 	EXPECT_EQ(ret.func, FFA_MSG_SEND_DIRECT_RESP_32);
-	EXPECT_EQ(hftest_interrupt_status_get(), INTR_SERVICED);
+	ASSERT_TRUE(hftest_twdog_state_is(HANDLED));
 
 	ffa_msg_wait();
 	FAIL("Not expected to reach here");
@@ -152,14 +156,16 @@ TEST_SERVICE(yield_direct_req_service_twdog_int)
 	ret = ffa_msg_wait();
 	EXPECT_EQ(ret.func, FFA_RUN_32);
 
-	/* Get the shared page used for interrupt status coordination and track
-	 * it. */
-	hftest_interrupt_status_page_setup(recv_buf, send_buf);
+	/*
+	 * Get the shared page used for interrupt status coordination and track
+	 * it.
+	 */
+	hftest_twdog_state_page_setup(recv_buf, send_buf);
 
 	/*
 	 * Ensure the status of the interrupt is correct before the test begins.
 	 */
-	EXPECT_EQ(hftest_interrupt_status_get(), INTR_RESET);
+	ASSERT_TRUE(hftest_twdog_state_is(INIT));
 
 	ret = ffa_msg_wait();
 
@@ -167,30 +173,36 @@ TEST_SERVICE(yield_direct_req_service_twdog_int)
 	EXPECT_EQ(ret.func, FFA_MSG_SEND_DIRECT_REQ_32);
 
 	/* Program the trusted watchdog timer and yield to companion SP. */
-	HFTEST_LOG("Start TWDOG timer with a delay of %lu", ret.arg3);
+	dlog_verbose("Start TWDOG timer with a delay of %lu\n", ret.arg3);
 	twdog_start((ret.arg3 * ARM_SP805_TWDG_CLK_HZ) / 1000);
 
-	hftest_interrupt_status_set(INTR_PROGRAMMED);
+	hftest_twdog_state_set(SENT);
 
 	/* Yield the direct request thereby moving to BLOCKED state. */
 	ffa_yield();
 
-	HFTEST_LOG("Completing the direct response");
+	dlog_verbose("Completing the direct response.\n");
 	ret = ffa_msg_send_direct_resp(ffa_receiver(ret), ffa_sender(ret),
 				       ret.arg3, ret.arg4, ret.arg5, ret.arg6,
 				       ret.arg7);
 
 	/* SPMC signals the secure interrupt through FFA_INTERRUPT interface. */
 	EXPECT_EQ(ret.func, FFA_INTERRUPT_32);
+	EXPECT_EQ(ret.arg2, IRQ_TWDOG_INTID);
 
 	/* S-EL0 partitions require this to be disabled after the FF-A call. */
-	ASSERT_EQ(hf_interrupt_deactivate(IRQ_TWDOG_INTID), 0);
 	twdog_stop();
 
 	/* Update the status of interrupt as serviced. */
-	hftest_interrupt_status_set(INTR_SERVICED);
+	hftest_twdog_state_set(HANDLED);
 
 	/* Secure interrupt has been serviced by now. Relinquish cycles. */
 	ffa_msg_wait();
+	FAIL("Not expected to reach here");
+}
+
+TEST_SERVICE(sys_reg_access_trapped)
+{
+	dlog("CTR_EL0 =%lx\n", read_msr(MSR_CTR_EL0));
 	FAIL("Not expected to reach here");
 }

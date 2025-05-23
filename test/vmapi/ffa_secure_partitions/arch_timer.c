@@ -389,6 +389,9 @@ TEST(arch_timer, preempted_state)
 	struct mailbox_buffers mb = set_up_mailbox();
 	struct ffa_partition_info *service2_info = service2(mb.recv);
 	const ffa_id_t receiver_id = service2_info->vm_id;
+	uint64_t rdist_addr = interrupt_get_gic_rdist_addr();
+	io32_t gicr_ispendr0 = IO32_C(rdist_addr + GICR_ISPENDR0);
+	io32_t gicr_isactiver0 = IO32_C(rdist_addr + GICR_ISACTIVER0);
 
 	gicv3_system_setup();
 
@@ -416,9 +419,9 @@ TEST(arch_timer, preempted_state)
 	/* Waiting for interrupt to be serviced in normal world. */
 	while (last_interrupt_id == 0) {
 		EXPECT_EQ(io_read32_array(GICD_ISPENDR, 0), 0);
-		EXPECT_EQ(io_read32(GICR_ISPENDR0), 0);
+		EXPECT_EQ(io_read32(gicr_ispendr0), 0);
 		EXPECT_EQ(io_read32_array(GICD_ISACTIVER, 0), 0);
-		EXPECT_EQ(io_read32(GICR_ISACTIVER0), 0);
+		EXPECT_EQ(io_read32(gicr_isactiver0), 0);
 	}
 
 	/* Check that we got the non-secure watchdog interrupt. */
@@ -619,27 +622,14 @@ TEST_LONG_RUNNING(arch_timer, multiple_sp_periodic_deadline)
 
 void cpu_entry_multiple_deadline_continuous_mp(uintptr_t args)
 {
-	struct ffa_value res;
 	struct multiple_sp_deadline_continuous_arguments *test =
 		// NOLINTNEXTLINE(performance-no-int-to-ptr)
 		(struct multiple_sp_deadline_continuous_arguments *)args;
 
-	/*
-	 * Execution context(s) of Secure Partitions on secondary CPUs need
-	 * cycles, to be allocated through FFA_RUN interface, to reach message
-	 * loop.
-	 */
-	if (!test->service2_is_up) {
-		res = ffa_run(test->service2_id, test->vcpu_id);
-		EXPECT_EQ(ffa_func_id(res), FFA_MSG_WAIT_32);
-	}
-
-	res = ffa_run(test->service3_id, test->vcpu_id);
-	EXPECT_EQ(ffa_func_id(res), FFA_MSG_WAIT_32);
-
 	base_multiple_sp_deadline_continuous(test);
 
 	semaphore_signal(&test->sync);
+	arch_cpu_stop();
 }
 
 TEST_LONG_RUNNING(arch_timer, multiple_sp_periodic_deadline_mp)
@@ -680,7 +670,25 @@ TEST_LONG_RUNNING(arch_timer, multiple_sp_periodic_deadline_mp)
 		 .service2_is_up = service2_info->vcpu_count == 1,
 		 .service3_id = service3_info->vm_id,
 		 .service3_timer_period = 90,
-		 .active_wait_timer = 300}};
+		 .active_wait_timer = 300},
+		/*
+		 * Configure the architectural timers of the Service SPs to
+		 * periodically trigger at a higher frequency (i.e., shorter
+		 * intervals) to stress-test the handling of the CPU_OFF
+		 * power management message by the SPMC and/or SPs. The goal is
+		 * to ensure that any interrupts, generated while SPMC and/or
+		 * SP is handling a power management operation, do not
+		 * interfere with such operations, as the SPMC is expected to
+		 * mask all interrupts during such procedures.
+		 */
+		{.service1_id = service1_info->vm_id,
+		 .service1_timer_period = 1,
+		 .service2_id = service2_info->vm_id,
+		 .service2_timer_period = 1,
+		 .service2_is_up = service2_info->vcpu_count == 1,
+		 .service3_id = service3_info->vm_id,
+		 .service3_timer_period = 1,
+		 .active_wait_timer = 10}};
 
 	for (size_t i = 0; i < ARRAY_SIZE(args); i++) {
 		uintptr_t id;

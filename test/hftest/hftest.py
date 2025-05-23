@@ -46,10 +46,16 @@ HFTEST_CTRL_JSON_REGEX = re.compile("^\\[[0-9a-fA-F]+ [0-9a-fA-F]+\\] ")
 HF_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 DTC_SCRIPT = os.path.join(HF_ROOT, "build", "image", "dtc.py")
-FVP_BINARY = os.path.join(
-    os.path.dirname(HF_ROOT), "fvp", "Base_RevC_AEMvA_pkg", "models",
-    "Linux64_armv8l_GCC-9.3" if MACHINE == "aarch64" else "Linux64_GCC-9.3",
-    "FVP_Base_RevC-2xAEMvA")
+
+try:
+    FVP_BINARY = os.environ['HAFNIUM_FVP']
+    print(f"Setting environment FVP: {FVP_BINARY}")
+except KeyError:
+    FVP_BINARY = os.path.join(
+        os.path.dirname(HF_ROOT), "fvp", "Base_RevC_AEMvA_pkg", "models",
+        "Linux64_armv8l_GCC-9.3" if MACHINE == "aarch64" else "Linux64_GCC-9.3",
+        "FVP_Base_RevC-2xAEMvA")
+
 HF_PREBUILTS = os.path.join(HF_ROOT, "prebuilts")
 QEMU_PREBUILTS = os.path.join(HF_PREBUILTS,
          "linux-" + ("x64" if MACHINE == "x86_64" else MACHINE),
@@ -69,7 +75,7 @@ VM_NODE_REGEX = "vm[1-9]"
 QEMU_CPU_MAX = "max,pauth-impdef=true"
 
 def read_file(path):
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8", errors="backslashreplace") as f:
         return f.read()
 
 def write_file(path, to_write, append=False):
@@ -349,7 +355,13 @@ class FvpDriver(Driver, ABC):
         """Generate command line arguments for FVP."""
         show_output = debug or show_output
         disable_visualisation = self.args.disable_visualisation is True
-        time_limit = "150s" if is_long_running else "40s"
+
+        time_limit = "40s"
+        if self.cov_plugin is None:
+            time_limit = "150s" if is_long_running else time_limit
+        else:
+            time_limit = "300s" if is_long_running else "80s"
+
         fvp_args = []
 
         if not show_output:

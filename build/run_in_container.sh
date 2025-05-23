@@ -38,9 +38,14 @@ IMAGE_ID="$(cat ${IID_FILE})"
 # Parse command line arguments
 INTERACTIVE=false
 ALLOW_PTRACE=false
+TTY=true
 while true
 do
 	case "${1:-}" in
+	--tty)
+	 	TTY=${2:-}
+		shift; shift
+		;;
 	-i)
 		INTERACTIVE=true
 		shift
@@ -51,7 +56,7 @@ do
 		;;
 	-*)
 		echo "ERROR: Unknown command line flag: $1" 1>&2
-		echo "Usage: $0 [-i] [-p] <command>"
+		echo "Usage: $0 [-i] [-p] [--tty true|false] <command>"
 		exit 1
 		;;
 	*)
@@ -62,7 +67,7 @@ done
 
 ARGS=()
 # Run with a pseduo-TTY for nicer logging.
-ARGS+=(-t)
+ARGS+=(--tty=${TTY})
 # Run interactive if this script was invoked with '-i'.
 if [ "${INTERACTIVE}" == "true" ]
 then
@@ -92,9 +97,10 @@ done <<< "$(env)"
 # Set environment variable informing the build that we are running inside
 # a container.
 ARGS+=(-e HAFNIUM_HERMETIC_BUILD=inside)
-# Bind-mount the Hafnium root directory. We mount it at the same absolute
-# location so that all paths match across the host and guest.
+# Bind-mount the Hafnium root directory and the FVP directory. We mount them at
+# the same absolute location so that all paths match across the host and guest.
 ARGS+=(-v "${ROOT_DIR}":"${ROOT_DIR}")
+ARGS+=(-v "${ROOT_DIR}/../fvp":"${ROOT_DIR}/../fvp")
 # Make all files outside of the Hafnium directory read-only to ensure that all
 # generated files are written there.
 ARGS+=(--read-only)

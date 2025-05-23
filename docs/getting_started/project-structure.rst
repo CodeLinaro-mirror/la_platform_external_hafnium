@@ -15,13 +15,11 @@ The source tree is organised as follows:
 
     ├── build
     ├── docs
-    ├── driver
-    │   └── linux
     ├── inc
     │   ├── hf
     │   │   ├── arch
-    │   │   └── plat
-    │   ├── system
+    │   │   ├── plat
+    │   │   └── ffa
     │   └── vmapi
     │       └── hf
     ├── kokoro
@@ -29,6 +27,7 @@ The source tree is organised as follows:
     ├── project
     ├── src
     │   ├── arch
+    │   └── ffa
     ├── test
     │   ├── arch
     │   ├── hftest
@@ -60,8 +59,7 @@ The source tree is organised as follows:
         separate implementations per platform. This includes details of the boot
         flow, and a UART driver for the debug log console.
 
-   - `system`: which are included by the `stdatomic.h` which we use from
-     Android Clang but not really needed, so we use dummy empty versions.
+      - `ffa`: Interface for FF-A features.
 
    - `vmapi/hf`: for the interface exposed to partitions.
 
@@ -81,6 +79,8 @@ The source tree is organised as follows:
 
   - `arch`: Implementation of architecture-dependent modules.
 
+  - `ffa`: Abstraction over SPMC/hypervisor specific implementation details of FF-A features.
+
 - `test`: Integration tests
 
    - `arch`: Tests for components of Hafnium that need to be run on a real architecture.
@@ -88,8 +88,6 @@ The source tree is organised as follows:
    - `hftest`: A simple test framework that supports running tests standalone on bare
      metal, in partitions under Hafnium. Also as user-space binaries under Linux, but these are
      not yet integrated with system where Hafnium is the SPMC.
-
-   - `linux`: Tests which are run in a Linux partition under Hafnium as normal world hypervisor.
 
    - `vmapi`: Tests which are run in minimal test partitions under Hafnium.
 

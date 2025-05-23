@@ -10,18 +10,15 @@
 
 #include "hf/arch/memcpy_trapped.h"
 #include "hf/arch/mm.h"
-#include "hf/arch/other_world.h"
-#include "hf/arch/plat/ffa.h"
 
 #include "hf/addr.h"
-#include "hf/api.h"
-#include "hf/assert.h"
 #include "hf/check.h"
 #include "hf/dlog.h"
 #include "hf/ffa.h"
+#include "hf/ffa/ffa_memory.h"
+#include "hf/ffa/setup_and_discovery.h"
 #include "hf/ffa_internal.h"
 #include "hf/ffa_memory_internal.h"
-#include "hf/ffa_partition_manifest.h"
 #include "hf/mm.h"
 #include "hf/mpool.h"
 #include "hf/panic.h"
@@ -67,14 +64,6 @@ static uint32_t ffa_composite_constituent_offset(
 }
 
 /**
- * Extracts the index from a memory handle allocated by Hafnium's current world.
- */
-uint64_t ffa_memory_handle_get_index(ffa_memory_handle_t handle)
-{
-	return handle & ~FFA_MEMORY_HANDLE_ALLOCATOR_MASK;
-}
-
-/**
  * Initialises the next available `struct ffa_memory_share_state`. If `handle`
  * is `FFA_MEMORY_HANDLE_INVALID` then allocates an appropriate handle,
  * otherwise uses the provided handle which is assumed to be globally unique.
@@ -100,7 +89,7 @@ struct ffa_memory_share_state *allocate_share_state(
 
 			if (handle == FFA_MEMORY_HANDLE_INVALID) {
 				memory_region->handle =
-					plat_ffa_memory_handle_make(i);
+					ffa_memory_make_handle(i);
 			} else {
 				memory_region->handle = handle;
 			}
@@ -157,8 +146,8 @@ struct ffa_memory_share_state *get_share_state(
 	 * First look for a share_state allocated by us, in which case the
 	 * handle is based on the index.
 	 */
-	if (plat_ffa_memory_handle_allocated_by_current_world(handle)) {
-		uint64_t index = ffa_memory_handle_get_index(handle);
+	if (ffa_memory_is_handle_allocated_by_current_world(handle)) {
+		uint64_t index = ffa_memory_handle_index(handle);
 
 		if (index < MAX_MEM_SHARES) {
 			share_state = &share_states.share_states[index];
@@ -364,7 +353,7 @@ void dump_share_states(void)
 static inline uint32_t ffa_memory_permissions_to_mode(
 	ffa_memory_access_permissions_t permissions, uint32_t default_mode)
 {
-	uint32_t mode = 0;
+	mm_mode_t mode = 0;
 
 	switch (permissions.data_access) {
 	case FFA_DATA_ACCESS_RO:
@@ -399,8 +388,8 @@ static inline uint32_t ffa_memory_permissions_to_mode(
 	}
 
 	/* Set the security state bit if necessary. */
-	if ((default_mode & plat_ffa_other_world_mode()) != 0) {
-		mode |= plat_ffa_other_world_mode();
+	if ((default_mode & ffa_memory_get_other_world_mode()) != 0) {
+		mode |= ffa_memory_get_other_world_mode();
 	}
 
 	mode |= default_mode & MM_MODE_D;
@@ -414,7 +403,7 @@ static inline uint32_t ffa_memory_permissions_to_mode(
  * an appropriate FF-A error if not.
  */
 static struct ffa_value constituents_get_mode(
-	struct vm_locked vm, uint32_t *orig_mode,
+	struct vm_locked vm, mm_mode_t *orig_mode,
 	struct ffa_memory_region_constituent **fragments,
 	const uint32_t *fragment_constituent_counts, uint32_t fragment_count)
 {
@@ -573,9 +562,8 @@ bool ffa_memory_region_sanity_check(struct ffa_memory_region *memory_region,
 		if (!receiver_size_and_offset_valid_for_version(
 			    receivers_size, receivers_offset, ffa_version)) {
 			dlog_verbose(
-				"Invalid memory access descriptor size %d, "
-				" or receiver offset %d, "
-				"for FF-A version %#x\n",
+				"Invalid memory access descriptor size %d, or "
+				"receiver offset %d, for FF-A version %#x\n",
 				receivers_size, receivers_offset, ffa_version);
 			return false;
 		}
@@ -752,12 +740,12 @@ static enum ffa_map_action ffa_mem_send_get_map_action(
  */
 static struct ffa_value ffa_send_check_transition(
 	struct vm_locked from, uint32_t share_func,
-	struct ffa_memory_region *memory_region, uint32_t *orig_from_mode,
+	struct ffa_memory_region *memory_region, mm_mode_t *orig_from_mode,
 	struct ffa_memory_region_constituent **fragments,
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t *from_mode, enum ffa_map_action *map_action, bool zero)
+	mm_mode_t *from_mode, enum ffa_map_action *map_action, bool zero)
 {
-	const uint32_t state_mask =
+	const mm_mode_t state_mask =
 		MM_MODE_INVALID | MM_MODE_UNOWNED | MM_MODE_SHARED;
 	struct ffa_value ret;
 	bool all_receivers_from_current_world = true;
@@ -881,10 +869,10 @@ static struct ffa_value ffa_send_check_transition(
 }
 
 static struct ffa_value ffa_relinquish_check_transition(
-	struct vm_locked from, uint32_t *orig_from_mode,
+	struct vm_locked from, mm_mode_t *orig_from_mode,
 	struct ffa_memory_region_constituent **fragments,
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t *from_mode, enum ffa_map_action *map_action)
+	mm_mode_t *from_mode, enum ffa_map_action *map_action)
 {
 	const uint32_t state_mask =
 		MM_MODE_INVALID | MM_MODE_UNOWNED | MM_MODE_SHARED;
@@ -952,10 +940,10 @@ struct ffa_value ffa_retrieve_check_transition(
 	struct vm_locked to, uint32_t share_func,
 	struct ffa_memory_region_constituent **fragments,
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t sender_orig_mode, uint32_t *to_mode, bool memory_protected,
+	mm_mode_t sender_orig_mode, mm_mode_t *to_mode, bool memory_protected,
 	enum ffa_map_action *map_action)
 {
-	uint32_t orig_to_mode;
+	mm_mode_t orig_to_mode;
 	struct ffa_value ret;
 
 	ret = constituents_get_mode(to, &orig_to_mode, fragments,
@@ -1023,7 +1011,7 @@ struct ffa_value ffa_retrieve_check_transition(
 		 * allow the secure access from the SP.
 		 */
 		if (memory_protected) {
-			*to_mode &= ~plat_ffa_other_world_mode();
+			*to_mode &= ~ffa_memory_get_other_world_mode();
 		}
 	}
 
@@ -1063,7 +1051,7 @@ struct ffa_value ffa_retrieve_check_transition(
  */
 static struct ffa_value ffa_region_group_check_actions(
 	struct vm_locked vm_locked, paddr_t pa_begin, paddr_t pa_end,
-	struct mpool *ppool, uint32_t mode, enum ffa_map_action action,
+	struct mpool *ppool, mm_mode_t mode, enum ffa_map_action action,
 	bool *memory_protected)
 {
 	struct ffa_value ret;
@@ -1131,7 +1119,7 @@ static struct ffa_value ffa_region_group_check_actions(
 
 static void ffa_region_group_commit_actions(struct vm_locked vm_locked,
 					    paddr_t pa_begin, paddr_t pa_end,
-					    struct mpool *ppool, uint32_t mode,
+					    struct mpool *ppool, mm_mode_t mode,
 					    enum ffa_map_action action)
 {
 	switch (action) {
@@ -1226,7 +1214,7 @@ struct ffa_value ffa_region_group_identity_map(
 	struct vm_locked vm_locked,
 	struct ffa_memory_region_constituent **fragments,
 	const uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t mode, struct mpool *ppool, enum ffa_map_action action,
+	mm_mode_t mode, struct mpool *ppool, enum ffa_map_action action,
 	bool *memory_protected)
 {
 	uint32_t i;
@@ -1298,7 +1286,7 @@ struct ffa_value ffa_region_group_identity_map(
  * flushed from the cache so the memory has been cleared across the system.
  */
 static bool clear_memory(paddr_t begin, paddr_t end, struct mpool *ppool,
-			 uint32_t extra_mode_attributes)
+			 mm_mode_t extra_mode)
 {
 	/*
 	 * TODO: change this to a CPU local single page window rather than a
@@ -1308,10 +1296,10 @@ static bool clear_memory(paddr_t begin, paddr_t end, struct mpool *ppool,
 	 */
 	bool ret;
 	struct mm_stage1_locked stage1_locked = mm_lock_stage1();
-	void *ptr = mm_identity_map(stage1_locked, begin, end,
-				    MM_MODE_W | (extra_mode_attributes &
-						 plat_ffa_other_world_mode()),
-				    ppool);
+	void *ptr = mm_identity_map(
+		stage1_locked, begin, end,
+		MM_MODE_W | (extra_mode & ffa_memory_get_other_world_mode()),
+		ppool);
 	size_t size = pa_difference(begin, end);
 
 	if (!ptr) {
@@ -1339,7 +1327,7 @@ out:
  * flushed from the cache so the memory has been cleared across the system.
  */
 static bool ffa_clear_memory_constituents(
-	uint32_t security_state_mode,
+	mm_mode_t security_state_mode,
 	struct ffa_memory_region_constituent **fragments,
 	const uint32_t *fragment_constituent_counts, uint32_t fragment_count,
 	struct mpool *page_pool)
@@ -1480,13 +1468,13 @@ static struct ffa_value ffa_send_check_update(
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
 	uint32_t composite_total_page_count, uint32_t share_func,
 	struct ffa_memory_region *memory_region, struct mpool *page_pool,
-	uint32_t *orig_from_mode_ret, bool *memory_protected)
+	mm_mode_t *orig_from_mode_ret, bool *memory_protected)
 {
 	uint32_t i;
 	uint32_t j;
-	uint32_t orig_from_mode;
-	uint32_t clean_mode;
-	uint32_t from_mode;
+	mm_mode_t orig_from_mode;
+	mm_mode_t clean_mode;
+	mm_mode_t from_mode;
 	struct mpool local_page_pool;
 	struct ffa_value ret;
 	uint32_t constituents_total_page_count = 0;
@@ -1582,9 +1570,10 @@ static struct ffa_value ffa_send_check_update(
 	 * perform a non-secure memory access. In such case `clean_mode` takes
 	 * the same mode as `orig_from_mode`.
 	 */
-	clean_mode = (memory_protected != NULL && *memory_protected)
-			     ? orig_from_mode & ~plat_ffa_other_world_mode()
-			     : orig_from_mode;
+	clean_mode =
+		(memory_protected != NULL && *memory_protected)
+			? orig_from_mode & ~ffa_memory_get_other_world_mode()
+			: orig_from_mode;
 
 	/* Clear the memory so no VM or device can see the previous contents. */
 	if (clear && !ffa_clear_memory_constituents(
@@ -1641,11 +1630,12 @@ struct ffa_value ffa_retrieve_check_update(
 	struct vm_locked to_locked,
 	struct ffa_memory_region_constituent **fragments,
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t sender_orig_mode, uint32_t share_func, bool clear,
-	struct mpool *page_pool, uint32_t *response_mode, bool memory_protected)
+	mm_mode_t sender_orig_mode, uint32_t share_func, bool clear,
+	struct mpool *page_pool, mm_mode_t *response_mode,
+	bool memory_protected)
 {
 	uint32_t i;
-	uint32_t to_mode;
+	mm_mode_t to_mode;
 	struct mpool local_page_pool;
 	struct ffa_value ret;
 	enum ffa_map_action map_action = MAP_ACTION_COMMIT;
@@ -1764,11 +1754,11 @@ static struct ffa_value ffa_relinquish_check_update(
 	struct vm_locked from_locked,
 	struct ffa_memory_region_constituent **fragments,
 	uint32_t *fragment_constituent_counts, uint32_t fragment_count,
-	uint32_t sender_orig_mode, struct mpool *page_pool, bool clear)
+	mm_mode_t sender_orig_mode, struct mpool *page_pool, bool clear)
 {
-	uint32_t orig_from_mode;
-	uint32_t clearing_mode;
-	uint32_t from_mode;
+	mm_mode_t orig_from_mode;
+	mm_mode_t clearing_mode;
+	mm_mode_t from_mode;
 	struct mpool local_page_pool;
 	struct ffa_value ret;
 	enum ffa_map_action map_action;
@@ -1875,7 +1865,7 @@ out:
 struct ffa_value ffa_memory_send_complete(
 	struct vm_locked from_locked, struct share_states_locked share_states,
 	struct ffa_memory_share_state *share_state, struct mpool *page_pool,
-	uint32_t *orig_from_mode_ret)
+	mm_mode_t *orig_from_mode_ret)
 {
 	struct ffa_memory_region *memory_region = share_state->memory_region;
 	struct ffa_composite_memory_region *composite;
@@ -2888,8 +2878,16 @@ static struct ffa_value ffa_memory_retrieve_validate_memory_access_list(
 		if (retrieve_request->receiver_count != 1) {
 			dlog_verbose(
 				"Set bypass multiple borrower check, receiver "
-				"list must be sized 1 (%x)\n",
+				"list must be sized 1 in the retrieve request "
+				"not %x.\n",
 				memory_region->receiver_count);
+			return ffa_error(FFA_INVALID_PARAMETERS);
+		}
+		if (memory_region->receiver_count == 1) {
+			dlog_verbose(
+				"Setting the bypass multiple borrower check "
+				"flag for a transaction with a single borrower "
+				"is not allowed.\n");
 			return ffa_error(FFA_INVALID_PARAMETERS);
 		}
 	}
@@ -3305,7 +3303,7 @@ static struct ffa_value ffa_partition_retrieve_request(
 	uint32_t retrieve_request_length, struct mpool *page_pool)
 {
 	ffa_memory_access_permissions_t permissions = {0};
-	uint32_t memory_to_mode;
+	mm_mode_t memory_to_mode;
 	struct ffa_value ret;
 	struct ffa_composite_memory_region *composite;
 	uint32_t total_length;
@@ -3318,7 +3316,7 @@ static struct ffa_value ffa_partition_retrieve_request(
 	struct ffa_memory_access *receiver;
 	ffa_memory_handle_t handle = retrieve_request->handle;
 	ffa_memory_attributes_t attributes = {0};
-	uint32_t retrieve_mode = 0;
+	mm_mode_t retrieve_mode = 0;
 	struct ffa_memory_region *memory_region = share_state->memory_region;
 
 	if (!share_state->sending_complete) {
@@ -3391,7 +3389,7 @@ static struct ffa_value ffa_partition_retrieve_request(
 		share_state->fragment_count;
 
 	/* VMs acquire the RX buffer from SPMC. */
-	CHECK(plat_ffa_acquire_receiver_rx(to_locked, &ret));
+	CHECK(ffa_setup_acquire_receiver_rx(to_locked, &ret));
 
 	/*
 	 * Copy response to RX buffer of caller and deliver the message.
@@ -3403,8 +3401,8 @@ static struct ffa_value ffa_partition_retrieve_request(
 	 * Set the security state in the memory retrieve response attributes
 	 * if specified by the target mode.
 	 */
-	attributes = plat_ffa_memory_security_mode(memory_region->attributes,
-						   retrieve_mode);
+	attributes = ffa_memory_add_security_bit_from_mode(
+		memory_region->attributes, retrieve_mode);
 
 	/*
 	 * Constituents which we received in the first fragment should
@@ -3503,7 +3501,7 @@ static struct ffa_value ffa_hypervisor_retrieve_request(
 	share_state->hypervisor_fragment_count = 1;
 
 	/* VMs acquire the RX buffer from SPMC. */
-	CHECK(plat_ffa_acquire_receiver_rx(to_locked, &ret));
+	CHECK(ffa_setup_acquire_receiver_rx(to_locked, &ret));
 
 	/*
 	 * Copy response to RX buffer of caller and deliver the message.
@@ -3523,7 +3521,7 @@ static struct ffa_value ffa_hypervisor_retrieve_request(
 	 * Set the security state in the memory retrieve response attributes
 	 * if specified by the target mode.
 	 */
-	attributes = plat_ffa_memory_security_mode(
+	attributes = ffa_memory_add_security_bit_from_mode(
 		memory_region->attributes, share_state->sender_orig_mode);
 
 	receiver = ffa_memory_region_get_receiver(memory_region, 0);
@@ -3785,7 +3783,7 @@ struct ffa_value ffa_memory_retrieve_continue(struct vm_locked to_locked,
 	 * When hafnium is the hypervisor, acquire the RX buffer of a VM, that
 	 * is currently ownder by the SPMC.
 	 */
-	assert(plat_ffa_acquire_receiver_rx(to_locked, &ret));
+	assert(ffa_setup_acquire_receiver_rx(to_locked, &ret));
 
 	remaining_constituent_count = ffa_memory_fragment_init(
 		(struct ffa_memory_region_constituent *)retrieve_continue_page,

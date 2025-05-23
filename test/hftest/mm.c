@@ -53,22 +53,22 @@ bool hftest_mm_init(void)
 		HFTEST_FAIL(true, "Failed to add buffer to page-table pool.");
 	}
 
-	if (!mm_ptable_init(&ptable, 0, MM_FLAG_STAGE1, &ppool)) {
+	if (!mm_ptable_init(&ptable, 0, true, &ppool)) {
 		HFTEST_FAIL(true, "Unable to allocate memory for page table.");
 	}
 
 	stage1_locked = hftest_mm_get_stage1();
 	mm_identity_map(stage1_locked,
 			pa_init((uintptr_t)HFTEST_STAGE1_START_ADDRESS),
-			pa_init(mm_ptable_addr_space_end(MM_FLAG_STAGE1)),
+			pa_init(mm_ptable_addr_space_end(stage1_locked.ptable)),
 			MM_MODE_R | MM_MODE_W | MM_MODE_X, &ppool);
 
-	arch_vm_mm_enable(ptable.root);
+	arch_vm_mm_enable(&ptable);
 
 	return true;
 }
 
-bool hftest_mm_get_mode(const void *base, size_t size, uint32_t *mode)
+bool hftest_mm_get_mode(const void *base, size_t size, mm_mode_t *mode)
 {
 	vaddr_t start = va_from_ptr(base);
 	vaddr_t end = va_add(start, size);
@@ -79,7 +79,7 @@ bool hftest_mm_get_mode(const void *base, size_t size, uint32_t *mode)
 	return mm_get_mode(stage1_locked.ptable, start, end, mode);
 }
 
-void hftest_mm_identity_map(const void *base, size_t size, uint32_t mode)
+void hftest_mm_identity_map(const void *base, size_t size, mm_mode_t mode)
 {
 	struct mm_stage1_locked stage1_locked = hftest_mm_get_stage1();
 	paddr_t start = pa_from_va(va_from_ptr(base));
@@ -93,5 +93,5 @@ void hftest_mm_identity_map(const void *base, size_t size, uint32_t mode)
 
 void hftest_mm_vcpu_init(void)
 {
-	arch_vm_mm_enable(ptable.root);
+	arch_vm_mm_enable(&ptable);
 }

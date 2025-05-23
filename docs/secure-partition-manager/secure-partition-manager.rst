@@ -217,7 +217,7 @@ A sample can be found at `[7]`_:
 
 * The *hypervisor* node describes SPs. *is_ffa_partition* boolean attribute
   indicates a |FF-A| compliant SP. The *load_address* field specifies the load
-  address at which BL2 loaded the SP package.
+  address at which BL2 loaded the partition package.
 * The *cpus* node provides the platform topology and allows MPIDR to VMPIDR mapping.
   Note the primary core is declared first, then secondary cores are declared
   in reverse order.
@@ -332,18 +332,28 @@ following SP types:
 Secure Partition packages
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Secure partitions are bundled as independent package files consisting
-of:
+Secure partitions are bundled as independent package files. Current supported
+partition package types are a Secure Partition Package or a Transfer List Package.
+
+The partition package type can be specified in the SP Layout of the SP (see section
+`Secure Partitions Layout File`_).
+
+A Secure Partition package is an implementation defined format that includes:
 
 - a header
 - a DTB
 - an image payload
 
+A Transfer List (TL) package type should include an entry for the image and an entry for the DTB
+using the Transfer Entry format. The TL package can also use other Transfer Entry types to include
+optional platform-specific boot information to be passed to the SP, such as a HOB list. More
+information on Transfer Lists can be found in the `Firmware Handoff specification`_.
+
 The header starts with a magic value and offset values to SP DTB and
-image payload. Each SP package is loaded independently by BL2 loader
+image payload. Each partition package is loaded independently by BL2 loader
 and verified for authenticity and integrity.
 
-The SP package identified by its UUID (matching FF-A uuid property) is
+The partition package identified by its UUID (matching FF-A uuid property) is
 inserted as a single entry into the FIP at end of the TF-A build flow
 as shown:
 
@@ -368,11 +378,11 @@ Secure Partitions Layout File
 
 A json-formatted description file is passed to the build flow specifying paths
 to the SP binary image and associated DTS partition manifest file. The latter
-is processed by the dtc compiler to generate a DTB fed into the SP package.
+is processed by the dtc compiler to generate a DTB fed into the partition package.
 Each partition can be configured with the following fields:
 
 :code:`image`
-  - Specifies the filename and offset of the image within the SP package.
+  - Specifies the filename and offset of the image within the partition package.
   - Can be written as :code:`"image": { "file": "path", "offset": 0x1234 }` to
     give both :code:`image.file` and :code:`image.offset` values explicitly, or
     can be written as :code:`"image": "path"` to give :code:`image.file` and value
@@ -382,12 +392,12 @@ Each partition can be configured with the following fields:
     - Specifies the filename of the image.
 
   :code:`image.offset`
-    - Specifies the offset of the image within the SP package.
+    - Specifies the offset of the image within the partiton package.
     - Must be 4KB aligned, because that is the translation granule supported by Hafnium SPMC.
     - Optional. Defaults to :code:`0x4000`.
 
 :code:`pm`
-  - Specifies the filename and offset of the partition manifest within the SP package.
+  - Specifies the filename and offset of the partition manifest within the partition package.
   - Can be written as :code:`"pm": { "file": "path", "offset": 0x1234 }` to
     give both :code:`pm.file` and :code:`pm.offset` values explicitly, or
     can be written as :code:`"pm": "path"` to give :code:`pm.file` and value
@@ -397,13 +407,13 @@ Each partition can be configured with the following fields:
     - Specifies the filename of the partition manifest.
 
   :code:`pm.offset`
-    - Specifies the offset of the partition manifest within the SP package.
+    - Specifies the offset of the partition manifest within the partition package.
     - Must be 4KB aligned, because that is the translation granule supported by Hafnium SPMC.
     - Optional. Defaults to :code:`0x1000`.
 
 :code:`image.offset` and :code:`pm.offset` can be leveraged to support SPs with
 S1 translation granules that differ from 4KB, and to configure the regions
-allocated within the SP package, as well as to comply with the requirements for
+allocated within the partition package, as well as to comply with the requirements for
 the implementation of the boot information protocol (see `Passing boot data to
 the SP`_ for more details).
 
@@ -419,6 +429,14 @@ the SP`_ for more details).
 :code:`physical-load-address`
   - Specifies the :code:`load_address` field of the generated DTS fragment.
   - Optional. Defaults to the value of the :code:`load-address` from the DTS partition manifest.
+
+:code:`package`
+  - Specifies the package type of the partition package.
+  - Optional. Defaults to the value of :code:`sp_pkg`.
+
+:code:`size`
+  - Specifies the size in bytes of the partition package.
+  - Optional. Defaults to :code:`0x100000`.
 
 .. code:: shell
 
@@ -445,7 +463,9 @@ the SP`_ for more details).
                 "file": "tee3.dts",
                 "offset":"0x6000"
              },
-            "owner": "Plat"
+            "owner": "Plat",
+            "package": "tl_pkg",
+            "size": "0x100000"
         },
     }
 
@@ -496,7 +516,7 @@ secondary physical core entry point physical address by the use of the
 `FFA_SECONDARY_EP_REGISTER`_ interface (SMC invocation from the SPMC to the SPMD
 at secure physical FF-A instance).
 
-The SPMC then creates secure partitions base on SP packages and manifests. Each
+The SPMC then creates secure partitions based on partition packages and manifests. Each
 secure partition is launched in sequence (`SP Boot order`_) on their "primary"
 execution context. If the primary boot physical core linear id is N, an MP SP is
 started using EC[N] on PE[N] (see `Platform topology`_). If the partition is a
@@ -521,20 +541,27 @@ woken up by the ``PSCI_CPU_ON`` service invocation. The TF-A SPD hook mechanism
 calls into the SPMD on the newly woken up physical core. Then the SPMC is
 entered at the secondary physical core entry point.
 
-In the current implementation, the first SP is resumed on the coresponding EC
-(the virtual CPU which matches the physical core). The implication is that the
-first SP must be a MP SP.
+As per secondary boot protocol described in section 18.2.2 of the FF-A v1.3ALP1
+specification, each pinned execution context of every MP SP is woken up by SPMC,
+thereby giving an opportunity to the MP SP's EC on secondary core to initialize
+itself. Upon successful initialization, the EC relinquishes CPU cycles through
+FFA_MSG_WAIT ABI and moves to WAITING state.
+
+Note that an UP SP does not have a pinned execution context. Hence, if a system
+only has UP SPs, then there are no pinned execution contexts to be resumed on
+secondary cores.
 
 In a linux based system, once secure and normal worlds are booted but prior to
 a NWd FF-A driver has been loaded:
 
-- The first SP has initialized all its ECs in response to primary core boot up
-  (at system initialization) and secondary core boot up (as a result of linux
-  invoking PSCI_CPU_ON for all secondary cores).
-- Other SPs have their first execution context initialized as a result of secure
-  world initialization on the primary boot core. Other ECs for those SPs have to
-  be run first through ffa_run to complete their initialization (which results
-  in the EC completing with FFA_MSG_WAIT).
+- Every MP SP has initialized its primary EC in response to primary core boot up
+  (at system initialization) and secondary ECs in response to secondary cores
+  boot up (as a result of linux invoking PSCI_CPU_ON for all secondary cores).
+  If there are multiple MP SPs deployed, the order in which their respective
+  ECs are woken up is determined by the boot-order field in the partition
+  manifests.
+- Every UP SP has its only EC initialized as a result of secure world
+  initialization on the primary boot core.
 
 Refer to `Power management`_ for further details.
 
@@ -576,10 +603,10 @@ The aggregate of both the boot info structures and the data itself is designated
 the boot information blob, and is passed to a Partition as a contiguous memory
 region.
 
-Currently, the SPM implementation supports the FDT type which is used to pass the
-partition's DTB manifest.
+Currently, the SPM implementation supports the FDT type, which is used to pass the
+partition's DTB manifest, and the Hand-off Block (HOB) list type.
 
-The region for the boot information blob is allocated through the SP package.
+The region for the boot information blob is allocated through the partition package.
 
 .. image:: ../resources/diagrams/partition-package.png
 
@@ -587,6 +614,9 @@ To adjust the space allocated for the boot information blob, the json descriptio
 of the SP (see section `Secure Partitions Layout File`_) shall be updated to contain
 the manifest offset. If no offset is provided the manifest offset defaults to 0x1000,
 which is the page size in the Hafnium SPMC.
+
+Currently, the SPM implementation does not yet support specifying the offset for the
+HOB list in the json description of the SP. A default value of 0x2000 is used.
 
 The configuration of the boot protocol is done in the SPs manifest. As defined by
 the specification, the manifest field 'gp-register-num' configures the GP register
@@ -602,11 +632,18 @@ to be listed in a designated DT node:
       ffa_manifest;
   };
 
+.. code:: shell
+
+  boot-info {
+      compatible = "arm,ffa-manifest-boot-info";
+      hob_list;
+  };
+
 The whole secure partition package image (see `Secure Partition packages`_) is
 mapped to the SP secure EL1&0 Stage-2 translation regime. As such, the SP can
 retrieve the address for the boot information blob in the designated GP register,
 process the boot information header and descriptors, access its own manifest
-DTB blob and extract its partition manifest properties.
+DTB blob or HOB list and extract its properties.
 
 SPMC Runtime
 ============
@@ -1558,10 +1595,8 @@ Inter-Processor Interrupts
 Inter-Processor Interrupts (IPIs) are a mechanism for an SP to send an interrupt
 to to itself on another CPU in a multiprocessor system.
 
-Currently Hafnium only supports a single SP to send an IPI to each CPU at a time.
-This is described in the example below.
 If an SP wants to send an IPI from vCPU0 on CPU0 to vCPU1 on CPU1 it uses the HVC
-paravirtualized interface HF_INTERRUPT_SENT_IPI, specifying the ID of vCPU1 as the target.
+paravirtualized interface `HF_INTERRUPT_SEND_IPI`_, specifying the ID of vCPU1 as the target.
 The SPMC on CPU0 records the vCPU1 as the target vCPU the IPI is intended for, and requests
 the GIC to send a secure interrupt to the CPU1 (interrupt ID 9 has been assigned for IPIs).
 This secure interrupt is caught by the SPMC on CPU1 and enters the secure interrupt handler.
@@ -1572,12 +1607,65 @@ Here the handling of the IPI depends on the current state of the target vCPU1 as
 - WAITING: The IPI is injected to vCPU1 and an SRI is triggered to notify the Normal
   World scheduler the SP vCPU1 has a pending IPI and requires cycles to handle it.
   This SRI is received in the Normal World on CPU1, here the notifications interface
-  has been extended so that FFA_NOTIFICATION_INFO_GET will also return the SP ID and
+  has been extended so that `FFA_NOTIFICATION_INFO_GET`_ will also return the SP ID and
   vCPU ID of any vCPUs with pending IPIs. Using this information the Normal World can
   use FFA_RUN to allocate vCPU1 CPU cycles.
 - PREEMPTED/BLOCKED: Inject and queue the virtual interrupt for vCPU1. We know,
   for these states, the vCPU will eventually resumed by the Normal World Scheduler
   and the IPI virtual interrupt will then be serviced by the target vCPU.
+
+Supporting multiple services targeting vCPUs on the same CPU adds some complexity to the
+handling of IPIs. The intention behind the implementation choices is to fulfil the
+following requirements:
+
+1. All target vCPUs should receive an IPI.
+2. The running vCPU should be prioritized if it has a pending IPI, so that it isn’t
+   preempted by another vCPU, just to be later run again to handle its IPI.
+
+To achieve this, a queue of vCPUs with pending IPIs is maintained for each CPU.
+When handling the IPI SGI, the list of vCPUs with pending IPIs for the current CPU
+is emptied and each vCPU is handled as described above, fulfilling requirement 1.
+To ensure the running vCPU is prioritized, as specified in requirement 2, if there
+is a vCPU with a pending IPI in the WAITING state, and the current (running) vCPU
+also has a pending IPI, Hafnium will send the SRI at the next context switch to the
+NWd. This means the running vCPU can handle it's IPI before the NWd is interrupted
+by the SRI to schedule the waiting vCPUs. If the current (running) vCPU does not
+have a pending IPI the SRI is immediately sent.
+
+As an example this diagram shows the flow for an SP sending an IPI to a vCPU in the
+waiting state.
+
+.. image:: ../resources/diagrams/ipi_nwd_waiting_vcpu.png
+
+The transactions in the diagram above are as follows:
+
+1. SP1 running on vCPU0 sends the IPI targeting itself on vCPU1 using the
+   paravirtualised interface `HF_INTERRUPT_SEND_IPI`_.
+2. Hafnium records that there is a pending IPI for SP1 vCPU1 and triggers
+   an IPI SGI, via the interrupt controller, for CPU1.
+3. FFA_SUCCESS is returned to SP1 vCPU0 to show the IPI has been sent.
+4. The interrupt controller triggers the IPI SGI targeted at CPU1.
+   As described above, when handing the interrupt, the list of vCPUs on this CPU with
+   pending IPIs is traversed. In the case of this example SP1 vCPU1 will be in the list
+   and is in the WAITING state. If the current (RUNNING) vCPU also has a pending IPI then
+   the flow follows the Case A on the diagram. Set the IPI virtual interrupt
+   as pending on the target vCPU and set the delayed SRI flag for the current CPU.
+   Otherwise the flow follows the Case B: simply set the IPI virtual interrupt as pending
+   on the target vCPU.
+5. For the Case B the SPM sends the Schedule Receiver Interrupt (SRI) SGI through the
+   interrupt controller.
+6. In both cases the interrupt controller will eventually send an SRI SGI targeted
+   at CPU1. This will be received by the FF-A driver in the NWd.
+7. This FF-A driver can use `FFA_NOTIFICATION_INFO_GET`_ to find more information about the
+   cause of the SRI.
+8. For this test, the IPI targeted at SP1 vCPU1 so this is returned in the list of partitions
+   returned in FFA_SUCCESS.
+9. From the information given by `FFA_NOTIFICATION_INFO_GET`_, the FF-A driver knows to
+   allocate SP1 vCPU1 cycles to handle the IPI. It does this through FFA_RUN.
+10. Hafnium resumes the target vCPU and injects the IPI virtual interrupts.
+11. The execution is preempted to the IRQ handlers by the pending virtual interrupt.
+12. The SP calls HF_INTERRUPT_GET to obtain the respective interrupt ID.
+13. Hafnium return the IPI interrupt ID via eret. Handling can then continue as required.
 
 Power management
 ----------------
@@ -1602,11 +1690,27 @@ When using the SPMD as a Secure Payload Dispatcher:
   signaled to the SPMC through a power management framework message.
   It consists in a SPMD-to-SPMC direct request/response (`SPMC-SPMD direct
   requests/responses`_) conveying the event details and SPMC response.
-  The SPMD performs a synchronous entry into the SPMC. The SPMC is entered and
-  updates its internal state to reflect the physical core is being turned off.
-  In the current implementation no SP is resumed as a consequence. This behavior
-  ensures a minimal support for CPU hotplug e.g. when initiated by the NWd linux
-  userspace.
+  The SPMD performs a synchronous entry into the SPMC. Once the SPMC is entered:
+
+   * It updates the internal state to reflect the physical core is being turned
+     off.
+   * It relays the PSCI CPU_OFF power management operation as a framework direct
+     request message to the pinned execution context of the first MP SP
+     provided:
+
+       * The SP has subscribed to the CPU_OFF operation explicitly through its
+         partition manifest. Refer to `[6]`_ for details of corresponding FF-A
+         binding.
+       * The pinned execution context is in the WAITING state.
+
+   * Else, it sends a framework direct response to SPMD with success status code.
+   * SPMC receives the direct response from the SP for the direct request
+     framework message it had sent earlier.
+   * If the status code in the message from SP is not SUCCESS, then SPMC
+     sends a framework direct response to SPMD with DENIED status code. SPMD
+     will eventually panic and stop the execution.
+   * Else, SPMC continues to relay PSCI CPU_OFF power management operation to
+     other subscribed MP SPs.
 
 Arm architecture extensions for security hardening
 --------------------------------------------------
@@ -1934,6 +2038,8 @@ References
 .. _device node: https://trustedfirmware-a.readthedocs.io/en/latest/components/ffa-manifest-binding.html#device-regions
 
 .. _memory region node: https://trustedfirmware-a.readthedocs.io/en/latest/components/ffa-manifest-binding.html#memory-regions
+
+.. _Firmware Handoff specification: https://github.com/FirmwareHandoff/firmware_handoff/
 
 .. _[1]:
 

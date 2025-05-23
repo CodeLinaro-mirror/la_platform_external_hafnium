@@ -6,6 +6,9 @@
  * https://opensource.org/licenses/BSD-3-Clause.
  */
 
+#include "hf/arch/irq.h"
+#include "hf/arch/vm/interrupts.h"
+
 #include "hf/check.h"
 #include "hf/ffa.h"
 
@@ -14,6 +17,7 @@
 
 #include "primary_with_secondary.h"
 #include "test/hftest.h"
+#include "test/vmapi/arch/exception_handler.h"
 #include "test/vmapi/ffa.h"
 
 #define MAX_RESP_REGS (MAX_MSG_SIZE / sizeof(uint64_t))
@@ -141,7 +145,7 @@ TEST_SERVICE(ffa_direct_message_echo_services)
 
 	/* Retrieve FF-A ID of the target endpoint. */
 	receive_indirect_message((void *)&target_id, sizeof(target_id),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	HFTEST_LOG("Echo test with: %x", target_id);
 
@@ -172,7 +176,7 @@ TEST_SERVICE(ffa_direct_message_req2_echo_services)
 
 	/* Retrieve uuid of target endpoint. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	HFTEST_LOG("Target UUID: %X-%X-%X-%X", target_uuid.uuid[0],
 		   target_uuid.uuid[1], target_uuid.uuid[2],
@@ -219,7 +223,7 @@ TEST_SERVICE(ffa_yield_direct_message_echo_services)
 
 	/* Retrieve FF-A ID of the target endpoint. */
 	receive_indirect_message((void *)&target_id, sizeof(target_id),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	HFTEST_LOG("Echo test with: %x", target_id);
 
@@ -396,9 +400,13 @@ TEST_SERVICE(ffa_direct_message_v_1_2_cycle_denied)
 	void *recv_buf = SERVICE_RECV_BUFFER();
 	struct ffa_uuid target_uuid;
 
+	/* Setup handling of NPI, to handle RX buffer full notification. */
+	exception_setup(check_npi, NULL);
+	arch_irq_enable();
+
 	/* Retrieve uuid of target endpoint. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	/* Wait for direct request. */
 	args = ffa_msg_wait();
@@ -437,9 +445,13 @@ TEST_SERVICE(ffa_direct_message_cycle_req_req2_denied)
 	void *recv_buf = SERVICE_RECV_BUFFER();
 	struct ffa_uuid target_uuid;
 
+	/* Setup handling of NPI, to handle RX buffer full notification. */
+	exception_setup(check_npi, NULL);
+	arch_irq_enable();
+
 	/* Retrieve uuid of target endpoint. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	/* Wait for direct request. */
 	args = ffa_msg_wait();
@@ -475,7 +487,7 @@ TEST_SERVICE(ffa_yield_direct_message_v_1_2_echo_services)
 
 	/* Retrieve FF-A ID of the target endpoint. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	/* From uuid to respective partition info. */
 	ASSERT_EQ(get_ffa_partition_info(target_uuid, &target_info,
@@ -582,9 +594,13 @@ TEST_SERVICE(ffa_disallowed_direct_msg_req2)
 	uint64_t msg[MAX_RESP_REGS] = {0};
 	struct ffa_uuid target_uuid;
 
+	/* Setup handling of NPI, to handle RX buffer full notification. */
+	exception_setup(check_npi, NULL);
+	arch_irq_enable();
+
 	/* Retrieve uuid of NWd PVM. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	service1_info = service1(recv_buf);
 
@@ -746,7 +762,7 @@ TEST_SERVICE(version_does_not_support_req2)
 
 	/* Retrieve uuid of target endpoint. */
 	receive_indirect_message((void *)&target_uuid, sizeof(target_uuid),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	HFTEST_LOG("Target UUID: %X-%X-%X-%X", target_uuid.uuid[0],
 		   target_uuid.uuid[1], target_uuid.uuid[2],
@@ -855,7 +871,8 @@ TEST_SERVICE(vm_availability_messaging)
 	struct ffa_value args = ffa_msg_wait();
 
 	for (;;) {
-		enum ffa_framework_msg_func func = ffa_framework_msg_func(args);
+		enum ffa_framework_msg_func func =
+			ffa_framework_msg_get_func(args);
 		ffa_id_t sender_id = ffa_sender(args);
 		ffa_id_t receiver_id = ffa_receiver(args);
 		ffa_id_t vm_id = ffa_vm_availability_message_vm_id(args);
@@ -899,7 +916,8 @@ TEST_SERVICE(vm_availability_messaging_send_from_sp)
 	struct ffa_value args = ffa_msg_wait();
 
 	for (;;) {
-		enum ffa_framework_msg_func func = ffa_framework_msg_func(args);
+		enum ffa_framework_msg_func func =
+			ffa_framework_msg_get_func(args);
 		ffa_id_t sp_id = ffa_receiver(args);
 		ffa_id_t pvm_id = ffa_sender(args);
 		ffa_id_t vm_id = ffa_vm_availability_message_vm_id(args);
@@ -929,10 +947,21 @@ TEST_SERVICE(vm_availability_messaging_send_non_framework_from_sp)
 {
 	struct ffa_value args = ffa_msg_wait();
 	struct ffa_value ret;
-	uint32_t ffa_func = args.func;
+	enum ffa_framework_msg_func func = ffa_framework_msg_get_func(args);
+	enum ffa_framework_msg_func func_resp = FFA_FRAMEWORK_MSG_INVALID;
 	ffa_id_t sp_id = ffa_receiver(args);
 	ffa_id_t pvm_id = ffa_sender(args);
 
+	if (func == FFA_FRAMEWORK_MSG_VM_CREATION_REQ) {
+		func_resp = FFA_FRAMEWORK_MSG_VM_CREATION_RESP;
+	} else if (func == FFA_FRAMEWORK_MSG_VM_DESTRUCTION_REQ) {
+		func_resp = FFA_FRAMEWORK_MSG_VM_DESTRUCTION_RESP;
+	} else {
+		FAIL("Unsupported framework message function%#x received",
+		     func);
+	}
+
+	/* Attempt to send a standard direct response message. */
 	ret = ffa_msg_send_direct_resp(sp_id, pvm_id, args.arg3, args.arg4,
 				       args.arg5, args.arg6, args.arg7);
 
@@ -940,13 +969,10 @@ TEST_SERVICE(vm_availability_messaging_send_non_framework_from_sp)
 	ASSERT_EQ(ret.func, FFA_ERROR_32);
 	ASSERT_EQ((enum ffa_error)ret.arg2, FFA_DENIED);
 
-	/* Send a valid response, so that the VM is not blocked forever. */
-	args = ffa_framework_message_send_direct_resp(sp_id, pvm_id, ffa_func,
-						      0);
-	ASSERT_EQ(args.func, FFA_MSG_SEND_DIRECT_REQ_32);
-	EXPECT_EQ(ffa_sender(args), pvm_id);
-	EXPECT_EQ(ffa_receiver(args), sp_id);
-	EXPECT_EQ(args.arg2,
-		  FFA_FRAMEWORK_MSG_BIT | FFA_FRAMEWORK_MSG_VM_DESTRUCTION_REQ);
-	ASSERT_EQ(args.arg3, 0);
+	/*
+	 * Send a valid framework direct response message, so that the VM is not
+	 * blocked forever.
+	 */
+	ffa_framework_message_send_direct_resp(sp_id, pvm_id, func_resp, 0);
+	FAIL("Direct response not expected to return");
 }

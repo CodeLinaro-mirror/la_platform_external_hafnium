@@ -8,6 +8,8 @@
 
 #include "arm_smmuv3.h"
 
+#include "hf/arch/types.h"
+
 #include "hf/dlog.h"
 #include "hf/io.h"
 #include "hf/panic.h"
@@ -76,7 +78,7 @@ static void smmuv3_disabled_translation(struct smmuv3_driver *smmuv3)
 	gbpa_reg =
 		gbpa_reg | COMPOSE(INCOMING_CFG, ALLOCFG_SHIFT, ALLOCFG_MASK);
 	gbpa_reg = gbpa_reg | COMPOSE(INCOMING_CFG, MTCFG_SHIFT, MTCFG_MASK);
-	gbpa_update_set = (1 << UPDATE_SHIFT);
+	gbpa_update_set = (UINT32_C(1) << UPDATE_SHIFT);
 
 	offset = find_offset(S_GBPA, GBPA);
 
@@ -85,7 +87,7 @@ static void smmuv3_disabled_translation(struct smmuv3_driver *smmuv3)
 			    gbpa_reg | gbpa_update_set);
 
 	if (!smmuv3_poll(smmuv3->base_addr, offset, gbpa_reg,
-			 (1 << UPDATE_SHIFT))) {
+			 (UINT32_C(1) << UPDATE_SHIFT))) {
 		panic("SMMUv3: Failed to update Gloal Bypass Attribute\n");
 	}
 }
@@ -1281,14 +1283,14 @@ static bool smmuv3_config_ste_stg2(struct smmuv3_driver *smmuv3, uint16_t vm_id,
 	uint64_t vsttbr;
 
 	/* BITS 243:196 */
-	vttbr = (pa_addr(iommu_ptable_ns[dma_device_id].root) &
+	vttbr = ((uintpaddr_t)(iommu_ptable_ns[dma_device_id].root_tables) &
 		 GEN_MASK(51, 4)) >>
 		4;
 
 	/* BITS 435:388 */
-	vsttbr =
-		(pa_addr(iommu_ptable[dma_device_id].root) & GEN_MASK(51, 4)) >>
-		4;
+	vsttbr = ((uintpaddr_t)(iommu_ptable[dma_device_id].root_tables) &
+		  GEN_MASK(51, 4)) >>
+		 4;
 
 	/* STRW is S-EL2*/
 	ste_data[1] = COMPOSE(STW_SEL2, STE_STW_SHIFT, STE_STW_MASK);
@@ -1309,7 +1311,8 @@ static bool smmuv3_config_ste_stg2(struct smmuv3_driver *smmuv3, uint16_t vm_id,
 	(void)iommu_ptable_ns;
 
 	/* BITS 243:196 */
-	vttbr = (pa_addr(iommu_ptable[dma_device_id].root) & GEN_MASK(51, 4)) >>
+	vttbr = ((uintpaddr_t)(iommu_ptable[dma_device_id].root_tables) &
+		 GEN_MASK(51, 4)) >>
 		4;
 
 	/* STRW is EL2*/
@@ -1390,7 +1393,7 @@ bool plat_iommu_unmap_iommus(struct vm_locked vm_locked, struct mpool *ppool)
 }
 
 void plat_iommu_identity_map(struct vm_locked vm_locked, paddr_t begin,
-			     paddr_t end, uint32_t mode)
+			     paddr_t end, mm_mode_t mode)
 {
 	(void)vm_locked;
 	(void)begin;

@@ -17,6 +17,9 @@ config("compiler_defaults") {
     "-Wpedantic",
     "-Werror",
 
+    # Extra warnings that are not included in `-Wall`, `-Wextra`, or `-Wpedantic`:
+    "-Wshift-sign-overflow",
+
     "-fstack-protector-all",
   ]
 
@@ -81,4 +84,8 @@ config("platform") {
     "PARTITION_MAX_STREAMS_PER_DEVICE=${plat_partition_max_streams_per_device}",
     "HF_NUM_INTIDS=${plat_num_virtual_interrupts_ids}",
   ]
+
+  if (ffa_version != "") {
+    defines += [ "FFA_VERSION=${ffa_version}" ]
+  }
 }

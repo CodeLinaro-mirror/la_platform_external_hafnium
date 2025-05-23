@@ -28,6 +28,12 @@ static struct vm other_world;
 static ffa_vm_count_t vm_count;
 
 /**
+ * The `boot_list` is a special entry in the circular linked list maintained by
+ * the partition manager and serves as both the start and end of the list.
+ */
+static struct list_entry boot_list = LIST_INIT(boot_list);
+
+/**
  * Counters on the status of notifications in the system. It helps to improve
  * the information retrieved by the receiver scheduler.
  */
@@ -94,6 +100,7 @@ struct vm *vm_init(ffa_id_t id, ffa_vcpu_count_t vcpu_count,
 	}
 
 	vm_notifications_init(vm, vcpu_count, ppool);
+	list_init(&vm->boot_list_node);
 	return vm;
 }
 
@@ -290,7 +297,7 @@ bool vm_id_is_current_world(ffa_id_t vm_id)
  *
  */
 bool vm_identity_map(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-		     uint32_t mode, struct mpool *ppool, ipaddr_t *ipa)
+		     mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa)
 {
 	if (!vm_identity_prepare(vm_locked, begin, end, mode, ppool)) {
 		return false;
@@ -312,7 +319,7 @@ bool vm_identity_map(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
  * made.
  */
 bool vm_identity_prepare(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-			 uint32_t mode, struct mpool *ppool)
+			 mm_mode_t mode, struct mpool *ppool)
 {
 	return arch_vm_identity_prepare(vm_locked, begin, end, mode, ppool);
 }
@@ -323,7 +330,7 @@ bool vm_identity_prepare(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
  * this condition.
  */
 void vm_identity_commit(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-			uint32_t mode, struct mpool *ppool, ipaddr_t *ipa)
+			mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa)
 {
 	arch_vm_identity_commit(vm_locked, begin, end, mode, ppool, ipa);
 }
@@ -373,13 +380,13 @@ bool vm_unmap_hypervisor(struct vm_locked vm_locked, struct mpool *ppool)
  * is a vm or a el0 partition.
  */
 bool vm_mem_get_mode(struct vm_locked vm_locked, ipaddr_t begin, ipaddr_t end,
-		     uint32_t *mode)
+		     mm_mode_t *mode)
 {
 	return arch_vm_mem_get_mode(vm_locked, begin, end, mode);
 }
 
 bool vm_iommu_mm_identity_map(struct vm_locked vm_locked, paddr_t begin,
-			      paddr_t end, uint32_t mode, struct mpool *ppool,
+			      paddr_t end, mm_mode_t mode, struct mpool *ppool,
 			      ipaddr_t *ipa, uint8_t dma_device_id)
 {
 	return arch_vm_iommu_mm_identity_map(vm_locked, begin, end, mode, ppool,
@@ -711,8 +718,16 @@ bool vm_notifications_validate_per_vcpu(struct vm_locked vm_locked,
 static void vm_notifications_state_set(struct notifications_state *state,
 				       ffa_notifications_bitmap_t notifications)
 {
-	state->pending |= notifications;
-	vm_notifications_pending_count_add(notifications);
+	/*
+	 * Exclude notifications which are already pending, to avoid
+	 * leaving the pending counter in a wrongful state.
+	 */
+	ffa_notifications_bitmap_t to_set =
+		(state->pending & notifications) ^ notifications;
+
+	/* Change the state of the pending notifications. */
+	state->pending |= to_set;
+	vm_notifications_pending_count_add(to_set);
 }
 
 void vm_notifications_partition_set_pending(
@@ -912,49 +927,58 @@ static bool vm_notifications_state_info_get(
 }
 
 /**
- * Check if the vcpu has a pending IPI that hasn't been retrieved.
- * If so try add it to the notification info list.
+ * Insert partition information and vCPU ID in the return to notification
+ * information, if the vCPU has pending interrupts that need explicit CPU
+ * cycles from the scheduler to the partition.
+ *
+ * This can be if:
+ * - Partition has configured in the partition manifest an SRI policy, and
+ *   it is in the waiting state.
+ * - If it has pending IPIs, and it is in the waiting state.
+ *
  * Returns true if successfully added to the list.
  */
-static bool vm_ipi_state_info_get(
+static void vm_interrupts_info_get(
 	struct vcpu *vcpu, ffa_id_t vm_id, ffa_vcpu_index_t vcpu_id,
 	uint16_t *ids, uint32_t *ids_count, uint32_t *lists_sizes,
 	uint32_t *lists_count, const uint32_t ids_max_count,
 	enum notifications_info_get_state *info_get_state, bool per_vcpu_added)
+
 {
-	bool ret = true;
-	bool pending_not_retrieved;
 	struct vcpu_locked vcpu_locked = vcpu_lock(vcpu);
-	struct interrupts *interrupts = &vcpu_locked.vcpu->interrupts;
+	struct vm *vm = vcpu->vm;
+	bool sri_interrupts_policy_configured =
+		vm->sri_policy.intr_while_waiting ||
+		vm->sri_policy.intr_pending_entry_wait;
 
-	pending_not_retrieved =
-		vcpu_is_virt_interrupt_pending(interrupts, HF_IPI_INTID) &&
-		!vcpu_ipi_is_info_get_retrieved(vcpu_locked);
-
-	/* No notifications pending that haven't been retrieved. */
-	if (!pending_not_retrieved) {
-		ret = false;
+	/*
+	 * If the information about interrupts in the current vCPU has been
+	 * retrieved or there are no pending interrupts, skip inserting an
+	 * element in the list.
+	 */
+	if (vcpu->interrupts_info_get_retrieved ||
+	    vcpu_virt_interrupt_count_get(vcpu_locked) == 0U) {
 		goto out;
 	}
 
 	/*
-	 * If the per vCPU notification was added to the list we do not need
-	 * to add it again for the IPI.
+	 * Report for any interrupt that is pending if partition is in the
+	 * waiting state, and either:
+	 * - The target partition is configured with an SRI policy.
+	 * - There are pending IPI and the SP in the waiting state.
 	 */
-	if (!per_vcpu_added &&
-	    !vm_insert_notification_info_list(
-		    vm_id, true, vcpu_id, ids, ids_count, lists_sizes,
-		    lists_count, ids_max_count, info_get_state)) {
-		ret = false;
-		goto out;
+	if (vcpu->state == VCPU_STATE_WAITING &&
+	    (sri_interrupts_policy_configured ||
+	     vcpu_is_virt_interrupt_pending(&vcpu->interrupts, HF_IPI_INTID))) {
+		if (per_vcpu_added ||
+		    vm_insert_notification_info_list(
+			    vm_id, true, vcpu_id, ids, ids_count, lists_sizes,
+			    lists_count, ids_max_count, info_get_state)) {
+			vcpu->interrupts_info_get_retrieved = true;
+		}
 	}
-
-	vcpu_ipi_set_info_get_retrieved(vcpu_locked);
-
 out:
 	vcpu_unlock(&vcpu_locked);
-
-	return ret;
 }
 
 /**
@@ -994,10 +1018,10 @@ void vm_notifications_info_get_pending(
 		 * current virtual FF-A instance.
 		 */
 		if (vm_id_is_current_world(vm_locked.vm->id)) {
-			vm_ipi_state_info_get(vcpu, vm_locked.vm->id, i, ids,
-					      ids_count, lists_sizes,
-					      lists_count, ids_max_count,
-					      info_get_state, per_vcpu_added);
+			vm_interrupts_info_get(vcpu, vm_locked.vm->id, i, ids,
+					       ids_count, lists_sizes,
+					       lists_count, ids_max_count,
+					       info_get_state, per_vcpu_added);
 		}
 	}
 }
@@ -1031,8 +1055,8 @@ bool vm_notifications_info_get(struct vm_locked vm_locked, uint16_t *ids,
 
 	/*
 	 * State transitions to FULL when trying to insert a new ID in the
-	 * list and there is not more space. This means there are notifications
-	 * pending, whose info is not retrieved.
+	 * list and there is not more space. This means there are
+	 * notifications pending, whose info is not retrieved.
 	 */
 	return current_state == FULL;
 }
@@ -1043,17 +1067,6 @@ bool vm_notifications_info_get(struct vm_locked vm_locked, uint16_t *ids,
 bool vm_supports_messaging_method(struct vm *vm, uint16_t msg_method)
 {
 	return (vm->messaging_method & msg_method) != 0;
-}
-
-void vm_notifications_set_npi_injected(struct vm_locked vm_locked,
-				       bool npi_injected)
-{
-	vm_locked.vm->notifications.npi_injected = npi_injected;
-}
-
-bool vm_notifications_is_npi_injected(struct vm_locked vm_locked)
-{
-	return vm_locked.vm->notifications.npi_injected;
 }
 
 /**
@@ -1076,7 +1089,7 @@ void vm_set_boot_info_gp_reg(struct vm *vm, struct vcpu *vcpu)
 static struct interrupt_descriptor *vm_find_interrupt_descriptor(
 	struct vm_locked vm_locked, uint32_t id)
 {
-	for (uint32_t i = 0; i < HF_NUM_INTIDS; i++) {
+	for (uint32_t i = 0; i < VM_MANIFEST_MAX_INTERRUPTS; i++) {
 		/* Interrupt descriptors are populated contiguously. */
 		if (!vm_locked.vm->interrupt_desc[i].valid) {
 			break;
@@ -1143,4 +1156,105 @@ struct interrupt_descriptor *vm_interrupt_set_enable(struct vm_locked vm_locked,
 	}
 
 	return int_desc;
+}
+
+/**
+ * The 'boot_list' is used as the start and end of the list.
+ * Start: the nodes it points to is the first VM to boot.
+ * End: the last node's next points to the entry.
+ */
+static bool vm_is_boot_list_end(struct vm *vm)
+{
+	return vm->boot_list_node.next == &boot_list;
+}
+
+/**
+ * Gets the first partition to boot, according to Boot Protocol from FF-A spec.
+ */
+struct vm *vm_get_boot_vm(void)
+{
+	assert(!list_empty(&boot_list));
+
+	return CONTAINER_OF(boot_list.next, struct vm, boot_list_node);
+}
+
+/**
+ * Gets the first MP partition to boot on a secondary CPU, as per the boot
+ * order from FF-A spec.
+ * If every SP in the system is an UP partition, this function returns NULL.
+ */
+struct vm *vm_get_boot_vm_secondary_core(void)
+{
+	struct vm *vm = vm_get_boot_vm();
+
+	if (vm_is_up(vm)) {
+		return vm_get_next_boot_secondary_core(vm);
+	}
+
+	return vm;
+}
+
+/**
+ * Returns the next element in the boot order list, if there is one.
+ */
+struct vm *vm_get_next_boot(struct vm *vm)
+{
+	return vm_is_boot_list_end(vm)
+		       ? NULL
+		       : CONTAINER_OF(vm->boot_list_node.next, struct vm,
+				      boot_list_node);
+}
+
+/**
+ * Returns the next element representing an MP endpoint in the boot order list,
+ * if there is one.
+ */
+struct vm *vm_get_next_boot_secondary_core(struct vm *vm)
+{
+	struct vm *vm_next;
+
+	assert(vm != NULL);
+
+	vm_next = vm_get_next_boot(vm);
+
+	/* Keep searching until an MP endpoint is found. */
+	while (vm_next != NULL && vm_is_up(vm_next)) {
+		vm_next = vm_get_next_boot(vm_next);
+	}
+
+	return vm_next;
+}
+
+/**
+ * Insert in boot list, sorted by `boot_order` parameter in the vm structure
+ * and rooted in `first_boot_vm`.
+ */
+void vm_update_boot(struct vm *vm)
+{
+	struct vm *current_vm = NULL;
+
+	if (list_empty(&boot_list)) {
+		list_prepend(&boot_list, &vm->boot_list_node);
+		return;
+	}
+
+	/*
+	 * When getting to this point the first insertion should have
+	 * been done.
+	 */
+	current_vm = vm_get_boot_vm();
+	assert(current_vm != NULL);
+
+	/*
+	 * Iterate until the position is found according to boot order, or
+	 * until we reach end of the list.
+	 */
+	while (!vm_is_boot_list_end(current_vm) &&
+	       current_vm->boot_order <= vm->boot_order) {
+		current_vm = vm_get_next_boot(current_vm);
+	}
+
+	current_vm->boot_order > vm->boot_order
+		? list_prepend(&current_vm->boot_list_node, &vm->boot_list_node)
+		: list_append(&current_vm->boot_list_node, &vm->boot_list_node);
 }

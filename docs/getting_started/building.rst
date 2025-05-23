@@ -45,7 +45,7 @@ resulting in:
 
 .. code:: shell
 
-    Supported platforms:  ['secure_rd_fremont', 'secure_rd_fremont_cfg1', 'secure_aem_v8a_fvp_vhe', 'aem_v8a_fvp_vhe', 'qemu_aarch64_vhe', 'secure_qemu_aarch64', 'rpi4', 'secure_tc']
+    Supported platforms:  ['secure_rd_fremont', 'secure_rd_fremont_cfg1', 'secure_aem_v8a_fvp_vhe', 'aem_v8a_fvp_vhe', 'aem_v8a_fvp_vhe_ffa_v1_1', 'qemu_aarch64_vhe', 'secure_qemu_aarch64', 'rpi4', 'secure_tc']
 
 Additional options
 ~~~~~~~~~~~~~~~~~~
@@ -73,6 +73,28 @@ If you wish to change the value of the make variables you may need to first use:
    make clobber
 
 So the `args.gn` file will be regenerated with the new values.
+
+Using Docker
+^^^^^^^^^^^^
+
+We provide a Docker container to ensure a consistent development environment or
+to enable building on non-Linux platforms (eg MacOS). Build the container with
+`./build/docker/build.sh`. You can run commands in the container with
+`./build/run_in_container.sh -i bash`:
+
+.. code:: shell
+
+   ./build/docker/build.sh
+   ./build/run_in_container.sh -i bash
+   make
+
+Alternatively, the Makefile will automatically use the Docker container
+if the environment variable `HAFNIUM_HERMETIC_BUILD` is set to `true`:
+
+.. code:: shell
+
+   ./build/docker/build.sh
+   HAFNIUM_HERMETIC_BUILD=true make
 
 Hafnium Documentation
 ^^^^^^^^^^^^^^^^^^^^^

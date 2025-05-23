@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 The Hafnium Authors.
+ * Copyright 2021 The Hafnium Authors.
  *
  * Use of this source code is governed by a BSD-style
  * license that can be found in the LICENSE file or at
@@ -8,4 +8,6 @@
 
 #pragma once
 
-#define section(S) __attribute__((__section__(#S)))
+#include "hf/vcpu.h"
+
+void plat_save_ns_simd_context(struct vcpu *vcpu);

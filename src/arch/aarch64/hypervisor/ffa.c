@@ -6,10 +6,10 @@
  * https://opensource.org/licenses/BSD-3-Clause.
  */
 
-#include "hf/arch/plat/ffa.h"
+#include "hf/ffa.h"
 
 #include "hf/check.h"
-#include "hf/ffa.h"
+#include "hf/ffa/setup_and_discovery.h"
 #include "hf/panic.h"
 #include "hf/vm_ids.h"
 
@@ -32,7 +32,7 @@ ffa_id_t arch_ffa_spmc_id_get(void)
  */
 void arch_ffa_init(void)
 {
-	struct ffa_value ret = plat_ffa_spmc_id_get();
+	struct ffa_value ret = ffa_setup_spmc_id_get();
 
 	if (ret.func == FFA_SUCCESS_32) {
 		spmc_id = ret.arg2;

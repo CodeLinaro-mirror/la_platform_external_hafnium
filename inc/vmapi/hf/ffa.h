@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "hf/static_assert.h"
 #include "hf/types.h"
 
 /**
@@ -21,8 +22,20 @@ enum ffa_version {
 	FFA_VERSION_1_0 = 0x10000,
 	FFA_VERSION_1_1 = 0x10001,
 	FFA_VERSION_1_2 = 0x10002,
+/*
+ * Use the value of `FFA_VERSION` passed by the build system, otherwise default
+ * to latest FF-A version.
+ */
+#ifdef FFA_VERSION
+	FFA_VERSION_COMPILED = FFA_VERSION,
+#else
 	FFA_VERSION_COMPILED = FFA_VERSION_1_2,
+#endif
 };
+
+static_assert((FFA_VERSION_1_0 <= FFA_VERSION_COMPILED) &&
+		      (FFA_VERSION_1_2 >= FFA_VERSION_COMPILED),
+	      "FFA_VERSION_COMPILED must be between v1.0 and v1.2");
 
 #define FFA_VERSION_MBZ_BIT (1U << 31U)
 #define FFA_VERSION_MAJOR_SHIFT (16U)
@@ -354,9 +367,15 @@ enum ffa_feature_id {
 
 #define FFA_SLEEP_INDEFINITE 0
 
-#define FFA_MEM_PERM_RO UINT32_C(0x7)
-#define FFA_MEM_PERM_RW UINT32_C(0x5)
-#define FFA_MEM_PERM_RX UINT32_C(0x3)
+/*
+ * The type of memory permissions used by `FFA_MEM_PERM_GET` and
+ * `FFA_MEM_PERM_SET`.
+ */
+enum ffa_mem_perm {
+	FFA_MEM_PERM_RO = 0x7,
+	FFA_MEM_PERM_RW = 0x5,
+	FFA_MEM_PERM_RX = 0x3,
+};
 
 #define FFA_MSG_WAIT_FLAG_RETAIN_RX UINT32_C(0x1)
 /*
@@ -396,55 +415,176 @@ static inline bool ffa_is_vm_id(ffa_id_t id)
 }
 
 /**
- * Partition message header as specified by table 6.2 from FF-A v1.1 EAC0
+ * Holds the UUID in a struct that is mappable directly to the SMCC calling
+ * convention, which is used for FF-A calls.
+ *
+ * Refer to table 84 of the FF-A 1.0 EAC specification as well as section 5.3
+ * of the SMCC Spec 1.2.
+ */
+struct ffa_uuid {
+	uint32_t uuid[4];
+};
+
+static inline void ffa_uuid_init(uint32_t w0, uint32_t w1, uint32_t w2,
+				 uint32_t w3, struct ffa_uuid *uuid)
+{
+	uuid->uuid[0] = w0;
+	uuid->uuid[1] = w1;
+	uuid->uuid[2] = w2;
+	uuid->uuid[3] = w3;
+}
+
+static inline bool ffa_uuid_equal(const struct ffa_uuid *uuid1,
+				  const struct ffa_uuid *uuid2)
+{
+	return (uuid1->uuid[0] == uuid2->uuid[0]) &&
+	       (uuid1->uuid[1] == uuid2->uuid[1]) &&
+	       (uuid1->uuid[2] == uuid2->uuid[2]) &&
+	       (uuid1->uuid[3] == uuid2->uuid[3]);
+}
+
+static inline bool ffa_uuid_is_null(const struct ffa_uuid *uuid)
+{
+	struct ffa_uuid null = {0};
+
+	return ffa_uuid_equal(uuid, &null);
+}
+
+static inline void ffa_uuid_from_u64x2(uint64_t uuid_lo, uint64_t uuid_hi,
+				       struct ffa_uuid *uuid)
+{
+	ffa_uuid_init((uint32_t)(uuid_lo & 0xFFFFFFFFU),
+		      (uint32_t)(uuid_lo >> 32),
+		      (uint32_t)(uuid_hi & 0xFFFFFFFFU),
+		      (uint32_t)(uuid_hi >> 32), uuid);
+}
+
+/**
+ * Split `uuid` into two u64s.
+ * This function writes to pointer parameters because C does not allow returning
+ * arrays from functions.
+ */
+static inline void ffa_uuid_to_u64x2(uint64_t *lo, uint64_t *hi,
+				     const struct ffa_uuid *uuid)
+{
+	*lo = (uint64_t)uuid->uuid[1] << 32 | uuid->uuid[0];
+	*hi = (uint64_t)uuid->uuid[3] << 32 | uuid->uuid[2];
+}
+
+/**
+ * Partition message header as specified by table 7.1 from FF-A v1.3 ALP0
  * specification.
  */
 struct ffa_partition_rxtx_header {
-	uint32_t flags; /* MBZ */
-	uint32_t reserved;
+	/* Reserved (SBZ). */
+	uint32_t flags;
+	/* Reserved (SBZ). */
+	uint32_t reserved_1;
 	/* Offset from the beginning of the buffer to the message payload. */
 	uint32_t offset;
-	/* Sender(Bits[31:16]) and Receiver(Bits[15:0]) endpoint IDs. */
-	uint32_t sender_receiver;
+	/* Receiver endpoint ID. */
+	ffa_id_t receiver;
+	/* Sender endpoint ID. */
+	ffa_id_t sender;
 	/* Size of message in buffer. */
 	uint32_t size;
+	/* Reserved (SBZ). Added in v1.2. */
+	uint32_t reserved_2;
+	/* UUID identifying the communication protocol. Added in v1.2. */
+	struct ffa_uuid uuid;
 };
 
+#define FFA_RXTX_HEADER_SIZE_V1_1 \
+	offsetof(struct ffa_partition_rxtx_header, reserved_2)
 #define FFA_RXTX_HEADER_SIZE sizeof(struct ffa_partition_rxtx_header)
-#define FFA_RXTX_SENDER_SHIFT (0x10U)
 #define FFA_RXTX_ALLOCATOR_SHIFT 16
 
-static inline void ffa_rxtx_header_init(
-	ffa_id_t sender, ffa_id_t receiver, uint32_t size,
-	struct ffa_partition_rxtx_header *header)
+/**
+ * Initialize a partition message header, with the default values for `flags`,
+ * `offset` and `uuid` and the v1.1 payload offset.
+ */
+static inline void ffa_rxtx_header_init_v1_1(
+	struct ffa_partition_rxtx_header *header, ffa_id_t sender,
+	ffa_id_t receiver, uint32_t payload_size)
 {
 	header->flags = 0;
-	header->reserved = 0;
+	header->reserved_1 = 0;
+	header->offset = FFA_RXTX_HEADER_SIZE_V1_1;
+	header->sender = sender;
+	header->receiver = receiver;
+	header->size = payload_size;
+	header->reserved_2 = 0;
+	header->uuid = (struct ffa_uuid){0};
+}
+
+/**
+ * Initialize a partition message header, with the default values for `flags`,
+ * `offset` and `uuid`.
+ */
+static inline void ffa_rxtx_header_init(
+	struct ffa_partition_rxtx_header *header, ffa_id_t sender,
+	ffa_id_t receiver, uint32_t payload_size)
+{
+	header->flags = 0;
+	header->reserved_1 = 0;
 	header->offset = FFA_RXTX_HEADER_SIZE;
-	header->sender_receiver =
-		(uint32_t)(receiver | (sender << FFA_RXTX_SENDER_SHIFT));
+	header->sender = sender;
+	header->receiver = receiver;
+	header->size = payload_size;
+	header->reserved_2 = 0;
+	header->uuid = (struct ffa_uuid){0};
+}
+
+/**
+ * Initialize a partition message header, with the default values for `flags`
+ * and `offset`.
+ */
+static inline void ffa_rxtx_header_init_with_uuid(
+	struct ffa_partition_rxtx_header *header, ffa_id_t sender,
+	ffa_id_t receiver, uint32_t size, struct ffa_uuid uuid)
+{
+	header->flags = 0;
+	header->reserved_1 = 0;
+	header->offset = FFA_RXTX_HEADER_SIZE;
+	header->sender = sender;
+	header->receiver = receiver;
 	header->size = size;
-}
-
-static inline ffa_id_t ffa_rxtx_header_sender(
-	const struct ffa_partition_rxtx_header *h)
-{
-	return (ffa_id_t)(h->sender_receiver >> FFA_RXTX_SENDER_SHIFT);
-}
-
-static inline ffa_id_t ffa_rxtx_header_receiver(
-	const struct ffa_partition_rxtx_header *h)
-{
-	return (ffa_id_t)(h->sender_receiver);
+	header->reserved_2 = 0;
+	header->uuid = uuid;
 }
 
 /* The maximum length possible for a single message. */
+#define FFA_PARTITION_MSG_PAYLOAD_MAX_V1_1 \
+	(HF_MAILBOX_SIZE - FFA_RXTX_HEADER_SIZE_V1_1)
 #define FFA_PARTITION_MSG_PAYLOAD_MAX (HF_MAILBOX_SIZE - FFA_RXTX_HEADER_SIZE)
 
 struct ffa_partition_msg {
 	struct ffa_partition_rxtx_header header;
+	/**
+	 * Prefer using `ffa_partition_msg_payload` to accessing this field
+	 * directly, because the offset does not necessarily correspond to the
+	 * offset of this field.
+	 */
 	char payload[FFA_PARTITION_MSG_PAYLOAD_MAX];
 };
+
+static_assert(sizeof(struct ffa_partition_msg) == HF_MAILBOX_SIZE,
+	      "FF-A message size must match mailbox size");
+
+/**
+ * Get the partition message's payload, according to the header's `offset`
+ * field.
+ */
+static inline void *ffa_partition_msg_payload(struct ffa_partition_msg *msg)
+{
+	return (char *)msg + msg->header.offset;
+}
+
+static inline const void *ffa_partition_msg_payload_const(
+	const struct ffa_partition_msg *msg)
+{
+	return (const char *)msg + msg->header.offset;
+}
 
 /* The maximum length possible for a single message. */
 #define FFA_MSG_PAYLOAD_MAX HF_MAILBOX_SIZE
@@ -621,13 +761,34 @@ typedef struct {
  */
 typedef uint64_t ffa_memory_handle_t;
 
-#define FFA_MEMORY_HANDLE_ALLOCATOR_MASK \
-	((ffa_memory_handle_t)(UINT64_C(1) << 63))
-#define FFA_MEMORY_HANDLE_ALLOCATOR_HYPERVISOR \
-	((ffa_memory_handle_t)(UINT64_C(1) << 63))
+enum ffa_memory_handle_allocator {
+	FFA_MEMORY_HANDLE_ALLOCATOR_SPMC = 0,
+	FFA_MEMORY_HANDLE_ALLOCATOR_HYPERVISOR = 1,
+};
 
-#define FFA_MEMORY_HANDLE_ALLOCATOR_SPMC (UINT64_C(0) << 63)
+#define FFA_MEMORY_HANDLE_ALLOCATOR_BIT UINT64_C(63)
+#define FFA_MEMORY_HANDLE_ALLOCATOR_MASK \
+	(UINT64_C(1) << FFA_MEMORY_HANDLE_ALLOCATOR_BIT)
 #define FFA_MEMORY_HANDLE_INVALID (~UINT64_C(0))
+
+static inline ffa_memory_handle_t ffa_memory_handle_make(
+	uint64_t index, enum ffa_memory_handle_allocator allocator)
+{
+	return index | ((uint64_t)allocator << FFA_MEMORY_HANDLE_ALLOCATOR_BIT);
+}
+
+static inline uint64_t ffa_memory_handle_index(ffa_memory_handle_t handle)
+{
+	return handle & ~FFA_MEMORY_HANDLE_ALLOCATOR_MASK;
+}
+
+static inline enum ffa_memory_handle_allocator ffa_memory_handle_allocator(
+	ffa_memory_handle_t handle)
+{
+	return ((handle & FFA_MEMORY_HANDLE_ALLOCATOR_MASK) != 0)
+		       ? FFA_MEMORY_HANDLE_ALLOCATOR_HYPERVISOR
+		       : FFA_MEMORY_HANDLE_ALLOCATOR_SPMC;
+}
 
 /**
  * A count of VMs. This has the same range as the VM IDs but we give it a
@@ -780,15 +941,24 @@ static inline uint32_t ffa_feature_intid(struct ffa_value args)
 #define FFA_FRAMEWORK_MSG_FUNC_MASK UINT64_C(0xFF)
 
 /**
- * Identifies the VM availability message. See section 18.3 of v1.2 FF-A
+ * Identifies FF-A framework messages. See sections 18.2 and 18.3 of v1.2 FF-A
  * specification.
  */
 enum ffa_framework_msg_func {
+	/* Power management framework messages. */
+	FFA_FRAMEWORK_MSG_PSCI_REQ = 0,
+	FFA_FRAMEWORK_MSG_PSCI_RESP = 2,
+
+	/* The VM availability messages. */
 	FFA_FRAMEWORK_MSG_VM_CREATION_REQ = 4,
 	FFA_FRAMEWORK_MSG_VM_CREATION_RESP = 5,
-
 	FFA_FRAMEWORK_MSG_VM_DESTRUCTION_REQ = 6,
 	FFA_FRAMEWORK_MSG_VM_DESTRUCTION_RESP = 7,
+
+	SPMD_FRAMEWORK_MSG_FFA_VERSION_REQ = 8,
+	SPMD_FRAMEWORK_MSG_FFA_VERSION_RESP = 9,
+
+	FFA_FRAMEWORK_MSG_INVALID = 0xFF,
 };
 
 #define FFA_VM_AVAILABILITY_MESSAGE_SBZ_LO 16
@@ -818,66 +988,9 @@ static inline ffa_id_t ffa_vm_availability_message_vm_id(struct ffa_value args)
 }
 
 /** Get the function ID from a framework message */
-static inline uint32_t ffa_framework_msg_func(struct ffa_value args)
+static inline uint32_t ffa_framework_msg_get_func(struct ffa_value args)
 {
 	return ffa_framework_msg_flags(args) & FFA_FRAMEWORK_MSG_FUNC_MASK;
-}
-
-/**
- * Holds the UUID in a struct that is mappable directly to the SMCC calling
- * convention, which is used for FF-A calls.
- *
- * Refer to table 84 of the FF-A 1.0 EAC specification as well as section 5.3
- * of the SMCC Spec 1.2.
- */
-struct ffa_uuid {
-	uint32_t uuid[4];
-};
-
-static inline void ffa_uuid_init(uint32_t w0, uint32_t w1, uint32_t w2,
-				 uint32_t w3, struct ffa_uuid *uuid)
-{
-	uuid->uuid[0] = w0;
-	uuid->uuid[1] = w1;
-	uuid->uuid[2] = w2;
-	uuid->uuid[3] = w3;
-}
-
-static inline bool ffa_uuid_equal(const struct ffa_uuid *uuid1,
-				  const struct ffa_uuid *uuid2)
-{
-	return (uuid1->uuid[0] == uuid2->uuid[0]) &&
-	       (uuid1->uuid[1] == uuid2->uuid[1]) &&
-	       (uuid1->uuid[2] == uuid2->uuid[2]) &&
-	       (uuid1->uuid[3] == uuid2->uuid[3]);
-}
-
-static inline bool ffa_uuid_is_null(const struct ffa_uuid *uuid)
-{
-	struct ffa_uuid null = {0};
-
-	return ffa_uuid_equal(uuid, &null);
-}
-
-static inline void ffa_uuid_from_u64x2(uint64_t uuid_lo, uint64_t uuid_hi,
-				       struct ffa_uuid *uuid)
-{
-	ffa_uuid_init((uint32_t)(uuid_lo & 0xFFFFFFFFU),
-		      (uint32_t)(uuid_lo >> 32),
-		      (uint32_t)(uuid_hi & 0xFFFFFFFFU),
-		      (uint32_t)(uuid_hi >> 32), uuid);
-}
-
-/**
- * Split `uuid` into two u64s.
- * This function writes to pointer parameters because C does not allow returning
- * arrays from functions.
- */
-static inline void ffa_uuid_to_u64x2(uint64_t *lo, uint64_t *hi,
-				     const struct ffa_uuid *uuid)
-{
-	*lo = (uint64_t)uuid->uuid[1] << 32 | uuid->uuid[0];
-	*hi = (uint64_t)uuid->uuid[3] << 32 | uuid->uuid[2];
 }
 
 /**
@@ -1098,26 +1211,28 @@ static inline ffa_notifications_bitmap_t ffa_notification_get_from_framework(
 	return ffa_notifications_bitmap((uint32_t)val.arg6, (uint32_t)val.arg7);
 }
 
-/**
- * Flags used in calls to FFA_NOTIFICATION_GET interface.
- */
+typedef uint32_t ffa_notification_flags_t;
+
+/** Flags used in calls to FFA_NOTIFICATION_BIND interface. */
+#define FFA_NOTIFICATIONS_FLAG_PER_VCPU (UINT32_C(1) << 0)
+
+/** Flags used in calls to FFA_NOTIFICATION_GET interface. */
 #define FFA_NOTIFICATION_FLAG_BITMAP_SP (UINT32_C(1) << 0)
 #define FFA_NOTIFICATION_FLAG_BITMAP_VM (UINT32_C(1) << 1)
 #define FFA_NOTIFICATION_FLAG_BITMAP_SPM (UINT32_C(1) << 2)
 #define FFA_NOTIFICATION_FLAG_BITMAP_HYP (UINT32_C(1) << 3)
 
-/* Flag to configure notification as being per vCPU. */
+/** Flags used in calls to FFA_NOTIFICATION_SET interface. */
 #define FFA_NOTIFICATIONS_FLAG_PER_VCPU (UINT32_C(1) << 0)
-
-/** Flag for FFA_NOTIFICATION_SET to delay Schedule Receiver Interrupt */
 #define FFA_NOTIFICATIONS_FLAG_DELAY_SRI (UINT32_C(1) << 1)
-
 #define FFA_NOTIFICATIONS_FLAGS_VCPU_ID(id) \
 	((((uint32_t)(id)) & UINT32_C(0xffff)) << 16)
+#define FFA_NOTIFICATIONS_FLAGS_GET_VCPU_ID(flags) \
+	((ffa_vcpu_index_t)((flags) >> 16))
 
 static inline ffa_vcpu_index_t ffa_notifications_get_vcpu(struct ffa_value args)
 {
-	return (ffa_vcpu_index_t)(args.arg1 >> 16 & 0xffffU);
+	return FFA_NOTIFICATIONS_FLAGS_GET_VCPU_ID(args.arg1);
 }
 
 /**
@@ -1142,6 +1257,8 @@ static inline ffa_vcpu_index_t ffa_notifications_get_vcpu(struct ffa_value args)
 #define FFA_NOTIFICATIONS_LIST_SHIFT(l) (2 * ((l) - 1) + 12)
 #define FFA_NOTIFICATIONS_LIST_SIZE_MASK 0x3U
 #define FFA_NOTIFICATIONS_LIST_MAX_SIZE 0x4U
+#define FFA_NOTIFICATIONS_LIST_MAX_VCPU_IDS \
+	(FFA_NOTIFICATIONS_LIST_MAX_SIZE - 1)
 
 static inline uint32_t ffa_notification_info_get_lists_count(
 	struct ffa_value args)

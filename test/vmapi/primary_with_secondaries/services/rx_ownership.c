@@ -6,6 +6,9 @@
  * https://opensource.org/licenses/BSD-3-Clause.
  */
 
+#include "hf/arch/irq.h"
+#include "hf/arch/vm/interrupts.h"
+
 #include "hf/ffa.h"
 #include "hf/std.h"
 
@@ -14,6 +17,7 @@
 #include "primary_with_secondary.h"
 #include "test/hftest.h"
 #include "test/semaphore.h"
+#include "test/vmapi/arch/exception_handler.h"
 #include "test/vmapi/ffa.h"
 
 /* Used to coordinate between multiple vCPUs in multicore test. */
@@ -47,7 +51,7 @@ TEST_SERVICE(test_ffa_msg_wait_release_buffer)
 	EXPECT_EQ(ret.func, FFA_RUN_32);
 
 	/* Read RX buffer and verify expected message payload. */
-	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf, NULL);
+	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf);
 	EXPECT_EQ(msg, 0x123);
 
 	dlog_verbose(
@@ -105,7 +109,7 @@ TEST_SERVICE(read_rx_buffer)
 	semaphore_wait(&ffa_msg_wait_called);
 
 	/* Read RX buffer and verify expected message payload. */
-	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf, NULL);
+	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf);
 	EXPECT_EQ(msg, 0x123);
 	ffa_yield();
 }
@@ -114,6 +118,10 @@ TEST_SERVICE(call_ffa_msg_wait_retain_rx)
 {
 	struct ffa_value ret;
 	HFTEST_LOG("Call FFA_MSG_WAIT");
+
+	/* Setup handling of NPI, to handle RX buffer full notification. */
+	exception_setup(check_npi, NULL);
+	arch_irq_enable();
 
 	/* FFA_MSG_WAIT should retain buffer */
 	semaphore_init(&ffa_msg_wait_called);
@@ -134,7 +142,7 @@ TEST_SERVICE(send_indirect_msg_to_sp_fail)
 
 	/* Receive ID of service to send message to. */
 	receive_indirect_message((void *)&target_id, sizeof(target_id),
-				 recv_buf, NULL);
+				 recv_buf);
 
 	HFTEST_LOG("Attempting to send indirect message %lx to %x", msg,
 		   target_id);
@@ -150,6 +158,10 @@ TEST_SERVICE(ffa_msg_wait_pending_indirect_message)
 	struct ffa_value ret;
 	uint64_t msg;
 
+	/* Setup handling of NPI, to handle RX buffer full notification. */
+	exception_setup(check_npi, NULL);
+	arch_irq_enable();
+
 	/*
 	 * FFA_MSG_WAIT will attempt to release buffer.
 	 * RUNNING -> WAITING state transition should succeed, but
@@ -160,7 +172,7 @@ TEST_SERVICE(ffa_msg_wait_pending_indirect_message)
 	EXPECT_EQ(ret.func, FFA_RUN_32);
 
 	/* Read RX buffer and verify expected message payload from PVM. */
-	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf, NULL);
+	receive_indirect_message((void *)&msg, sizeof(msg), recv_buf);
 	EXPECT_EQ(msg, 0x123);
 
 	dlog_verbose(

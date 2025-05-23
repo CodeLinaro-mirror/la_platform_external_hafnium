@@ -11,10 +11,8 @@
 #include "hf/arch/barriers.h"
 #include "hf/arch/gicv3.h"
 #include "hf/arch/host_timer.h"
-#include "hf/arch/init.h"
 #include "hf/arch/memcpy_trapped.h"
 #include "hf/arch/mmu.h"
-#include "hf/arch/plat/ffa.h"
 #include "hf/arch/plat/smc.h"
 #include "hf/arch/timer.h"
 #include "hf/arch/vmid_base.h"
@@ -24,15 +22,16 @@
 #include "hf/cpu.h"
 #include "hf/dlog.h"
 #include "hf/ffa.h"
+#include "hf/ffa/cpu_cycles.h"
+#include "hf/ffa/indirect_messaging.h"
+#include "hf/ffa/interrupts.h"
+#include "hf/ffa/notifications.h"
+#include "hf/ffa/vm.h"
 #include "hf/ffa_internal.h"
-#include "hf/hf_ipi.h"
 #include "hf/panic.h"
 #include "hf/plat/interrupts.h"
 #include "hf/timer_mgmt.h"
 #include "hf/vm.h"
-#include "hf/vm_ids.h"
-
-#include "vmapi/hf/call.h"
 
 #include "debug_el1.h"
 #include "el1_physical_timer.h"
@@ -64,18 +63,6 @@
  * The Client ID field within X7 for an SMC64 call.
  */
 #define CLIENT_ID_MASK UINT64_C(0xffff)
-
-/**
- * Identifies SPMD specific framework messages. See section 18.2 of v1.2 FF-A
- * specification.
- */
-enum ffa_spmd_framework_msg_func {
-	SPMD_FRAMEWORK_MSG_PSCI_REQ = 0,
-	SPMD_FRAMEWORK_MSG_PSCI_RESP = 2,
-
-	SPMD_FRAMEWORK_MSG_FFA_VERSION_REQ = 8,
-	SPMD_FRAMEWORK_MSG_FFA_VERSION_RESP = 9,
-};
 
 /**
  * Returns a reference to the currently executing vCPU.
@@ -256,7 +243,6 @@ bool sync_current_exception(uintreg_t elr, uintreg_t spsr)
 				"far=%#lx, dfsc = %#lx\n",
 				elr, esr, ec, far, dfsc);
 		}
-		break;
 #endif
 		if (!GET_ESR_FNV(esr)) {
 			dlog_error(
@@ -307,121 +293,6 @@ static void set_virtual_irq(struct arch_regs *r, bool enable)
 		r->hyp_state.hcr_el2 &= ~HCR_EL2_VI;
 	}
 }
-
-#if SECURE_WORLD == 1
-/**
- * Handle special direct messages from SPMD to SPMC.
- */
-static bool spmd_handler(struct ffa_value *args, struct vcpu *current)
-{
-	ffa_id_t sender = ffa_sender(*args);
-	ffa_id_t receiver = ffa_receiver(*args);
-	ffa_id_t current_vm_id = current->vm->id;
-	enum ffa_spmd_framework_msg_func func =
-		(enum ffa_spmd_framework_msg_func)ffa_framework_msg_func(*args);
-
-	/*
-	 * Check if direct message request is originating from the SPMD,
-	 * directed to the SPMC and the message is a framework message.
-	 */
-	if (!(sender == HF_SPMD_VM_ID && receiver == HF_SPMC_VM_ID &&
-	      current_vm_id == HF_OTHER_WORLD_ID &&
-	      ffa_is_framework_msg(*args))) {
-		return false;
-	}
-
-	/*
-	 * The framework message is conveyed by EL3/SPMD to SPMC so the
-	 * current VM id must match to the other world VM id.
-	 */
-	CHECK(current->vm->id == HF_HYPERVISOR_VM_ID);
-
-	switch (func) {
-	case SPMD_FRAMEWORK_MSG_PSCI_REQ: {
-		enum psci_return_code psci_msg_response =
-			PSCI_ERROR_NOT_SUPPORTED;
-		struct vcpu *boot_vcpu = vcpu_get_boot_vcpu();
-		struct vm *vm = boot_vcpu->vm;
-		struct vcpu_locked vcpu_locked;
-
-		/*
-		 * TODO: the power management event reached the SPMC.
-		 * In a later iteration, the power management event can
-		 * be passed to the SP by resuming it.
-		 */
-		switch (args->arg3) {
-		case PSCI_CPU_OFF: {
-			if (vm_power_management_cpu_off_requested(vm) == true) {
-				struct vcpu *vcpu;
-
-				/* Allow only S-EL1 MP SPs to reach here. */
-				CHECK(vm->el0_partition == false);
-				CHECK(vm->vcpu_count > 1);
-
-				vcpu = vm_get_vcpu(vm, vcpu_index(current));
-				vcpu_locked = vcpu_lock(vcpu);
-				vcpu->state = VCPU_STATE_OFF;
-				vcpu_unlock(&vcpu_locked);
-				cpu_off(vcpu->cpu);
-				dlog_verbose("cpu%u off notification!\n",
-					     vcpu_index(vcpu));
-			}
-
-			psci_msg_response = PSCI_RETURN_SUCCESS;
-			break;
-		}
-		default:
-			dlog_error(
-				"FF-A PSCI framework message not handled "
-				"%#lx %#lx %#lx %#lx\n",
-				args->func, args->arg1, args->arg2, args->arg3);
-			psci_msg_response = PSCI_ERROR_NOT_SUPPORTED;
-		}
-
-		*args = ffa_framework_msg_resp(HF_SPMC_VM_ID, HF_SPMD_VM_ID,
-					       SPMD_FRAMEWORK_MSG_PSCI_RESP,
-					       psci_msg_response);
-		return true;
-	}
-	case SPMD_FRAMEWORK_MSG_FFA_VERSION_REQ: {
-		struct ffa_value ret = api_ffa_version(current, args->arg3);
-		*args = ffa_framework_msg_resp(
-			HF_SPMC_VM_ID, HF_SPMD_VM_ID,
-			SPMD_FRAMEWORK_MSG_FFA_VERSION_RESP, ret.func);
-		return true;
-	}
-	default:
-		dlog_error("FF-A framework message not handled %#lx\n",
-			   args->arg2);
-
-		/*
-		 * TODO: the framework message that was conveyed by a direct
-		 * request is not handled although we still want to complete
-		 * by a direct response. However, there is no defined error
-		 * response to state that the message couldn't be handled.
-		 * An alternative would be to return FFA_ERROR.
-		 */
-		*args = ffa_framework_msg_resp(HF_SPMC_VM_ID, HF_SPMD_VM_ID,
-					       func, 0);
-		return true;
-	}
-}
-
-void spmc_exit_to_nwd(struct vcpu *owd_vcpu)
-{
-	struct vcpu *deadline_vcpu =
-		timer_find_vcpu_nearest_deadline(owd_vcpu->cpu);
-
-	/*
-	 * SPMC tracks a vCPU's timer deadline through its host timer such that
-	 * it can bring back execution from normal world to signal the timer
-	 * virtual interrupt to the SP's vCPU.
-	 */
-	if (deadline_vcpu != NULL) {
-		host_timer_track_deadline(&deadline_vcpu->regs.arch_timer);
-	}
-}
-#endif
 
 /**
  * Checks whether to block an SMC being forwarded from a VM.
@@ -550,7 +421,7 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 		*args = api_yield(current, next, args);
 		return true;
 	case FFA_MSG_SEND_32:
-		*args = plat_ffa_msg_send(
+		*args = ffa_indirect_msg_send(
 			ffa_sender(*args), ffa_receiver(*args),
 			ffa_msg_send_size(*args), current, next);
 		return true;
@@ -566,7 +437,7 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 		struct vcpu_locked current_locked;
 
 		current_locked = vcpu_lock(current);
-		*args = plat_ffa_msg_recv(false, current_locked, next);
+		*args = ffa_indirect_msg_recv(false, current_locked, next);
 		vcpu_unlock(&current_locked);
 		return true;
 	}
@@ -621,11 +492,6 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 		return true;
 	case FFA_MSG_SEND_DIRECT_REQ_64:
 	case FFA_MSG_SEND_DIRECT_REQ_32:
-#if SECURE_WORLD == 1
-		if (spmd_handler(args, current)) {
-			return true;
-		}
-#endif
 	case FFA_MSG_SEND_DIRECT_REQ2_64:
 		*args = api_ffa_msg_send_direct_req(*args, current, next);
 		return true;
@@ -672,7 +538,8 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 		return true;
 	case FFA_MEM_PERM_GET_32:
 	case FFA_MEM_PERM_GET_64:
-		*args = api_ffa_mem_perm_get(va_init(args->arg1), current);
+		*args = api_ffa_mem_perm_get(va_init(args->arg1), args->arg2,
+					     current);
 		return true;
 	case FFA_NOTIFICATION_SET_32:
 		*args = api_ffa_notification_set(
@@ -699,7 +566,7 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 			return true;
 		}
 
-		plat_ffa_handle_secure_interrupt(current, next);
+		ffa_interrupts_handle_secure_interrupt(current, next);
 
 		/*
 		 * If the next vCPU belongs to an SP, the next time the NWd
@@ -718,7 +585,7 @@ static bool ffa_handler(struct ffa_value *args, struct vcpu *current,
 		*args = api_ffa_console_log(*args, current);
 		return true;
 	case FFA_ERROR_32:
-		*args = plat_ffa_error_32(current, next, args->arg2);
+		*args = ffa_cpu_cycles_error_32(current, next, args->arg2);
 		return true;
 
 	default:
@@ -746,9 +613,9 @@ static void vcpu_update_virtual_interrupts(struct vcpu *vcpu)
 
 	vcpu_locked = vcpu_lock(vcpu);
 	set_virtual_irq(&vcpu->regs,
-			vcpu_interrupt_irq_count_get(vcpu_locked) > 0);
+			vcpu_virt_interrupt_irq_count_get(vcpu_locked) > 0);
 	set_virtual_fiq(&vcpu->regs,
-			vcpu_interrupt_fiq_count_get(vcpu_locked) > 0);
+			vcpu_virt_interrupt_fiq_count_get(vcpu_locked) > 0);
 	vcpu_unlock(&vcpu_locked);
 }
 
@@ -780,7 +647,7 @@ static bool hvc_smc_handler(struct ffa_value args, struct vcpu *vcpu,
 		 */
 		if ((*next != NULL && (*next)->vm->id == HF_OTHER_WORLD_ID) ||
 		    (*next == NULL && vcpu->vm->id == HF_OTHER_WORLD_ID)) {
-			plat_ffa_sri_trigger_if_delayed(vcpu->cpu);
+			ffa_notifications_sri_trigger_if_delayed(vcpu->cpu);
 		}
 #endif
 		if (func != FFA_VERSION_32) {
@@ -1034,12 +901,12 @@ static struct vcpu *hvc_handler(struct vcpu *vcpu)
 	switch (args.func) {
 #if SECURE_WORLD == 1
 	case HF_INTERRUPT_DEACTIVATE:
-		vcpu->regs.r[0] = plat_ffa_interrupt_deactivate(
-			args.arg1, args.arg2, vcpu);
+		vcpu->regs.r[0] =
+			ffa_interrupts_deactivate(args.arg1, args.arg2, vcpu);
 		break;
 
 	case HF_INTERRUPT_RECONFIGURE:
-		vcpu->regs.r[0] = plat_ffa_interrupt_reconfigure(
+		vcpu->regs.r[0] = ffa_interrupts_reconfigure(
 			args.arg1, args.arg2, args.arg3, vcpu);
 		break;
 
@@ -1056,7 +923,7 @@ static struct vcpu *hvc_handler(struct vcpu *vcpu)
 		struct vcpu_locked current_locked;
 
 		current_locked = vcpu_lock(vcpu);
-		vcpu->regs.r[0] = plat_ffa_interrupt_get(current_locked);
+		vcpu->regs.r[0] = api_interrupt_get(current_locked);
 		vcpu_unlock(&current_locked);
 		break;
 	}
@@ -1079,7 +946,7 @@ struct vcpu *irq_lower(void)
 #if SECURE_WORLD == 1
 	struct vcpu *next = NULL;
 
-	plat_ffa_handle_secure_interrupt(current(), &next);
+	ffa_interrupts_handle_secure_interrupt(current(), &next);
 
 	/*
 	 * Since we are in interrupt context, set the bit for the
@@ -1121,7 +988,6 @@ struct vcpu *fiq_lower(void)
 #if SECURE_WORLD == 1
 	struct vcpu_locked current_locked;
 	struct vcpu *current_vcpu = current();
-	int64_t ret;
 	uint32_t intid;
 
 	intid = get_highest_pending_g0_interrupt_id();
@@ -1142,7 +1008,7 @@ struct vcpu *fiq_lower(void)
 	 */
 	assert(current_vcpu->vm->ns_interrupts_action != NS_ACTION_QUEUED);
 
-	if (plat_ffa_vm_managed_exit_supported(current_vcpu->vm)) {
+	if (ffa_vm_managed_exit_supported(current_vcpu->vm)) {
 		uint8_t pmr = plat_interrupts_get_priority_mask();
 
 		/*
@@ -1153,12 +1019,8 @@ struct vcpu *fiq_lower(void)
 
 		current_locked = vcpu_lock(current_vcpu);
 		current_vcpu->prev_interrupt_priority = pmr;
-		ret = api_interrupt_inject_locked(current_locked,
-						  HF_MANAGED_EXIT_INTID,
-						  current_locked, NULL);
-		if (ret != 0) {
-			panic("Failed to inject managed exit interrupt\n");
-		}
+		vcpu_virt_interrupt_inject(current_locked,
+					   HF_MANAGED_EXIT_INTID);
 
 		/* Entering managed exit sequence. */
 		current_vcpu->processing_managed_exit = true;
@@ -1179,7 +1041,7 @@ struct vcpu *fiq_lower(void)
 	 * Unwind Normal World Scheduled Call chain in response to NS
 	 * Interrupt.
 	 */
-	return plat_ffa_unwind_nwd_call_chain_interrupt(current_vcpu);
+	return ffa_interrupts_unwind_nwd_call_chain(current_vcpu);
 #else
 	return irq_lower();
 #endif
@@ -1204,7 +1066,7 @@ noreturn struct vcpu *serr_lower(void)
  */
 static struct vcpu_fault_info fault_info_init(uintreg_t esr,
 					      const struct vcpu *vcpu,
-					      uint32_t mode)
+					      mm_mode_t mode)
 {
 	uint32_t fsc = esr & 0x3f;
 	struct vcpu_fault_info r;
@@ -1388,11 +1250,12 @@ struct vcpu *sync_lower_exception(uintreg_t esr, uintreg_t far)
  * Handles EC = 011000, MSR, MRS instruction traps.
  * Returns non-null ONLY if the access failed and the vCPU is changing.
  */
-void handle_system_register_access(uintreg_t esr_el2)
+struct vcpu *handle_system_register_access(uintreg_t esr_el2)
 {
 	struct vcpu *vcpu = current();
 	ffa_id_t vm_id = vcpu->vm->id;
 	uintreg_t ec = GET_ESR_EC(esr_el2);
+	bool is_el0_partition = vcpu->vm->el0_partition;
 
 	CHECK(ec == EC_MSR);
 	/*
@@ -1402,28 +1265,36 @@ void handle_system_register_access(uintreg_t esr_el2)
 	if (debug_el1_is_register_access(esr_el2)) {
 		if (!debug_el1_process_access(vcpu, vm_id, esr_el2)) {
 			inject_el1_sysreg_trap_exception(vcpu, esr_el2);
-			return;
+			return NULL;
 		}
 	} else if (perfmon_is_register_access(esr_el2)) {
 		if (!perfmon_process_access(vcpu, vm_id, esr_el2)) {
 			inject_el1_sysreg_trap_exception(vcpu, esr_el2);
-			return;
+			return NULL;
 		}
 	} else if (feature_id_is_register_access(esr_el2)) {
 		if (!feature_id_process_access(vcpu, esr_el2)) {
 			inject_el1_sysreg_trap_exception(vcpu, esr_el2);
-			return;
+			return NULL;
 		}
 	} else if (el1_physical_timer_is_register_access(esr_el2)) {
 		if (!el1_physical_timer_process_access(vcpu, esr_el2)) {
 			inject_el1_sysreg_trap_exception(vcpu, esr_el2);
-			return;
+			return NULL;
 		}
 	} else {
+		if (is_el0_partition) {
+			dlog_warning(
+				"Unexpected system register access by EL0 "
+				"partition\n");
+			return api_abort(vcpu);
+		}
+
 		inject_el1_sysreg_trap_exception(vcpu, esr_el2);
-		return;
+		return NULL;
 	}
 
 	/* Instruction was fulfilled. Skip it and run the next one. */
 	vcpu->regs.pc += GET_NEXT_PC_INC(esr_el2);
+	return NULL;
 }

@@ -42,20 +42,13 @@ struct vcpu *api_wake_up(struct vcpu *current, struct vcpu *target_vcpu);
 int64_t api_interrupt_enable(uint32_t intid, bool enable,
 			     enum interrupt_type type, struct vcpu *current);
 uint32_t api_interrupt_get(struct vcpu_locked current_locked);
-int64_t api_interrupt_inject(ffa_id_t target_vm_id,
-			     ffa_vcpu_index_t target_vcpu_idx, uint32_t intid,
-			     struct vcpu *current, struct vcpu **next);
-int64_t api_interrupt_inject_locked(struct vcpu_locked target_locked,
-				    uint32_t intid,
-				    struct vcpu_locked current_locked,
-				    struct vcpu **next);
 int64_t api_hf_interrupt_send_ipi(uint32_t target_vcpu_id,
 				  struct vcpu *current);
 
 struct ffa_value api_ffa_msg_send(ffa_id_t sender_vm_id,
 				  ffa_id_t receiver_vm_id, uint32_t size,
 				  struct vcpu *current, struct vcpu **next);
-struct ffa_value api_ffa_msg_send2(ffa_id_t sender_vm_id, uint32_t flags,
+struct ffa_value api_ffa_msg_send2(ffa_id_t sender_id, uint32_t flags,
 				   struct vcpu *current);
 struct ffa_value api_ffa_rx_release(ffa_id_t receiver_id, struct vcpu *current);
 struct ffa_value api_ffa_rx_acquire(ffa_id_t receiver_id, struct vcpu *current);
@@ -76,8 +69,9 @@ struct ffa_value api_ffa_partition_info_get(struct vcpu *current,
 					    uint32_t flags);
 bool api_ffa_fill_partition_info_from_regs(
 	struct ffa_value ret, uint16_t start_index,
-	struct ffa_partition_info *partitions, uint16_t partitions_len,
-	ffa_vm_count_t *ret_count);
+	struct ffa_partition_info *partitions, size_t partitions_max_len,
+	size_t *ret_count);
+
 struct ffa_value api_ffa_partition_info_get_regs(struct vcpu *current,
 						 const struct ffa_uuid *uuid,
 						 uint16_t start_index,
@@ -129,23 +123,28 @@ struct ffa_value api_ffa_notification_bitmap_destroy(ffa_id_t vm_id,
 						     struct vcpu *current);
 
 struct ffa_value api_ffa_notification_update_bindings(
-	ffa_id_t sender_vm_id, ffa_id_t receiver_vm_id, uint32_t flags,
+	ffa_id_t sender_vm_id, ffa_id_t receiver_vm_id,
+	ffa_notification_flags_t flags,
 	ffa_notifications_bitmap_t notifications, bool is_bind,
 	struct vcpu *current);
 
 struct ffa_value api_ffa_notification_set(
-	ffa_id_t sender_vm_id, ffa_id_t receiver_vm_id, uint32_t flags,
+	ffa_id_t sender_vm_id, ffa_id_t receiver_vm_id,
+	ffa_notification_flags_t flags,
 	ffa_notifications_bitmap_t notifications, struct vcpu *current);
 
 struct ffa_value api_ffa_notification_get(ffa_id_t receiver_vm_id,
-					  uint16_t vcpu_id, uint32_t flags,
+					  uint16_t vcpu_id,
+					  ffa_notification_flags_t flags,
 					  struct vcpu *current);
 
 struct ffa_value api_ffa_notification_info_get(struct vcpu *current);
 
-struct ffa_value api_ffa_mem_perm_get(vaddr_t base_addr, struct vcpu *current);
+struct ffa_value api_ffa_mem_perm_get(vaddr_t base_addr, uint32_t page_count,
+				      struct vcpu *current);
 struct ffa_value api_ffa_mem_perm_set(vaddr_t base_addr, uint32_t page_count,
-				      uint32_t mem_perm, struct vcpu *current);
+				      enum ffa_mem_perm mem_perm,
+				      struct vcpu *current);
 
 void api_flush_log_buffer(struct vcpu_locked *vcpu_locked);
 struct ffa_value api_ffa_console_log(struct ffa_value args,

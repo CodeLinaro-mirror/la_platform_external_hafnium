@@ -11,9 +11,6 @@
 #include <stdalign.h>
 #include <stddef.h>
 
-#include "hf/arch/other_world.h"
-#include "hf/arch/plat/ffa.h"
-
 #include "hf/api.h"
 #include "hf/boot_flow.h"
 #include "hf/boot_params.h"
@@ -21,6 +18,8 @@
 #include "hf/cpu.h"
 #include "hf/dlog.h"
 #include "hf/fdt_handler.h"
+#include "hf/ffa.h"
+#include "hf/ffa/init.h"
 #include "hf/load.h"
 #include "hf/manifest.h"
 #include "hf/mm.h"
@@ -31,9 +30,6 @@
 #include "hf/plat/interrupts.h"
 #include "hf/plat/iommu.h"
 #include "hf/std.h"
-#include "hf/vm.h"
-
-#include "vmapi/hf/call.h"
 
 alignas(MM_PPOOL_ENTRY_SIZE) char ptable_buf[MM_PPOOL_ENTRY_SIZE * HEAP_PAGES];
 
@@ -51,7 +47,7 @@ void one_time_init_mm(void)
 	/* Make sure the console is initialised before calling dlog. */
 	plat_console_init();
 
-	plat_ffa_log_init();
+	ffa_init_log();
 
 	mpool_init(&ppool, MM_PPOOL_ENTRY_SIZE);
 	mpool_add_chunk(&ppool, ptable_buf, sizeof(ptable_buf));
@@ -154,7 +150,7 @@ void one_time_init(void)
 		      manifest_strerror(manifest_ret));
 	}
 
-	plat_ffa_set_tee_enabled(manifest->ffa_tee_enabled);
+	ffa_init_set_tee_enabled(manifest->ffa_tee_enabled);
 
 	if (!plat_iommu_init(&fdt, mm_stage1_locked, &ppool)) {
 		panic("Could not initialize IOMMUs.");
@@ -195,7 +191,7 @@ void one_time_init(void)
 	mm_vm_enable_invalidation();
 
 	/* Perform platform specfic FF-A initialization. */
-	plat_ffa_init(&ppool);
+	ffa_init(&ppool);
 
 	/* Initialise the API page pool. ppool will be empty from now on. */
 	api_init(&ppool);

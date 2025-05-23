@@ -11,13 +11,28 @@ source_set("absent") {
   sources = [ "absent.c" ]
 }
 
+config("hypervisor_config") {
+  include_dirs = [ "inc" ]
+}
+
 source_set("hypervisor") {
   public_configs = [
     "//src/arch/${plat_arch}:config",
     "//src/arch/${plat_arch}:arch_config",
+    ":hypervisor_config",
   ]
   deps = [ "//vmlib/${plat_arch}:smc_call" ]
-  sources = [ "hypervisor.c" ]
+  sources = [
+    "hypervisor/cpu_cycles.c",
+    "hypervisor/direct_messaging.c",
+    "hypervisor/ffa_memory.c",
+    "hypervisor/indirect_messaging.c",
+    "hypervisor/init.c",
+    "hypervisor/interrupts.c",
+    "hypervisor/notifications.c",
+    "hypervisor/setup_and_discovery.c",
+    "hypervisor/vm.c",
+  ]
 }
 
 source_set("spmc") {
@@ -30,6 +45,14 @@ source_set("spmc") {
 
   sources = [
     "//src/arch/aarch64/hypervisor/simd.c",
-    "spmc.c",
+    "spmc/cpu_cycles.c",
+    "spmc/direct_messaging.c",
+    "spmc/ffa_memory.c",
+    "spmc/indirect_messaging.c",
+    "spmc/init.c",
+    "spmc/interrupts.c",
+    "spmc/notifications.c",
+    "spmc/setup_and_discovery.c",
+    "spmc/vm.c",
   ]
 }

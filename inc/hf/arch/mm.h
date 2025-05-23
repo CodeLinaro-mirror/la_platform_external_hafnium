@@ -12,99 +12,118 @@
 #include <stddef.h>
 
 #include "hf/addr.h"
+#include "hf/mm.h"
 
 #include "vmapi/hf/ffa.h"
-
-/*
- * A page table entry (PTE) will take one of the following forms:
- *
- *  1. absent        : There is no mapping.
- *  2. invalid block : Represents a block that is not in the address space.
- *  3. valid block   : Represents a block that is in the address space.
- *  4. table         : Represents a reference to a table of PTEs.
- */
 
 /**
  * Creates an absent PTE.
  */
-pte_t arch_mm_absent_pte(uint8_t level);
+pte_t arch_mm_absent_pte(mm_level_t level);
 
 /**
  * Creates a table PTE.
  */
-pte_t arch_mm_table_pte(uint8_t level, paddr_t pa);
+pte_t arch_mm_table_pte(mm_level_t level, paddr_t pa);
 
 /**
  * Creates a block PTE.
  */
-pte_t arch_mm_block_pte(uint8_t level, paddr_t pa, uint64_t attrs);
+pte_t arch_mm_block_pte(mm_level_t level, paddr_t pa, mm_attr_t attrs);
+
+enum mm_pte_type arch_mm_pte_type(pte_t pte, mm_level_t level);
 
 /**
  * Checks whether a block is allowed at the given level of the page table.
  */
-bool arch_mm_is_block_allowed(uint8_t level);
+bool arch_mm_is_block_allowed(mm_level_t level);
+
+static inline bool arch_mm_pte_is_absent(pte_t pte, mm_level_t level)
+{
+	return arch_mm_pte_type(pte, level) == PTE_TYPE_ABSENT;
+}
 
 /**
  * Determines if a PTE is present i.e. it contains information and therefore
  * needs to exist in the page table. Any non-absent PTE is present.
  */
-bool arch_mm_pte_is_present(pte_t pte, uint8_t level);
+static inline bool arch_mm_pte_is_present(pte_t pte, mm_level_t level)
+{
+	return !arch_mm_pte_is_absent(pte, level);
+}
 
 /**
  * Determines if a PTE is valid i.e. it can affect the address space. Tables and
  * valid blocks fall into this category. Invalid blocks do not as they hold
  * information about blocks that are not in the address space.
  */
-bool arch_mm_pte_is_valid(pte_t pte, uint8_t level);
+static inline bool arch_mm_pte_is_valid(pte_t pte, mm_level_t level)
+{
+	switch (arch_mm_pte_type(pte, level)) {
+	case PTE_TYPE_ABSENT:
+	case PTE_TYPE_INVALID_BLOCK:
+		return false;
+	case PTE_TYPE_VALID_BLOCK:
+	case PTE_TYPE_TABLE:
+		return true;
+	}
+}
 
 /**
  * Determines if a PTE is a block and represents an address range, valid or
  * invalid.
  */
-bool arch_mm_pte_is_block(pte_t pte, uint8_t level);
+static inline bool arch_mm_pte_is_block(pte_t pte, mm_level_t level)
+{
+	switch (arch_mm_pte_type(pte, level)) {
+	case PTE_TYPE_ABSENT:
+	case PTE_TYPE_TABLE:
+		return false;
+	case PTE_TYPE_INVALID_BLOCK:
+	case PTE_TYPE_VALID_BLOCK:
+		return true;
+	}
+}
 
 /**
  * Determines if a PTE represents a reference to a table of PTEs.
  */
-bool arch_mm_pte_is_table(pte_t pte, uint8_t level);
-
-/**
- * Clears the bits of an address that are ignored by the page table. In effect,
- * the address is rounded down to the start of the corresponding PTE range.
- */
-paddr_t arch_mm_clear_pa(paddr_t pa);
+static inline bool arch_mm_pte_is_table(pte_t pte, mm_level_t level)
+{
+	return arch_mm_pte_type(pte, level) == PTE_TYPE_TABLE;
+}
 
 /**
  * Extracts the start address of the PTE range.
  */
-paddr_t arch_mm_block_from_pte(pte_t pte, uint8_t level);
+paddr_t arch_mm_block_from_pte(pte_t pte, mm_level_t level);
 
 /**
- * Extracts the address of the table referenced by the PTE.
+ * Extracts the table referenced by the PTE.
  */
-paddr_t arch_mm_table_from_pte(pte_t pte, uint8_t level);
+struct mm_page_table *arch_mm_table_from_pte(pte_t pte, mm_level_t level);
 
 /**
  * Extracts the attributes of the PTE.
  */
-uint64_t arch_mm_pte_attrs(pte_t pte, uint8_t level);
+mm_attr_t arch_mm_pte_attrs(pte_t pte, mm_level_t level);
 
 /**
- * Merges the attributes of a block into those of its containing table.
+ * Merges the attributes of a block into those of its parent table.
  */
-uint64_t arch_mm_combine_table_entry_attrs(uint64_t table_attrs,
-					   uint64_t block_attrs);
+mm_attr_t arch_mm_combine_table_entry_attrs(mm_attr_t table_attrs,
+					    mm_attr_t block_attrs);
 
 /**
  * Invalidates the given range of stage-1 TLB.
  */
-void arch_mm_invalidate_stage1_range(uint16_t asid, vaddr_t va_begin,
+void arch_mm_invalidate_stage1_range(ffa_id_t asid, vaddr_t va_begin,
 				     vaddr_t va_end);
 
 /**
  * Invalidates the given range of stage-2 TLB.
  */
-void arch_mm_invalidate_stage2_range(uint16_t vmid, ipaddr_t va_begin,
+void arch_mm_invalidate_stage2_range(ffa_id_t vmid, ipaddr_t va_begin,
 				     ipaddr_t va_end, bool non_secure);
 
 /**
@@ -117,17 +136,17 @@ void arch_mm_flush_dcache(void *base, size_t size);
 /**
  * Sets the maximum level allowed in the page table for stage-1.
  */
-void arch_mm_stage1_max_level_set(uint32_t pa_bits);
+void arch_mm_stage1_root_level_set(uint32_t pa_bits);
 
 /**
  * Gets the maximum level allowed in the page table for stage-1.
  */
-uint8_t arch_mm_stage1_max_level(void);
+mm_level_t arch_mm_stage1_root_level(void);
 
 /**
  * Gets the maximum level allowed in the page table for stage-2.
  */
-uint8_t arch_mm_stage2_max_level(void);
+mm_level_t arch_mm_stage2_root_level(void);
 
 /**
  * Gets the number of concatenated page tables used at the root for stage-1.
@@ -147,32 +166,32 @@ uint8_t arch_mm_stage2_root_table_count(void);
 /**
  * Converts the mode into stage-1 attributes for a block PTE.
  */
-uint64_t arch_mm_mode_to_stage1_attrs(uint32_t mode);
+mm_attr_t arch_mm_mode_to_stage1_attrs(mm_mode_t mode);
 
 /**
  * Converts the mode into stage-2 attributes for a block PTE.
  */
-uint64_t arch_mm_mode_to_stage2_attrs(uint32_t mode);
+mm_attr_t arch_mm_mode_to_stage2_attrs(mm_mode_t mode);
 
 /**
  * Converts the stage-2 block attributes back to the corresponding mode.
  */
-uint32_t arch_mm_stage2_attrs_to_mode(uint64_t attrs);
+mm_mode_t arch_mm_stage2_attrs_to_mode(mm_attr_t attrs);
 
 /**
  * Converts the stage-1 block attributes back to the corresponding mode.
  */
-uint32_t arch_mm_stage1_attrs_to_mode(uint64_t attrs);
+mm_mode_t arch_mm_stage1_attrs_to_mode(mm_attr_t attrs);
 
 /**
  * Initializes the arch specific memory management.
  */
-bool arch_mm_init(paddr_t table);
+bool arch_mm_init(const struct mm_ptable *ptable);
 
 /**
  * Return the arch specific mm mode for send/recv pages of given VM ID.
  */
-uint32_t arch_mm_extra_attributes_from_vm(ffa_id_t id);
+mm_mode_t arch_mm_extra_mode_from_vm(ffa_id_t id);
 
 /**
  * Execute any barriers or synchronization that is required

@@ -13,6 +13,7 @@
 #include "hf/addr.h"
 #include "hf/interrupt_desc.h"
 #include "hf/list.h"
+#include "hf/mm.h"
 #include "hf/spinlock.h"
 
 #include "vmapi/hf/ffa.h"
@@ -23,7 +24,7 @@
 #define NS_ACTION_SIGNALED 2
 
 /** Maximum number of pending virtual interrupts in the queue per vCPU. */
-#define VINT_QUEUE_MAX 5
+#define VINT_QUEUE_MAX 10
 
 enum vcpu_state {
 	/** The vCPU is switched off. */
@@ -73,6 +74,13 @@ enum schedule_mode {
 	SPMC_MODE,
 };
 
+enum power_mgmt_operation {
+	PWR_MGMT_NONE = 0,
+	/** Power off the CPU. */
+	PWR_MGMT_CPU_OFF,
+	/** No other operations are supported at the moment. */
+};
+
 /*
  * This queue is implemented as a circular buffer. The entries are managed on
  * a First In First Out basis.
@@ -81,6 +89,7 @@ struct interrupt_queue {
 	uint32_t vint_buffer[VINT_QUEUE_MAX];
 	uint16_t head;
 	uint16_t tail;
+	size_t queued_vint_count;
 };
 
 struct interrupts {
@@ -109,7 +118,7 @@ struct vcpu_fault_info {
 	ipaddr_t ipaddr;
 	vaddr_t vaddr;
 	vaddr_t pc;
-	uint32_t mode;
+	mm_mode_t mode;
 };
 
 struct call_chain {
@@ -178,27 +187,14 @@ struct vcpu {
 	 */
 	struct vcpu *preempted_vcpu;
 
-	/**
-	 * Per FF-A v1.1-Beta0 spec section 8.3, an SP can use multiple
-	 * mechanisms to signal completion of secure interrupt handling. SP
-	 * can invoke explicit FF-A ABIs, namely FFA_MSG_WAIT and FFA_RUN,
-	 * when in WAITING/BLOCKED state respectively, but has to perform
-	 * implicit signal completion mechanism by dropping the priority
-	 * of the virtual secure interrupt when SPMC signaled the virtual
-	 * interrupt in PREEMPTED state(The vCPU was preempted by a Self S-Int
-	 * while running). This variable helps SPMC to keep a track of such
-	 * mechanism and perform appropriate bookkeeping.
-	 */
-	bool requires_deactivate_call;
-
 	/** SP call chain. */
 	struct call_chain call_chain;
 
 	/**
-	 * Track if the pending IPI has been retrieved by
+	 * Track if pending interrupts have been retrieved by
 	 * FFA_NOTIFICATION_INFO_GET.
 	 */
-	bool ipi_info_get_retrieved;
+	bool interrupts_info_get_retrieved;
 
 	/**
 	 * Indicates if the current vCPU is running in SPMC scheduled
@@ -216,9 +212,6 @@ struct vcpu {
 	/** Partition Runtime Model. */
 	enum partition_runtime_model rt_model;
 
-	/* List entry pointing to the next vCPU in the boot order list. */
-	struct list_entry boot_list_node;
-
 	/**
 	 * An entry in a list maintained by Hafnium for pending arch timers.
 	 * It exists in the list on behalf of its parent vCPU. The `prev` and
@@ -227,6 +220,18 @@ struct vcpu {
 	 * safeguarded from concurrent accesses.
 	 */
 	struct list_entry timer_node;
+
+	/*
+	 * List entry pointing to the next vcpu with an IPI pending on the
+	 * same pinned CPU.
+	 */
+	struct list_entry ipi_list_node;
+
+	/*
+	 * Denotes which power management operation message is being currently
+	 * handled by this vCPU.
+	 */
+	enum power_mgmt_operation pwr_mgmt_op;
 };
 
 /** Encapsulates a vCPU whose lock is held. */
@@ -256,46 +261,35 @@ bool vcpu_handle_page_fault(const struct vcpu *current,
 void vcpu_set_phys_core_idx(struct vcpu *vcpu);
 void vcpu_set_boot_info_gp_reg(struct vcpu *vcpu);
 
-void vcpu_update_boot(struct vcpu *vcpu);
-struct vcpu *vcpu_get_boot_vcpu(void);
-struct vcpu *vcpu_get_next_boot(struct vcpu *vcpu);
-
-static inline bool vcpu_is_virt_interrupt_enabled(struct interrupts *interrupts,
-						  uint32_t intid)
+static inline void vcpu_call_chain_extend(struct vcpu_locked vcpu1_locked,
+					  struct vcpu_locked vcpu2_locked)
 {
-	return interrupt_bitmap_get_value(&interrupts->interrupt_enabled,
-					  intid) == 1U;
+	vcpu1_locked.vcpu->call_chain.next_node = vcpu2_locked.vcpu;
+	vcpu2_locked.vcpu->call_chain.prev_node = vcpu1_locked.vcpu;
 }
 
-static inline void vcpu_virt_interrupt_set_enabled(
-	struct interrupts *interrupts, uint32_t intid)
+static inline void vcpu_call_chain_remove_node(struct vcpu_locked vcpu1_locked,
+					       struct vcpu_locked vcpu2_locked)
 {
-	interrupt_bitmap_set_value(&interrupts->interrupt_enabled, intid);
+	vcpu1_locked.vcpu->call_chain.prev_node = NULL;
+	vcpu2_locked.vcpu->call_chain.next_node = NULL;
 }
 
-static inline void vcpu_virt_interrupt_clear_enabled(
-	struct interrupts *interrupts, uint32_t intid)
-{
-	interrupt_bitmap_clear_value(&interrupts->interrupt_enabled, intid);
-}
+void vcpu_set_running(struct vcpu_locked target_locked,
+		      const struct ffa_value *args);
+
+void vcpu_save_interrupt_priority(struct vcpu_locked vcpu_locked,
+				  uint8_t priority);
+
+void vcpu_enter_secure_interrupt_rtm(struct vcpu_locked vcpu_locked);
+
+void vcpu_secure_interrupt_complete(struct vcpu_locked vcpu_locked);
 
 static inline bool vcpu_is_virt_interrupt_pending(struct interrupts *interrupts,
 						  uint32_t intid)
 {
 	return interrupt_bitmap_get_value(&interrupts->interrupt_pending,
 					  intid) == 1U;
-}
-
-static inline void vcpu_virt_interrupt_set_pending(
-	struct interrupts *interrupts, uint32_t intid)
-{
-	interrupt_bitmap_set_value(&interrupts->interrupt_pending, intid);
-}
-
-static inline void vcpu_virt_interrupt_clear_pending(
-	struct interrupts *interrupts, uint32_t intid)
-{
-	interrupt_bitmap_clear_value(&interrupts->interrupt_pending, intid);
 }
 
 static inline enum interrupt_type vcpu_virt_interrupt_get_type(
@@ -317,123 +311,23 @@ static inline void vcpu_virt_interrupt_set_type(struct interrupts *interrupts,
 	}
 }
 
-static inline void vcpu_irq_count_increment(struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->interrupts.enabled_and_pending_irq_count++;
-}
+uint32_t vcpu_virt_interrupt_irq_count_get(struct vcpu_locked vcpu_locked);
+uint32_t vcpu_virt_interrupt_fiq_count_get(struct vcpu_locked vcpu_locked);
+uint32_t vcpu_virt_interrupt_count_get(struct vcpu_locked vcpu_locked);
 
-static inline void vcpu_irq_count_decrement(struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->interrupts.enabled_and_pending_irq_count--;
-}
+void vcpu_virt_interrupt_enable(struct vcpu_locked vcpu_locked,
+				uint32_t vint_id, bool enable);
 
-static inline void vcpu_fiq_count_increment(struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->interrupts.enabled_and_pending_fiq_count++;
-}
-
-static inline void vcpu_fiq_count_decrement(struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->interrupts.enabled_and_pending_fiq_count--;
-}
-
-static inline void vcpu_interrupt_count_increment(
-	struct vcpu_locked vcpu_locked, struct interrupts *interrupts,
-	uint32_t intid)
-{
-	if (vcpu_virt_interrupt_get_type(interrupts, intid) ==
-	    INTERRUPT_TYPE_IRQ) {
-		vcpu_irq_count_increment(vcpu_locked);
-	} else {
-		vcpu_fiq_count_increment(vcpu_locked);
-	}
-}
-
-static inline void vcpu_interrupt_count_decrement(
-	struct vcpu_locked vcpu_locked, struct interrupts *interrupts,
-	uint32_t intid)
-{
-	if (vcpu_virt_interrupt_get_type(interrupts, intid) ==
-	    INTERRUPT_TYPE_IRQ) {
-		vcpu_irq_count_decrement(vcpu_locked);
-	} else {
-		vcpu_fiq_count_decrement(vcpu_locked);
-	}
-}
-
-static inline uint32_t vcpu_interrupt_irq_count_get(
-	struct vcpu_locked vcpu_locked)
-{
-	return vcpu_locked.vcpu->interrupts.enabled_and_pending_irq_count;
-}
-
-static inline uint32_t vcpu_interrupt_fiq_count_get(
-	struct vcpu_locked vcpu_locked)
-{
-	return vcpu_locked.vcpu->interrupts.enabled_and_pending_fiq_count;
-}
-
-static inline uint32_t vcpu_interrupt_count_get(struct vcpu_locked vcpu_locked)
-{
-	return vcpu_locked.vcpu->interrupts.enabled_and_pending_irq_count +
-	       vcpu_locked.vcpu->interrupts.enabled_and_pending_fiq_count;
-}
-
-static inline void vcpu_call_chain_extend(struct vcpu_locked vcpu1_locked,
-					  struct vcpu_locked vcpu2_locked)
-{
-	vcpu1_locked.vcpu->call_chain.next_node = vcpu2_locked.vcpu;
-	vcpu2_locked.vcpu->call_chain.prev_node = vcpu1_locked.vcpu;
-}
-
-static inline void vcpu_call_chain_remove_node(struct vcpu_locked vcpu1_locked,
-					       struct vcpu_locked vcpu2_locked)
-{
-	vcpu1_locked.vcpu->call_chain.prev_node = NULL;
-	vcpu2_locked.vcpu->call_chain.next_node = NULL;
-}
-
-void vcpu_interrupt_clear_decrement(struct vcpu_locked vcpu_locked,
-				    uint32_t intid);
-
-void vcpu_set_running(struct vcpu_locked target_locked,
-		      const struct ffa_value *args);
-
-static inline void vcpu_ipi_set_info_get_retrieved(
-	struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->ipi_info_get_retrieved = true;
-}
-
-static inline bool vcpu_ipi_is_info_get_retrieved(
-	struct vcpu_locked vcpu_locked)
-{
-	return vcpu_locked.vcpu->ipi_info_get_retrieved;
-}
-
-/**
- * Clear the flag tracking if the IPI has been retrieved by
- * FFA_NOTIFCATION_INFO_GET.
- */
-static inline void vcpu_ipi_clear_info_get_retrieved(
-	struct vcpu_locked vcpu_locked)
-{
-	vcpu_locked.vcpu->ipi_info_get_retrieved = false;
-}
-
-void vcpu_save_interrupt_priority(struct vcpu_locked vcpu_locked,
-				  uint8_t priority);
-void vcpu_interrupt_inject(struct vcpu_locked target_locked, uint32_t intid);
-void vcpu_enter_secure_interrupt_rtm(struct vcpu_locked vcpu_locked);
-
-bool vcpu_interrupt_queue_push(struct vcpu_locked vcpu_locked,
-			       uint32_t vint_id);
-bool vcpu_interrupt_queue_pop(struct vcpu_locked vcpu_locked,
-			      uint32_t *vint_id);
-bool vcpu_interrupt_queue_peek(struct vcpu_locked vcpu_locked,
-			       uint32_t *vint_id);
-bool vcpu_is_interrupt_in_queue(struct vcpu_locked vcpu_locked,
+uint32_t vcpu_virt_interrupt_peek_pending_and_enabled(
+	struct vcpu_locked vcpu_locked);
+uint32_t vcpu_virt_interrupt_get_pending_and_enabled(
+	struct vcpu_locked vcpu_locked);
+void vcpu_virt_interrupt_inject(struct vcpu_locked vcpu_locked,
 				uint32_t vint_id);
-bool vcpu_is_interrupt_queue_empty(struct vcpu_locked vcpu_locked);
+void vcpu_virt_interrupt_clear(struct vcpu_locked vcpu_locked,
+			       uint32_t vint_id);
 
-void vcpu_secure_interrupt_complete(struct vcpu_locked vcpu_locked);
+void vcpu_dir_req_set_state(struct vcpu_locked target_locked, bool is_ffa_req2,
+			    ffa_id_t sender_vm_id, struct ffa_value args);
+
+void vcpu_dir_req_reset_state(struct vcpu_locked vcpu_locked);

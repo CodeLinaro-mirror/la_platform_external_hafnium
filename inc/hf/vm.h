@@ -33,7 +33,6 @@
  * notified about.
  */
 #define VM_POWER_MANAGEMENT_CPU_OFF_SHIFT (0)
-#define VM_POWER_MANAGEMENT_CPU_ON_SHIFT (3)
 
 /**
  * The state of an RX buffer, as defined by FF-A v1.1 EAC0 specification.
@@ -208,7 +207,6 @@ struct vm {
 		struct notifications from_sp;
 		struct notifications_state framework;
 		bool enabled;
-		bool npi_injected;
 	} notifications;
 
 	/**
@@ -242,6 +240,12 @@ struct vm {
 	uint8_t ns_interrupts_action;
 
 	/**
+	 * Whether the SRI is used for requesting CPU cycles for a partition to
+	 * handle interrupts.
+	 */
+	struct sri_interrupts_policy sri_policy;
+
+	/**
 	 * Action specified by a Partition through the manifest in response to
 	 * Other-S-Int.
 	 */
@@ -266,6 +270,9 @@ struct vm {
 
 	/** Interrupt descriptor */
 	struct interrupt_descriptor interrupt_desc[VM_MANIFEST_MAX_INTERRUPTS];
+
+	/* List entry pointing to the next VM in the boot order list. */
+	struct list_entry boot_list_node;
 };
 
 /** Encapsulates a VM whose lock is held. */
@@ -299,20 +306,20 @@ bool vm_id_is_current_world(ffa_id_t vm_id);
 bool vm_is_mailbox_busy(struct vm_locked to);
 bool vm_is_mailbox_other_world_owned(struct vm_locked to);
 bool vm_identity_map(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-		     uint32_t mode, struct mpool *ppool, ipaddr_t *ipa);
+		     mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa);
 bool vm_identity_prepare(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-			 uint32_t mode, struct mpool *ppool);
+			 mm_mode_t mode, struct mpool *ppool);
 void vm_identity_commit(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
-			uint32_t mode, struct mpool *ppool, ipaddr_t *ipa);
+			mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa);
 bool vm_unmap(struct vm_locked vm_locked, paddr_t begin, paddr_t end,
 	      struct mpool *ppool);
 void vm_ptable_defrag(struct vm_locked vm_locked, struct mpool *ppool);
 bool vm_unmap_hypervisor(struct vm_locked vm_locked, struct mpool *ppool);
 
 bool vm_mem_get_mode(struct vm_locked vm_locked, ipaddr_t begin, ipaddr_t end,
-		     uint32_t *mode);
+		     mm_mode_t *mode);
 bool vm_iommu_mm_identity_map(struct vm_locked vm_locked, paddr_t begin,
-			      paddr_t end, uint32_t mode, struct mpool *ppool,
+			      paddr_t end, mm_mode_t mode, struct mpool *ppool,
 			      ipaddr_t *ipa, uint8_t dma_device_id);
 
 void vm_notifications_init(struct vm *vm, ffa_vcpu_count_t vcpu_count,
@@ -361,20 +368,7 @@ bool vm_notifications_info_get(struct vm_locked vm_locked, uint16_t *ids,
 			       uint32_t *ids_count, uint32_t *lists_sizes,
 			       uint32_t *lists_count, uint32_t ids_max_count);
 bool vm_supports_messaging_method(struct vm *vm, uint16_t messaging_method);
-void vm_notifications_set_npi_injected(struct vm_locked vm_locked,
-				       bool npi_injected);
-bool vm_notifications_is_npi_injected(struct vm_locked vm_locked);
 void vm_set_boot_info_gp_reg(struct vm *vm, struct vcpu *vcpu);
-
-/**
- * Returns true if the VM requested to receive cpu on power management
- * events.
- */
-static inline bool vm_power_management_cpu_on_requested(struct vm *vm)
-{
-	return (vm->power_management &
-		(UINT32_C(1) << VM_POWER_MANAGEMENT_CPU_ON_SHIFT)) != 0;
-}
 
 /**
  * Returns true if the VM requested to receive cpu off power management
@@ -419,3 +413,9 @@ struct interrupt_descriptor *vm_interrupt_set_sec_state(
 	struct vm_locked vm_locked, uint32_t id, uint32_t sec_state);
 struct interrupt_descriptor *vm_interrupt_set_enable(struct vm_locked vm_locked,
 						     uint32_t id, bool enable);
+
+void vm_update_boot(struct vm *vm);
+struct vm *vm_get_boot_vm(void);
+struct vm *vm_get_boot_vm_secondary_core(void);
+struct vm *vm_get_next_boot(struct vm *vm);
+struct vm *vm_get_next_boot_secondary_core(struct vm *vm);

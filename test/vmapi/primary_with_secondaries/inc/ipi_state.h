@@ -6,32 +6,17 @@
  * https://opensource.org/licenses/BSD-3-Clause.
  */
 
-#include "hf/arch/spinlock.h"
+#include "int_state.h"
 
-/**
- * State machine to aid with testing Hafnium's IPI.
- */
-enum ipi_state {
-	/* IPI Interrupt hasn't been configured by target vCPU. */
-	INIT,
-	/* IPI Interrupt has been configured by the target vCPU. */
-	READY,
-	/* IPI has been sent to the target vCPU. */
-	SENT,
-	/* IPI has been handled. */
-	HANDLED,
-};
-
-struct hftest_ipi {
-	enum ipi_state state;
-	struct spinlock lock;
-};
-
-void hftest_ipi_init_state_default(void);
-void hftest_ipi_state_share_page_and_init(uint64_t page,
-					  ffa_id_t receivers_ids[],
-					  size_t receivers_count,
-					  void *send_buf);
+ffa_memory_handle_t hftest_ipi_state_share_page_and_init(
+	uint64_t page, ffa_id_t receivers_ids[],
+	uint32_t receivers_ipi_state_indexes[], size_t receivers_count,
+	void *send_buf, uint32_t vcpu_id);
 void hftest_ipi_init_state_from_message(void *recv_buf, void *send_buf);
-bool hftest_ipi_state_is(enum ipi_state to_check);
-void hftest_ipi_state_set(enum ipi_state to_set);
+bool hftest_ipi_state_is(enum int_state to_check);
+void hftest_ipi_state_set(enum int_state to_set);
+uint32_t hftest_ipi_state_get_interrupt_count(void);
+void hftest_ipi_state_set_all_ready(void);
+void hftest_ipi_state_reset_all(void);
+
+void hftest_ipi_state_page_relinquish(void *send_buf);

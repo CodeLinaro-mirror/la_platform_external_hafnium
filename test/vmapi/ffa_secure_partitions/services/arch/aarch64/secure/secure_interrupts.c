@@ -62,23 +62,6 @@ static void send_managed_exit_response(ffa_id_t dir_req_source_id)
 	HFTEST_LOG("Resuming the suspended command");
 }
 
-static void deactivate_interrupt_and_yield(uint32_t intid)
-{
-	/* Perform secure interrupt de-activation. */
-	ASSERT_EQ(hf_interrupt_deactivate(intid), 0);
-
-	if (yield_while_handling_sec_interrupt) {
-		struct ffa_value ret;
-		HFTEST_LOG("Yield cycles while handling secure interrupt");
-		ret = ffa_yield();
-
-		ASSERT_EQ(ret.func, FFA_SUCCESS_32);
-		HFTEST_LOG("Resuming secure interrupt handling");
-	}
-
-	exception_handler_set_last_interrupt(intid);
-}
-
 static void irq_current(void)
 {
 	uint32_t intid;
@@ -93,6 +76,10 @@ static void irq_current(void)
 		HFTEST_LOG("vIRQ: Sending ME response to %x",
 			   dir_req_source_id);
 		send_managed_exit_response(dir_req_source_id);
+		break;
+	}
+	case HF_NOTIFICATION_PENDING_INTID: {
+		HFTEST_LOG("Notification Pending Interrupt received.\n");
 		break;
 	}
 	case IRQ_TWDOG_INTID: {
@@ -127,7 +114,6 @@ static void irq_current(void)
 			sp_sleep_active_wait(5);
 		}
 
-		deactivate_interrupt_and_yield(intid);
 		break;
 	}
 	case IRQ_AP_REFCLK_BASE1_INTID: {
@@ -138,20 +124,17 @@ static void irq_current(void)
 		HFTEST_LOG("AP_REFCLK timer stopped: %u", intid);
 		cancel_ap_refclk_timer();
 
-		deactivate_interrupt_and_yield(intid);
 		break;
 	}
 	case HF_VIRTUAL_TIMER_INTID: {
 		/* Disable the EL1 physical arch timer. */
 		timer_disable();
-		ASSERT_EQ(hf_interrupt_deactivate(intid), 0);
-
-		exception_handler_set_last_interrupt(intid);
 
 		/* Configure timer to expire periodically. */
 		timer_set(periodic_timer_ms);
 		timer_start();
-		HFTEST_LOG("EL1 Physical timer stopped and restarted");
+		dlog_verbose("EL1 Physical timer stopped and restarted");
+
 		break;
 	}
 	default:
@@ -159,6 +142,20 @@ static void irq_current(void)
 		HFTEST_LOG(HFTEST_LOG_INDENT "Unsupported interrupt id: %u\n",
 			   intid);
 		abort();
+	}
+
+	if (yield_while_handling_sec_interrupt) {
+		struct ffa_value ret;
+		HFTEST_LOG("Yield cycles while handling secure interrupt");
+		ret = ffa_yield();
+
+		ASSERT_EQ(ret.func, FFA_SUCCESS_32);
+		HFTEST_LOG("Resuming secure interrupt handling");
+	}
+
+	/* Don't log NPIs as these are used during test coordination. */
+	if (intid != HF_NOTIFICATION_PENDING_INTID) {
+		exception_handler_set_last_interrupt(intid);
 	}
 }
 

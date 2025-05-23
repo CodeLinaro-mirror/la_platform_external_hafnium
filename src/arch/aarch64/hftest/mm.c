@@ -9,6 +9,7 @@
 #include "hf/mm.h"
 
 #include "hf/arch/barriers.h"
+#include "hf/arch/mm.h"
 #include "hf/arch/vm/mm.h"
 
 #include "hf/dlog.h"
@@ -57,7 +58,7 @@ bool arch_vm_mm_init(void)
 	 * Limit PA bits to HFTEST_S1_PA_BITS. Using the pa_bits reported by
 	 * arch_mm_get_pa_range requires an increase in page pool size.
 	 */
-	arch_mm_stage1_max_level_set(HFTEST_S1_PA_BITS);
+	arch_mm_stage1_root_level_set(HFTEST_S1_PA_BITS);
 
 	/*
 	 * Preserve initial values of the system registers in case we want to
@@ -95,10 +96,10 @@ bool arch_vm_mm_init(void)
 	return true;
 }
 
-void arch_vm_mm_enable(paddr_t table)
+void arch_vm_mm_enable(const struct mm_ptable *ptable)
 {
 	/* Configure translation management registers. */
-	write_msr(ttbr0_el1, pa_addr(table));
+	write_msr(ttbr0_el1, ptable->root_tables);
 	write_msr(mair_el1, mm_mair_el1);
 	write_msr(tcr_el1, mm_tcr_el1);
 

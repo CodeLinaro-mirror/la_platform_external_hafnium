@@ -7,9 +7,8 @@
  */
 
 #include <array>
-#include <cstdio>
+#include <format>
 #include <span>
-#include <sstream>
 
 #include <gmock/gmock.h>
 
@@ -18,6 +17,7 @@ extern "C" {
 
 #include "hf/boot_params.h"
 #include "hf/manifest.h"
+#include "hf/mm.h"
 #include "hf/sp_pkg.h"
 }
 
@@ -210,7 +210,7 @@ class ManifestDtBuilder
 
 	ManifestDtBuilder &LoadAddress(uint64_t value)
 	{
-		return Integer64Property("load_address", value);
+		return Integer64Property("load_address", value, true);
 	}
 
 	ManifestDtBuilder &FfaPartition()
@@ -250,11 +250,10 @@ class ManifestDtBuilder
 
 	ManifestDtBuilder &FfaLoadAddress(uint64_t value)
 	{
-		Integer64Property("load-address", value);
+		Integer64Property("load-address", value, true);
 		return *this;
 	}
 
-       private:
 	ManifestDtBuilder &StringProperty(const std::string_view &name,
 					  const std::string_view &value)
 	{
@@ -282,19 +281,32 @@ class ManifestDtBuilder
 	}
 
 	ManifestDtBuilder &IntegerProperty(const std::string_view &name,
-					   uint32_t value)
+					   uint32_t value, bool hex = false)
 	{
-		dts_ << name << " = <" << value << ">;" << std::endl;
+		std::ostream_iterator<char> out(dts_);
+
+		if (hex) {
+			std::format_to(out, "{} = <{:#08x}>;\n", name, value);
+		} else {
+			std::format_to(out, "{} = <{}>;\n", name, value);
+		}
 		return *this;
 	}
 
 	ManifestDtBuilder &Integer64Property(const std::string_view &name,
-					     uint64_t value)
+					     uint64_t value, bool hex = false)
 	{
 		uint32_t high = value >> 32;
 		uint32_t low = (uint32_t)value;
-		dts_ << name << " = <" << high << " " << low << ">;"
-		     << std::endl;
+		std::ostream_iterator<char> out(dts_);
+
+		if (hex) {
+			std::format_to(out, "{} = <{:#08x} {:#08x}>;\n", name,
+				       high, low);
+		} else {
+			std::format_to(out, "{} = <{} {}>;\n", name, high, low);
+		}
+
 		return *this;
 	}
 
@@ -423,23 +435,56 @@ class manifest : public ::testing::Test
 		struct_manifest **m, const std::vector<char> &vec)
 	{
 		struct memiter it;
-		struct mm_stage1_locked mm_stage1_locked;
+		struct mm_stage1_locked mm_stage1_locked = mm_lock_stage1();
 		struct boot_params params;
+		enum manifest_return_code ret;
 
 		boot_params_init(&params, nullptr);
 
 		memiter_init(&it, vec.data(), vec.size());
 
-		return manifest_init(mm_stage1_locked, m, &it, &params, &ppool);
+		ret = manifest_init(mm_stage1_locked, m, &it, &params, &ppool);
+		mm_unlock_stage1(&mm_stage1_locked);
+		return ret;
+	}
+
+	enum manifest_return_code ffa_manifest_from_spkg(
+		struct_manifest **m, Partition_package *spkg)
+	{
+		struct memiter it;
+		struct mm_stage1_locked mm_stage1_locked = mm_lock_stage1();
+		struct boot_params params;
+		enum manifest_return_code ret;
+
+		boot_params_init(&params, spkg);
+
+		/* clang-format off */
+		std::vector<char> core_dtb = ManifestDtBuilder()
+			.StartChild("hypervisor")
+				.Compatible()
+				.StartChild("vm1")
+					.DebugName("primary_vm")
+					.FfaPartition()
+					.LoadAddress((uint64_t)spkg)
+				.EndChild()
+			.EndChild()
+			.Build(true);
+		/* clang-format on */
+		memiter_init(&it, core_dtb.data(), core_dtb.size());
+
+		ret = manifest_init(mm_stage1_locked, m, &it, &params, &ppool);
+		mm_unlock_stage1(&mm_stage1_locked);
+		return ret;
 	}
 
 	enum manifest_return_code ffa_manifest_from_vec(
 		struct_manifest **m, const std::vector<char> &vec)
 	{
 		struct memiter it;
-		struct mm_stage1_locked mm_stage1_locked;
+		struct mm_stage1_locked mm_stage1_locked = mm_lock_stage1();
 		Partition_package spkg(vec);
 		struct boot_params params;
+		enum manifest_return_code ret;
 
 		boot_params_init(&params, &spkg);
 
@@ -457,7 +502,9 @@ class manifest : public ::testing::Test
 		/* clang-format on */
 		memiter_init(&it, core_dtb.data(), core_dtb.size());
 
-		return manifest_init(mm_stage1_locked, m, &it, &params, &ppool);
+		ret = manifest_init(mm_stage1_locked, m, &it, &params, &ppool);
+		mm_unlock_stage1(&mm_stage1_locked);
+		return ret;
 	}
 };
 
@@ -1191,47 +1238,9 @@ TEST_F(manifest, power_management)
 	struct manifest_vm *vm;
 	struct_manifest *m;
 
-	/* S-EL1 partition power management field can set bit 0. */
+	/* S-EL1 partition power management field can only set bit 0. */
 	/* clang-format off */
 	std::vector<char>  dtb = ManifestDtBuilder()
-		.Compatible({ "arm,ffa-manifest-1.0" })
-		.Property("ffa-version", "<0x10001>")
-		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
-		.Property("execution-ctx-count", "<8>")
-		.Property("exception-level", "<2>")
-		.Property("execution-state", "<0>")
-		.Property("entrypoint-offset", "<0x00002000>")
-		.Property("messaging-method", "<1>")
-		.Property("power-management-messages", "<1>")
-		.Build();
-	/* clang-format on */
-	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
-	vm = &m->vm[0];
-	ASSERT_EQ(vm->partition.power_management, 1);
-	manifest_dealloc();
-
-	/* S-EL1 partition power management field can set bit 3. */
-	/* clang-format off */
-	dtb = ManifestDtBuilder()
-		.Compatible({ "arm,ffa-manifest-1.0" })
-		.Property("ffa-version", "<0x10001>")
-		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
-		.Property("execution-ctx-count", "<8>")
-		.Property("exception-level", "<2>")
-		.Property("execution-state", "<0>")
-		.Property("entrypoint-offset", "<0x00002000>")
-		.Property("messaging-method", "<1>")
-		.Property("power-management-messages", "<8>")
-		.Build();
-	/* clang-format on */
-	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
-	vm = &m->vm[0];
-	ASSERT_EQ(vm->partition.power_management, 8);
-	manifest_dealloc();
-
-	/* S-EL1 partition power management field can only set bits 0 and 3. */
-	/* clang-format off */
-	dtb = ManifestDtBuilder()
 		.Compatible({ "arm,ffa-manifest-1.0" })
 		.Property("ffa-version", "<0x10001>")
 		.Property("uuid", "<0xb4b5671e 0x4a904fe1 0xb81ffb13 0xdae1dacb>")
@@ -1245,7 +1254,7 @@ TEST_F(manifest, power_management)
 	/* clang-format on */
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
 	vm = &m->vm[0];
-	ASSERT_EQ(vm->partition.power_management, 9);
+	ASSERT_EQ(vm->partition.power_management, 1);
 	manifest_dealloc();
 
 	/* S-EL0 partition power management field is forced to 0. */
@@ -1297,13 +1306,14 @@ TEST_F(manifest, ffa_validate_rxtx_info)
 		  MANIFEST_ERROR_PROPERTY_NOT_FOUND);
 }
 
-TEST_F(manifest, ffa_validate_mem_regions)
+TEST_F(manifest, ffa_validate_mem_regions_not_compatible)
 {
 	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Not Compatible */
 	/* clang-format off */
-	std::vector<char>  dtb = ManifestDtBuilder()
+	dtb = ManifestDtBuilder()
 		.FfaValidManifest()
 		.StartChild("memory-regions")
 			.Compatible({ "foo,bar" })
@@ -1313,6 +1323,12 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_NOT_COMPATIBLE);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_unavailable)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Memory regions unavailable  */
 	/* clang-format off */
@@ -1326,6 +1342,12 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_MEMORY_REGION_NODE_EMPTY);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_missing_properties)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Missing Properties */
 	/* clang-format off */
@@ -1342,6 +1364,12 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_PROPERTY_NOT_FOUND);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_empty_region)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Empty memory region */
 	/* clang-format off */
@@ -1374,6 +1402,12 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_MEM_REGION_EMPTY);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_base_address_and_relative_offset)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Mutually exclusive base-address and load-address-relative-offset
 	 * properties */
@@ -1396,6 +1430,13 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_BASE_ADDRESS_AND_RELATIVE_ADDRESS);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_relative_address_overflow)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
+
 	/* Relative-address overflow*/
 	/* clang-format off */
 	dtb = ManifestDtBuilder()
@@ -1416,6 +1457,38 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_INTEGER_OVERFLOW);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_relative_offset_valid)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
+
+	/* valid relative offset */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("load-address", "<0xffffff00 0xffffff00>")
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.Label("rx")
+			.StartChild("rx")
+				.Description("rx-buffer")
+				.Property("load-address-relative-offset", "<0x1000>")
+				.Property("pages-count", "<1>")
+				.Property("attributes", "<1>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_overlapping)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Overlapping memory regions */
 	/* clang-format off */
@@ -1452,6 +1525,32 @@ TEST_F(manifest, ffa_validate_mem_regions)
 			.Label("rx")
 			.StartChild("rx")
 				.Description("rx-buffer")
+				.Property("load-address-relative-offset", "<0x0>")
+				.Property("pages-count", "<1>")
+				.Property("attributes", "<1>")
+			.EndChild()
+			.Label("tx")
+			.StartChild("tx")
+				.Description("tx-buffer")
+				.Property("load-address-relative-offset", "<0x0>")
+				.Property("pages-count", "<2>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_MEM_REGION_OVERLAP);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.Label("rx")
+			.StartChild("rx")
+				.Description("rx-buffer")
 				.Property("base-address", "<0x7300000>")
 				.Property("pages-count", "<2>")
 				.Property("attributes", "<1>")
@@ -1496,6 +1595,98 @@ TEST_F(manifest, ffa_validate_mem_regions)
 		  MANIFEST_ERROR_MEM_REGION_OVERLAP);
 	manifest_dealloc();
 
+	/* clang-format off */
+	Partition_package spkg(dtb);
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.StartChild("test-memory")
+				.Description("test-memory")
+				.Integer64Property("base-address", (uint64_t)&spkg,true)
+				.Property("pages-count", "<1>")
+				.Property("attributes", "<1>")
+			.EndChild()
+		.EndChild()
+		.Build(true);
+	/* clang-format on */
+	spkg.init(dtb);
+	ASSERT_EQ(ffa_manifest_from_spkg(&m, &spkg),
+		  MANIFEST_ERROR_MEM_REGION_OVERLAP);
+	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_overlapping_allowed)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
+
+	/*
+	 * Mem regions are allowed to overlap with parent `load-address` if the
+	 * `load-address-relative-offset` was specified.
+	 */
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.Label("rx")
+			.StartChild("rx")
+				.Description("rx-buffer")
+				.Property("load-address-relative-offset", "<0x1000>")
+				.Property("pages-count", "<1>")
+				.Property("attributes", "<1>")
+			.EndChild()
+			.Label("tx")
+			.StartChild("tx")
+				.Description("tx-buffer")
+				.Property("base-address", "<0x7300000>")
+				.Property("pages-count", "<2>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	ASSERT_EQ(m->vm[0].partition.mem_regions[0].is_relative, true);
+	ASSERT_EQ(m->vm[0].partition.mem_regions[0].base_address,
+		  m->vm[0].partition.load_addr + 0x1000);
+	manifest_dealloc();
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.StartChild("memory-regions")
+			.Compatible({ "arm,ffa-manifest-memory-regions" })
+			.Label("rx")
+			.StartChild("rx")
+				.Description("rx-buffer")
+				.Property("base-address", "<0x7300000>")
+				.Property("pages-count", "<1>")
+				.Property("attributes", "<1>")
+			.EndChild()
+			.Label("tx")
+			.StartChild("tx")
+				.Description("tx-buffer")
+				.Property("load-address-relative-offset", "<0x1000>")
+				.Property("pages-count", "<2>")
+				.Property("attributes", "<3>")
+			.EndChild()
+		.EndChild()
+		.Build();
+	/* clang-format on */
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+	ASSERT_EQ(m->vm[0].partition.mem_regions[1].is_relative, true);
+	ASSERT_EQ(m->vm[0].partition.mem_regions[1].base_address,
+		  m->vm[0].partition.load_addr + 0x1000);
+	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_unaligned)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
+
 	/* Unaligned memory region */
 	/* clang-format off */
 	dtb = ManifestDtBuilder()
@@ -1522,6 +1713,12 @@ TEST_F(manifest, ffa_validate_mem_regions)
 	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
 		  MANIFEST_ERROR_MEM_REGION_UNALIGNED);
 	manifest_dealloc();
+}
+
+TEST_F(manifest, ffa_validate_mem_regions_different_rxtx_sizes)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
 
 	/* Different RXTX buffer sizes */
 	/* clang-format off */
@@ -1992,11 +2189,61 @@ TEST_F(manifest, ffa_invalid_interrupt_target_manifest)
 		  MANIFEST_ERROR_INTERRUPT_ID_NOT_IN_LIST);
 }
 
+TEST_F(manifest, sri_policy)
+{
+	struct_manifest *m;
+	std::vector<char> dtb;
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("sri-interrupts-policy", "<0x0>")
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("sri-interrupts-policy", "<0x1>")
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("sri-interrupts-policy", "<0x2>")
+		.Build();
+	/* clang-format on */
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("sri-interrupts-policy", "<0x3>")
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb), MANIFEST_SUCCESS);
+
+	/* clang-format off */
+	dtb = ManifestDtBuilder()
+		.FfaValidManifest()
+		.Property("sri-interrupts-policy", "<0xF>")
+		.Build();
+	/* clang-format on */
+
+	ASSERT_EQ(ffa_manifest_from_vec(&m, dtb),
+		  MANIFEST_ERROR_ILLEGAL_SRI_POLICY);
+}
+
 TEST_F(manifest, ffa_boot_order_not_unique)
 {
 	struct_manifest *m;
 	struct memiter it;
-	struct mm_stage1_locked mm_stage1_locked;
+	struct mm_stage1_locked mm_stage1_locked = mm_lock_stage1();
 	struct boot_params params;
 	Partition_package spkg_1;
 	Partition_package spkg_2;
@@ -2062,6 +2309,8 @@ TEST_F(manifest, ffa_boot_order_not_unique)
 	memiter_init(&it, core_dtb.data(), core_dtb.size());
 	ASSERT_EQ(manifest_init(mm_stage1_locked, &m, &it, &params, &ppool),
 		  MANIFEST_ERROR_INVALID_BOOT_ORDER);
+
+	mm_unlock_stage1(&mm_stage1_locked);
 }
 
 TEST_F(manifest, ffa_valid_multiple_uuids)
@@ -2167,7 +2416,7 @@ TEST_F(manifest, ffa_device_region_multi_sps)
 {
 	struct_manifest *m;
 	struct memiter it;
-	struct mm_stage1_locked mm_stage1_locked;
+	struct mm_stage1_locked mm_stage1_locked = mm_lock_stage1();
 	struct boot_params params;
 	Partition_package spkg_1;
 	Partition_package spkg_2;
@@ -2323,6 +2572,8 @@ TEST_F(manifest, ffa_device_region_multi_sps)
 	memiter_init(&it, core_dtb.data(), core_dtb.size());
 	ASSERT_EQ(manifest_init(mm_stage1_locked, &m, &it, &params, &ppool),
 		  MANIFEST_SUCCESS);
+
+	mm_unlock_stage1(&mm_stage1_locked);
 }
 
 /*

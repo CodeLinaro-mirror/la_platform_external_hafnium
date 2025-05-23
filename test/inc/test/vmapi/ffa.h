@@ -64,7 +64,8 @@ struct mailbox_buffers {
 
 struct mailbox_buffers set_up_mailbox(void);
 void mailbox_unmap_buffers(struct mailbox_buffers *mb);
-void mailbox_receive_retry(void *buffer, size_t buffer_size, void *recv,
+void mailbox_receive_retry(void *payload, size_t payload_size,
+			   const void *recv_buf,
 			   struct ffa_partition_rxtx_header *header);
 ffa_memory_handle_t send_memory_and_retrieve_request_multi_receiver(
 	uint32_t share_func, void *tx_buffer, ffa_id_t sender,
@@ -118,7 +119,8 @@ void send_fragmented_memory_region(
 	struct ffa_memory_region_constituent constituents[],
 	uint32_t constituent_count, uint32_t remaining_constituent_count,
 	uint32_t sent_length, uint32_t total_length,
-	ffa_memory_handle_t *handle, uint64_t allocator_mask);
+	ffa_memory_handle_t *handle,
+	enum ffa_memory_handle_allocator allocator);
 void memory_region_desc_from_rx_fragments(uint32_t fragment_length,
 					  uint32_t total_length,
 					  ffa_memory_handle_t handle,
@@ -144,12 +146,23 @@ struct ffa_boot_info_desc *get_boot_info_desc(
 	struct ffa_boot_info_header *boot_info_heade, uint8_t type,
 	uint8_t type_id);
 
-struct ffa_value send_indirect_message(ffa_id_t from, ffa_id_t to, void *send,
-				       const void *payload, size_t payload_size,
+struct ffa_value send_indirect_message(ffa_id_t sender, ffa_id_t receiver,
+				       void *send_buf, const void *payload,
+				       size_t payload_size,
 				       uint32_t send_flags);
 
-void receive_indirect_message(void *buffer, size_t buffer_size, void *recv,
-			      ffa_id_t *sender);
+struct ffa_value send_indirect_message_v1_1(ffa_id_t sender, ffa_id_t receiver,
+					    void *send_buf, const void *payload,
+					    size_t payload_size,
+					    uint32_t send_flags);
+
+struct ffa_value send_indirect_message_with_uuid(
+	ffa_id_t sender, ffa_id_t receiver, void *send_buf, const void *payload,
+	size_t payload_size, struct ffa_uuid uuid, uint32_t send_flags);
+
+struct ffa_partition_rxtx_header receive_indirect_message(void *payload,
+							  size_t payload_size,
+							  const void *recv_buf);
 
 bool ffa_partition_info_regs_get_part_info(
 	struct ffa_value args, uint8_t idx,
@@ -159,7 +172,10 @@ void update_mm_security_state(struct ffa_composite_memory_region *composite,
 			      ffa_memory_attributes_t attributes);
 
 uint64_t get_shared_page_from_message(void *recv_buf, void *send_buf,
-				      void *retrieve_buffer);
+				      void *retrieve_buffer,
+				      ffa_memory_handle_t *handle);
 
-void share_page_with_endpoints(uint64_t page, ffa_id_t receivers_ids[],
-			       size_t receivers_count, void *send_buf);
+ffa_memory_handle_t share_page_with_endpoints(uint64_t page,
+					      ffa_id_t receivers_ids[],
+					      size_t receivers_count,
+					      void *send_buf);

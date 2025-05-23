@@ -8,10 +8,13 @@
 
 #include "hf/boot_info.h"
 
+#include "hf/arch/mm.h"
+
 #include "hf/assert.h"
 #include "hf/dlog.h"
 #include "hf/ffa.h"
 #include "hf/memiter.h"
+#include "hf/mm.h"
 #include "hf/std.h"
 
 #include "vmapi/hf/ffa.h"
@@ -20,13 +23,14 @@
  * Initializes the ffa_boot_info_header in accordance to the specification.
  */
 static void ffa_boot_info_header_init(struct ffa_boot_info_header *header,
-				      size_t blob_size)
+				      size_t blob_size,
+				      enum ffa_version vm_ffa_version)
 {
 	assert(header != NULL);
 	assert(blob_size != 0U);
 
 	header->signature = FFA_BOOT_INFO_SIG;
-	header->version = FFA_BOOT_INFO_VERSION;
+	header->version = vm_ffa_version;
 	header->info_blob_size = blob_size;
 	header->desc_size = sizeof(struct ffa_boot_info_desc);
 	header->desc_count = 0;
@@ -91,20 +95,26 @@ static void boot_info_write_desc(struct ffa_boot_info_header *header,
  * Looks for the FF-A manifest boot information node, and writes the
  * requested information into the boot info memory.
  */
-bool ffa_boot_info_node(struct fdt_node *boot_info_node, vaddr_t pkg_address,
-			struct sp_pkg_header *pkg_header)
+bool ffa_boot_info_node(struct fdt_node *boot_info_node,
+			struct partition_pkg *pkg,
+			enum ffa_version vm_ffa_version)
 {
 	struct memiter data;
-	struct ffa_boot_info_header *boot_info_header =
-		(struct ffa_boot_info_header *)ptr_from_va(pkg_address);
-	const size_t boot_info_size = sp_pkg_get_boot_info_size(pkg_header);
+	struct ffa_boot_info_header *boot_info_header;
+	const size_t boot_info_size =
+		pa_difference(pkg->boot_info.begin, pkg->boot_info.end);
 	const size_t max_boot_info_desc_count =
 		(boot_info_size -
 		 offsetof(struct ffa_boot_info_header, boot_info)) /
 		sizeof(struct ffa_boot_info_desc);
+	bool ret = false;
 
 	assert(boot_info_node != NULL);
-	assert(pkg_header != NULL);
+	assert(pkg != NULL);
+
+	boot_info_header = (struct ffa_boot_info_header *)ptr_from_va(
+		va_from_pa(pkg->boot_info.begin));
+
 	assert(boot_info_header != NULL);
 
 	/*
@@ -116,41 +126,71 @@ bool ffa_boot_info_node(struct fdt_node *boot_info_node, vaddr_t pkg_address,
 	 * descriptors. The size of boot info contents to be incremented,
 	 * depending on the info specified in the partition's FF-A manifest.
 	 */
-	ffa_boot_info_header_init(boot_info_header, boot_info_size);
+	ffa_boot_info_header_init(boot_info_header, boot_info_size,
+				  vm_ffa_version);
 
 	if (!fdt_is_compatible(boot_info_node, "arm,ffa-manifest-boot-info")) {
 		dlog_verbose("The node 'boot-info' is not compatible.\n");
 		return false;
 	}
 
-	dlog_verbose("  FF-A Boot Info:\n");
+	dlog_verbose("  FF-A Boot Info: base %lx\n",
+		     (uintptr_t)ptr_from_va(va_from_pa(pkg->boot_info.begin)));
 
 	if (fdt_read_property(boot_info_node, "ffa_manifest", &data) &&
 	    memiter_size(&data) == 0U) {
-		ipaddr_t manifest_address = ipa_init(
-			va_addr(va_add(pkg_address, pkg_header->pm_offset)));
+		ipaddr_t manifest_address = ipa_from_pa(pkg->pm.begin);
+		const uint32_t pm_size =
+			pa_difference(pkg->pm.begin, pkg->pm.end);
 
-		dlog_verbose("    FF-A Manifest\n");
-		boot_info_write_desc(
-			boot_info_header,
-			FFA_BOOT_INFO_FLAG_CONTENT_FORMAT_ADDR, true,
-			FFA_BOOT_INFO_TYPE_ID_FDT, pkg_header->pm_size,
-			ipa_addr(manifest_address), max_boot_info_desc_count);
+		dlog_verbose("    FF-A Manifest: %lx\n",
+			     ipa_addr(manifest_address));
+		boot_info_write_desc(boot_info_header,
+				     FFA_BOOT_INFO_FLAG_CONTENT_FORMAT_ADDR,
+				     true, FFA_BOOT_INFO_TYPE_ID_FDT, pm_size,
+				     ipa_addr(manifest_address),
+				     max_boot_info_desc_count);
 
 		/*
 		 * Incrementing the size of the boot information blob with the
 		 * size of the partition's manifest.
 		 */
-		boot_info_header->info_blob_size += pkg_header->pm_size;
+		boot_info_header->info_blob_size += pm_size;
 
+		ret = true;
+	}
+
+	if (fdt_read_property(boot_info_node, "hob_list", &data) &&
+	    memiter_size(&data) == 0U) {
+		ipaddr_t hob_address = ipa_from_pa(pkg->hob.begin);
+		const uint32_t hob_size =
+			pa_difference(pkg->hob.begin, pkg->hob.end);
+
+		dlog_verbose("    Hob List: %lx, size: %x\n",
+			     ipa_addr(hob_address), hob_size);
+		boot_info_write_desc(boot_info_header,
+				     FFA_BOOT_INFO_FLAG_CONTENT_FORMAT_ADDR,
+				     true, FFA_BOOT_INFO_TYPE_ID_HOB, hob_size,
+				     ipa_addr(hob_address),
+				     max_boot_info_desc_count);
+
+		/*
+		 * Incrementing the size of the boot information blob with the
+		 * size of the partition's manifest.
+		 */
+		boot_info_header->info_blob_size += hob_size;
+
+		ret = true;
+	}
+
+	if (ret == true) {
 		/*
 		 * Flush the data cache in case partition initializes with
 		 * caches disabled.
 		 */
 		arch_mm_flush_dcache((void *)boot_info_header,
 				     boot_info_header->info_blob_size);
-		return true;
 	}
 
-	return false;
+	return ret;
 }

@@ -22,10 +22,12 @@
 #include "hf/dlog.h"
 #include "hf/fdt.h"
 #include "hf/ffa.h"
+#include "hf/ffa_partition_manifest.h"
 #include "hf/layout.h"
+#include "hf/mem_range.h"
 #include "hf/mm.h"
 #include "hf/mpool.h"
-#include "hf/sp_pkg.h"
+#include "hf/partition_pkg.h"
 #include "hf/static_assert.h"
 #include "hf/std.h"
 
@@ -100,7 +102,7 @@ static bool check_boot_order(uint16_t boot_order)
 	}
 
 	i = boot_order / BOOT_ORDER_ENTRY_BITS;
-	boot_order_mask = 1 << (boot_order % BOOT_ORDER_ENTRY_BITS);
+	boot_order_mask = UINT64_C(1) << (boot_order % BOOT_ORDER_ENTRY_BITS);
 
 	if ((boot_order_mask & manifest_data->boot_order_values[i]) != 0U) {
 		dlog_error("Boot order must be a unique value.");
@@ -506,20 +508,19 @@ static enum manifest_return_code parse_vm(struct fdt_node *node,
 	return MANIFEST_SUCCESS;
 }
 
-static bool is_memory_region_within_ranges(uintptr_t base_address,
+/**
+ * Return true if the region described by `region_start` and `page_count`
+ * overlaps with any of `ranges`.
+ */
+static bool is_memory_region_within_ranges(uintptr_t region_start,
 					   uint32_t page_count,
-					   const struct mem_range *ranges,
-					   const size_t ranges_size)
+					   const struct mem_range ranges[],
+					   size_t ranges_size)
 {
-	uintptr_t region_end =
-		base_address + ((uintptr_t)page_count * PAGE_SIZE - 1);
+	struct mem_range region = make_mem_range(region_start, page_count);
 
 	for (size_t i = 0; i < ranges_size; i++) {
-		uintptr_t base = (uintptr_t)pa_addr(ranges[i].begin);
-		uintptr_t end = (uintptr_t)pa_addr(ranges[i].end);
-
-		if ((base_address >= base && base_address <= end) ||
-		    (region_end >= base && region_end <= end)) {
+		if (mem_range_overlaps(ranges[i], region)) {
 			return true;
 		}
 	}
@@ -594,15 +595,7 @@ static enum manifest_return_code check_and_record_memory_used(
 	uintptr_t base_address, uint32_t page_count,
 	struct mem_range *mem_ranges, size_t *mem_regions_index)
 {
-	bool overlap_of_regions;
-
-	if (page_count == 0U) {
-		dlog_error(
-			"Empty memory region defined with base address: "
-			"%#lx.\n",
-			base_address);
-		return MANIFEST_ERROR_MEM_REGION_EMPTY;
-	}
+	paddr_t begin;
 
 	if (!is_aligned(base_address, PAGE_SIZE)) {
 		dlog_error("base_address (%#lx) is not aligned to page size.\n",
@@ -610,21 +603,19 @@ static enum manifest_return_code check_and_record_memory_used(
 		return MANIFEST_ERROR_MEM_REGION_UNALIGNED;
 	}
 
-	overlap_of_regions = is_memory_region_within_ranges(
-		base_address, page_count, mem_ranges, *mem_regions_index);
-
-	if (!overlap_of_regions) {
-		paddr_t begin = pa_init(base_address);
-
-		mem_ranges[*mem_regions_index].begin = begin;
-		mem_ranges[*mem_regions_index].end =
-			pa_add(begin, page_count * PAGE_SIZE - 1);
-		(*mem_regions_index)++;
-
-		return MANIFEST_SUCCESS;
+	if (is_memory_region_within_ranges(base_address, page_count, mem_ranges,
+					   *mem_regions_index)) {
+		return MANIFEST_ERROR_MEM_REGION_OVERLAP;
 	}
 
-	return MANIFEST_ERROR_MEM_REGION_OVERLAP;
+	begin = pa_init(base_address);
+
+	mem_ranges[*mem_regions_index].begin = begin;
+	mem_ranges[*mem_regions_index].end =
+		pa_add(begin, page_count * PAGE_SIZE - 1);
+	(*mem_regions_index)++;
+
+	return MANIFEST_SUCCESS;
 }
 
 static enum manifest_return_code parse_common_fields_mem_dev_region_node(
@@ -666,6 +657,113 @@ static enum manifest_return_code parse_common_fields_mem_dev_region_node(
 	return MANIFEST_SUCCESS;
 }
 
+/**
+ * Parse and validate a memory regions's base address.
+ *
+ * The base address can be specified either as an absolute address (with
+ * `base-address`) or as an offset from `load_address` (with
+ * `load-address-relative-offset`).
+
+ * Returns an error if:
+ * - Neither `base-address` or `load-address-relative-offset` are specified.
+ * - Both `base-address` and `load-address-relative-offset` are specified.
+ * - The effective address (`load-address-relative-offset` + `load_address`)
+ *   would overflow.
+ */
+static enum manifest_return_code parse_base_address(
+	struct fdt_node *mem_node, uintptr_t load_address,
+	struct memory_region *mem_region)
+{
+	uintptr_t relative_offset;
+	uintptr_t absolute_address;
+
+	bool is_relative;
+	bool is_absolute;
+
+	TRY(read_optional_uint64(mem_node, "base-address",
+				 MANIFEST_INVALID_ADDRESS, &absolute_address));
+
+	TRY(read_optional_uint64(mem_node, "load-address-relative-offset",
+				 MANIFEST_INVALID_ADDRESS, &relative_offset));
+
+	is_absolute = (absolute_address != MANIFEST_INVALID_ADDRESS);
+	is_relative = (relative_offset != MANIFEST_INVALID_ADDRESS);
+
+	if (!is_absolute && !is_relative) {
+		return MANIFEST_ERROR_PROPERTY_NOT_FOUND;
+	}
+
+	if (is_absolute && is_relative) {
+		return MANIFEST_ERROR_BASE_ADDRESS_AND_RELATIVE_ADDRESS;
+	}
+
+	if (is_relative && relative_offset > UINT64_MAX - load_address) {
+		return MANIFEST_ERROR_INTEGER_OVERFLOW;
+	}
+
+	mem_region->base_address =
+		is_absolute ? absolute_address : load_address + relative_offset;
+	mem_region->is_relative = is_relative;
+
+	return MANIFEST_SUCCESS;
+}
+
+/**
+ * Parse and validate a memory region/device region's attributes.
+ * Returns an error if:
+ * - Memory region attributes are not `R` or `RW` or `RX`.
+ * - Device region attributes are not `R` or `RW`.
+ * NOTE: Security attribute is not checked by this function, it is checked in
+ * the load phase.
+ */
+static enum manifest_return_code parse_ffa_region_attributes(
+	struct fdt_node *node, uint32_t *out_attributes, bool is_device)
+{
+	uint32_t attributes;
+
+	TRY(read_uint32(node, "attributes", out_attributes));
+
+	attributes = *out_attributes &
+		     (MANIFEST_REGION_ATTR_READ | MANIFEST_REGION_ATTR_WRITE |
+		      MANIFEST_REGION_ATTR_EXEC);
+
+	if (is_device) {
+		switch (attributes) {
+		case MANIFEST_REGION_ATTR_READ:
+		case MANIFEST_REGION_ATTR_READ | MANIFEST_REGION_ATTR_WRITE:
+			break;
+		default:
+			return MANIFEST_ERROR_INVALID_MEM_PERM;
+		}
+	} else {
+		switch (attributes) {
+		case MANIFEST_REGION_ATTR_READ:
+		case MANIFEST_REGION_ATTR_READ | MANIFEST_REGION_ATTR_WRITE:
+		case MANIFEST_REGION_ATTR_READ | MANIFEST_REGION_ATTR_EXEC:
+			break;
+		default:
+			return MANIFEST_ERROR_INVALID_MEM_PERM;
+		}
+	}
+
+	/* Filter region attributes. */
+	*out_attributes &= MANIFEST_REGION_ALL_ATTR_MASK;
+
+	return MANIFEST_SUCCESS;
+}
+
+static enum manifest_return_code parse_page_count(struct fdt_node *node,
+						  uint32_t *page_count)
+{
+	TRY(read_uint32(node, "pages-count", page_count));
+
+	if (*page_count == 0) {
+		return MANIFEST_ERROR_MEM_REGION_EMPTY;
+	}
+
+	return MANIFEST_SUCCESS;
+}
+
 static enum manifest_return_code parse_ffa_memory_region_node(
 	struct fdt_node *mem_node, uintptr_t load_address,
 	struct memory_region *mem_regions, uint16_t *count, struct rx_tx *rxtx,
@@ -674,7 +772,6 @@ static enum manifest_return_code parse_ffa_memory_region_node(
 	uint32_t phandle;
 	uint16_t i = 0;
 	uint32_t j = 0;
-	uintptr_t relative_address;
 	struct uint32list_iter list;
 
 	dlog_verbose("  Partition memory regions\n");
@@ -691,77 +788,39 @@ static enum manifest_return_code parse_ffa_memory_region_node(
 		dlog_verbose("    Memory Region[%u]\n", i);
 
 		TRY(read_optional_string(mem_node, "description",
-					 &mem_regions[i].name));
-		dlog_verbose("      Name: %s\n",
-			     string_data(&mem_regions[i].name));
+					 &mem_regions[i].description));
+		dlog_verbose("      Description: %s\n",
+			     string_data(&mem_regions[i].description));
 
-		TRY(read_optional_uint64(mem_node, "base-address",
-					 MANIFEST_INVALID_ADDRESS,
-					 &mem_regions[i].base_address));
-		dlog_verbose("      Base address: %#lx\n",
-			     mem_regions[i].base_address);
+		TRY(parse_base_address(mem_node, load_address,
+				       &mem_regions[i]));
 
-		TRY(read_optional_uint64(
-			mem_node, "load-address-relative-offset",
-			MANIFEST_INVALID_ADDRESS, &relative_address));
-		if (relative_address != MANIFEST_INVALID_ADDRESS) {
-			dlog_verbose("      Relative address:  %#lx\n",
-				     relative_address);
-		}
-
-		if (mem_regions[i].base_address == MANIFEST_INVALID_ADDRESS &&
-		    relative_address == MANIFEST_INVALID_ADDRESS) {
-			return MANIFEST_ERROR_PROPERTY_NOT_FOUND;
-		}
-
-		if (mem_regions[i].base_address != MANIFEST_INVALID_ADDRESS &&
-		    relative_address != MANIFEST_INVALID_ADDRESS) {
-			return MANIFEST_ERROR_BASE_ADDRESS_AND_RELATIVE_ADDRESS;
-		}
-
-		if (relative_address != MANIFEST_INVALID_ADDRESS &&
-		    relative_address > UINT64_MAX - load_address) {
-			return MANIFEST_ERROR_INTEGER_OVERFLOW;
-		}
-
-		if (relative_address != MANIFEST_INVALID_ADDRESS) {
-			mem_regions[i].base_address =
-				load_address + relative_address;
-		}
-
-		TRY(read_uint32(mem_node, "pages-count",
-				&mem_regions[i].page_count));
+		TRY(parse_page_count(mem_node, &mem_regions[i].page_count));
 		dlog_verbose("      Pages_count: %u\n",
 			     mem_regions[i].page_count);
 
-		TRY(read_uint32(mem_node, "attributes",
-				&mem_regions[i].attributes));
-
-		/*
-		 * Check RWX permission attributes.
-		 * Security attribute is checked at load phase.
-		 */
-		uint32_t permissions = mem_regions[i].attributes &
-				       (MANIFEST_REGION_ATTR_READ |
-					MANIFEST_REGION_ATTR_WRITE |
-					MANIFEST_REGION_ATTR_EXEC);
-		if (permissions != MANIFEST_REGION_ATTR_READ &&
-		    permissions != (MANIFEST_REGION_ATTR_READ |
-				    MANIFEST_REGION_ATTR_WRITE) &&
-		    permissions != (MANIFEST_REGION_ATTR_READ |
-				    MANIFEST_REGION_ATTR_EXEC)) {
-			return MANIFEST_ERROR_INVALID_MEM_PERM;
-		}
-
-		/* Filter memory region attributes. */
-		mem_regions[i].attributes &= MANIFEST_REGION_ALL_ATTR_MASK;
-
+		TRY(parse_ffa_region_attributes(
+			mem_node, &mem_regions[i].attributes, false));
 		dlog_verbose("      Attributes: %#x\n",
 			     mem_regions[i].attributes);
 
 		TRY(check_partition_memory_is_valid(
 			mem_regions[i].base_address, mem_regions[i].page_count,
 			mem_regions[i].attributes, boot_params, false));
+
+		/*
+		 * Memory regions are not allowed to overlap with
+		 * `load_address`, unless the memory region is relative.
+		 */
+		if (!mem_regions[i].is_relative) {
+			struct mem_range range =
+				make_mem_range(mem_regions[i].base_address,
+					       mem_regions[i].page_count);
+
+			if (mem_range_contains_address(range, load_address)) {
+				return MANIFEST_ERROR_MEM_REGION_OVERLAP;
+			}
+		}
 
 		TRY(check_and_record_memory_used(
 			mem_regions[i].base_address, mem_regions[i].page_count,
@@ -889,8 +948,7 @@ static enum manifest_return_code parse_ffa_device_region_node(
 		dlog_verbose("      Base address: %#lx\n",
 			     dev_regions[i].base_address);
 
-		TRY(read_uint32(dev_node, "pages-count",
-				&dev_regions[i].page_count));
+		TRY(parse_page_count(dev_node, &dev_regions[i].page_count));
 		dlog_verbose("      Pages_count: %u\n",
 			     dev_regions[i].page_count);
 
@@ -899,28 +957,8 @@ static enum manifest_return_code parse_ffa_device_region_node(
 			manifest_data->mem_regions,
 			&manifest_data->mem_regions_index));
 
-		TRY(read_uint32(dev_node, "attributes",
-				&dev_regions[i].attributes));
-
-		/*
-		 * Check RWX permission attributes.
-		 * Security attribute is checked at load phase.
-		 */
-		uint32_t permissions = dev_regions[i].attributes &
-				       (MANIFEST_REGION_ATTR_READ |
-					MANIFEST_REGION_ATTR_WRITE |
-					MANIFEST_REGION_ATTR_EXEC);
-
-		if (permissions != MANIFEST_REGION_ATTR_READ &&
-		    permissions != (MANIFEST_REGION_ATTR_READ |
-				    MANIFEST_REGION_ATTR_WRITE)) {
-			return MANIFEST_ERROR_INVALID_MEM_PERM;
-		}
-
-		/* Filter device region attributes. */
-		dev_regions[i].attributes = dev_regions[i].attributes &
-					    MANIFEST_REGION_ALL_ATTR_MASK;
-
+		TRY(parse_ffa_region_attributes(
+			dev_node, &dev_regions[i].attributes, true));
 		dlog_verbose("      Attributes: %#x\n",
 			     dev_regions[i].attributes);
 
@@ -1053,9 +1091,13 @@ static enum manifest_return_code sanity_check_ffa_manifest(
 	/* ensure that the SPM version is compatible */
 	ffa_version = vm->partition.ffa_version;
 	if (!ffa_versions_are_compatible(ffa_version, FFA_VERSION_COMPILED)) {
-		dlog_error("FF-A partition manifest version %s: %u.%u\n",
-			   error_string, ffa_version_get_major(ffa_version),
-			   ffa_version_get_minor(ffa_version));
+		dlog_error(
+			"FF-A partition manifest version v%u.%u is not "
+			"compatible with compiled version v%u.%u\n",
+			ffa_version_get_major(ffa_version),
+			ffa_version_get_minor(ffa_version),
+			ffa_version_get_major(FFA_VERSION_COMPILED),
+			ffa_version_get_minor(FFA_VERSION_COMPILED));
 		ret_code = MANIFEST_ERROR_NOT_COMPATIBLE;
 	}
 
@@ -1138,6 +1180,12 @@ static enum manifest_return_code sanity_check_ffa_manifest(
 		dlog_error("GP register number %s: %u\n", error_string,
 			   vm->partition.gp_register_num);
 		ret_code = MANIFEST_ERROR_NOT_COMPATIBLE;
+	}
+
+	if (vm->partition.run_time_el == S_EL0 &&
+	    (vm->partition.sri_policy.intr_while_waiting ||
+	     vm->partition.sri_policy.intr_pending_entry_wait)) {
+		ret_code = MANIFEST_ERROR_SRI_POLICY_NOT_SUPPORTED;
 	}
 
 	return ret_code;
@@ -1247,8 +1295,9 @@ enum manifest_return_code parse_ffa_manifest(
 	TRY(read_optional_uint64(&root, "load-address", 0, &load_address));
 	if (vm->partition.load_addr != load_address) {
 		dlog_warning(
-			"Partition's load address at its manifest differs"
-			" from specified in partition's package.\n");
+			"Partition's `load_address` (%#lx) in its manifest "
+			"differs from `load-address` (%#lx) in its package\n",
+			vm->partition.load_addr, load_address);
 	}
 	dlog_verbose("  Load address %#lx\n", vm->partition.load_addr);
 
@@ -1319,7 +1368,6 @@ enum manifest_return_code parse_ffa_manifest(
 	if (managed_exit_field_present) {
 		vm->partition.ns_interrupts_action = NS_ACTION_ME;
 	}
-
 	if (vm->partition.ns_interrupts_action != NS_ACTION_QUEUED &&
 	    vm->partition.ns_interrupts_action != NS_ACTION_ME &&
 	    vm->partition.ns_interrupts_action != NS_ACTION_SIGNALED) {
@@ -1347,6 +1395,28 @@ enum manifest_return_code parse_ffa_manifest(
 			      &vm->partition.me_signal_virq));
 		if (vm->partition.me_signal_virq) {
 			dlog_verbose("  Managed Exit signaled through vIRQ\n");
+		}
+	}
+
+	TRY(read_optional_uint8(&root, "sri-interrupts-policy", 0,
+				(uint8_t *)&vm->partition.sri_policy));
+
+	if (vm->partition.sri_policy.mbz != 0U) {
+		return MANIFEST_ERROR_ILLEGAL_SRI_POLICY;
+	}
+
+	dlog_verbose("  SRI Trigger Policy.\n");
+	if (!vm->partition.sri_policy.intr_while_waiting &&
+	    !vm->partition.sri_policy.intr_pending_entry_wait) {
+		dlog_verbose("    Not trigged in interrupt handling.\n");
+	} else {
+		if (vm->partition.sri_policy.intr_while_waiting) {
+			dlog_verbose("    On interrupts while waiting.\n");
+		}
+		if (vm->partition.sri_policy.intr_pending_entry_wait) {
+			dlog_verbose(
+				"    On entry to wait while interrupts "
+				"pending.\n");
 		}
 	}
 
@@ -1400,11 +1470,9 @@ enum manifest_return_code parse_ffa_manifest(
 		return MANIFEST_ERROR_VM_AVAILABILITY_MESSAGE_INVALID;
 	}
 
-	TRY(read_optional_uint32(
-		&root, "power-management-messages",
-		MANIFEST_POWER_MANAGEMENT_CPU_OFF_SUPPORTED |
-			MANIFEST_POWER_MANAGEMENT_CPU_ON_SUPPORTED,
-		&vm->partition.power_management));
+	TRY(read_optional_uint32(&root, "power-management-messages",
+				 MANIFEST_POWER_MANAGEMENT_NONE_MASK,
+				 &vm->partition.power_management));
 	vm->partition.power_management &= MANIFEST_POWER_MANAGEMENT_ALL_MASK;
 	if (vm->partition.execution_ctx_count == 1 ||
 	    vm->partition.run_time_el == S_EL0 ||
@@ -1453,11 +1521,12 @@ static enum manifest_return_code parse_ffa_partition_package(
 {
 	enum manifest_return_code ret = MANIFEST_ERROR_NOT_COMPATIBLE;
 	uintpaddr_t load_address;
-	struct sp_pkg_header header;
+	struct partition_pkg pkg;
 	struct fdt sp_fdt;
-	vaddr_t pkg_start;
-	vaddr_t manifest_address;
+	void *pm_ptr;
+	size_t pm_size;
 	struct fdt_node boot_info_node;
+	size_t total_mem_size;
 
 	/*
 	 * This must have been hinted as being an FF-A partition,
@@ -1474,23 +1543,25 @@ static enum manifest_return_code parse_ffa_partition_package(
 
 	assert(load_address != 0U);
 
-	if (!sp_pkg_init(stage1_locked, pa_init(load_address), &header,
-			 ppool)) {
+	if (!partition_pkg_init(stage1_locked, pa_init(load_address), &pkg,
+				ppool)) {
 		return ret;
 	}
 
-	pkg_start = va_init(load_address);
+	total_mem_size = pa_difference(pkg.total.begin, pkg.total.end);
 
 	if (vm_id != HF_PRIMARY_VM_ID &&
-	    sp_pkg_get_mem_size(&header) >= vm->secondary.mem_size) {
-		dlog_error("Invalid package header or DT size.\n");
+	    total_mem_size > (size_t)vm->secondary.mem_size) {
+		dlog_error("Partition pkg size %zx bigger than expected: %x\n",
+			   total_mem_size, (uint32_t)vm->secondary.mem_size);
 		goto out;
 	}
 
-	manifest_address = va_add(va_init(load_address), header.pm_offset);
-	if (!fdt_init_from_ptr(&sp_fdt, ptr_from_va(manifest_address),
-			       header.pm_size)) {
-		dlog_error("manifest.c: FDT failed validation.\n");
+	pm_ptr = ptr_from_va(va_from_pa(pkg.pm.begin));
+
+	pm_size = pa_difference(pkg.pm.begin, pkg.pm.end);
+	if (!fdt_init_from_ptr(&sp_fdt, pm_ptr, pm_size)) {
+		dlog_error("%s: FDT failed validation.\n", __func__);
 		goto out;
 	}
 
@@ -1502,15 +1573,28 @@ static enum manifest_return_code parse_ffa_partition_package(
 		goto out;
 	}
 
-	if (vm->partition.gp_register_num != DEFAULT_BOOT_GP_REGISTER) {
-		if (header.version == SP_PKG_HEADER_VERSION_2 &&
-		    vm->partition.boot_info &&
-		    !ffa_boot_info_node(&boot_info_node, pkg_start, &header)) {
-			dlog_error("Failed to process boot information.\n");
+	/* Partition subscribed to boot information. */
+	if (vm->partition.gp_register_num != DEFAULT_BOOT_GP_REGISTER &&
+	    vm->partition.boot_info) {
+		/* Its package should have available space for it. */
+		if (pa_addr(pkg.boot_info.begin) == 0U) {
+			dlog_warning(
+				"Partition Package %s doesn't have boot info "
+				"space.\n",
+				vm->debug_name.data);
+		} else {
+			if (!ffa_boot_info_node(&boot_info_node, &pkg,
+						vm->partition.ffa_version)) {
+				dlog_error(
+					"Failed to process boot "
+					"information.\n");
+			}
 		}
 	}
+
 out:
-	sp_pkg_deinit(stage1_locked, pkg_start, &header, ppool);
+	partition_pkg_deinit(stage1_locked, &pkg, ppool);
+
 	return ret;
 }
 
@@ -1676,8 +1760,6 @@ const char *manifest_strerror(enum manifest_return_code ret_code)
 		return "Success";
 	case MANIFEST_ERROR_FILE_SIZE:
 		return "Total size in header does not match file size";
-	case MANIFEST_ERROR_MALFORMED_DTB:
-		return "Malformed device tree blob";
 	case MANIFEST_ERROR_NO_ROOT_NODE:
 		return "Could not find root node in manifest";
 	case MANIFEST_ERROR_NO_HYPERVISOR_FDT_NODE:
@@ -1721,13 +1803,15 @@ const char *manifest_strerror(enum manifest_return_code ret_code)
 		return "Memory region is not aligned to a page boundary";
 	case MANIFEST_ERROR_INVALID_MEM_PERM:
 		return "Memory permission should be RO, RW or RX";
-	case MANIFEST_ERROR_ARGUMENTS_LIST_EMPTY:
-		return "Arguments-list node should have at least one argument";
 	case MANIFEST_ERROR_INTERRUPT_ID_REPEATED:
 		return "Interrupt ID already assigned to another endpoint";
 	case MANIFEST_ERROR_ILLEGAL_NS_INT_ACTION:
-		return "Illegal value specidied for the field: Action in "
+		return "Illegal value specified for the field: Action in "
 		       "response to NS Interrupt";
+	case MANIFEST_ERROR_ILLEGAL_SRI_POLICY:
+		return "Illegal value specified for the field: SRI Policy";
+	case MANIFEST_ERROR_SRI_POLICY_NOT_SUPPORTED:
+		return "S-EL0 Partitions do not support the SRI trigger policy";
 	case MANIFEST_ERROR_INTERRUPT_ID_NOT_IN_LIST:
 		return "Interrupt ID is not in the list of interrupts";
 	case MANIFEST_ERROR_ILLEGAL_OTHER_S_INT_ACTION:
@@ -1736,10 +1820,6 @@ const char *manifest_strerror(enum manifest_return_code ret_code)
 	case MANIFEST_ERROR_MEMORY_MISSING:
 		return "Memory nodes must be defined in the SPMC manifest "
 		       "('memory' and 'ns-memory')";
-	case MANIFEST_ERROR_PARTITION_ADDRESS_OVERLAP:
-		return "Partition's memory [load address: load address + "
-		       "memory size[ overlap with other allocated "
-		       "regions";
 	case MANIFEST_ERROR_MEM_REGION_INVALID:
 		return "Invalid memory region range";
 	case MANIFEST_ERROR_DEVICE_MEM_REGION_INVALID:

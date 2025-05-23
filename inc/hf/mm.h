@@ -13,11 +13,47 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "hf/arch/mm.h"
-
 #include "hf/addr.h"
 #include "hf/mpool.h"
 #include "hf/static_assert.h"
+
+typedef uint32_t mm_mode_t;
+typedef uint64_t mm_attr_t;
+
+/**
+ * The level of a page table entry (i.e. how deep into the recursive tree
+ * structure it is). See also Arm ARM, table D8-14.
+ *
+ * - `level == 4`: table entries (root)
+ * - `level == 3`: table or block entries
+ * - `level == 2`: table or block entries
+ * - `level == 1`: table or block entries
+ * - `level == 0`: page entries
+ *
+ * NOTE: The Arm ARM uses levels in the opposite order to our code: in the Arm
+ * ARM, levels start at 0 (or -1 if 52 bits of PA are used, but that is not
+ * supported by Hafnium) and page entries are at level 3. We go in the opposite
+ * direction: levels start at 3 or 4 and page entries are at level 0. This is
+ * because it makes the arithmetic and bit manipulation easier.
+ */
+typedef uint8_t mm_level_t;
+typedef uint16_t mm_asid_t;
+
+/*
+ * A page table entry (PTE) will take one of the following forms:
+ *
+ *  1. absent        : There is no mapping.
+ *  2. invalid block : Represents a block that is not in the address space.
+ *  3. valid block   : Represents a block that is in the address space.
+ *  4. table         : Represents a reference to a table of PTEs.
+ * See Arm ARM, D8.3 (Translation table descriptor formats).
+ */
+enum mm_pte_type {
+	PTE_TYPE_ABSENT,
+	PTE_TYPE_INVALID_BLOCK,
+	PTE_TYPE_VALID_BLOCK,
+	PTE_TYPE_TABLE,
+};
 
 /* Keep macro alignment */
 /* clang-format off */
@@ -26,10 +62,10 @@
 #define MM_PTE_PER_PAGE (PAGE_SIZE / sizeof(pte_t))
 
 /* The following are arch-independent page mapping modes. */
-#define MM_MODE_R UINT32_C(0x0001) /* read */
-#define MM_MODE_W UINT32_C(0x0002) /* write */
-#define MM_MODE_X UINT32_C(0x0004) /* execute */
-#define MM_MODE_D UINT32_C(0x0008) /* device */
+#define MM_MODE_R (1U << 0) /* read */
+#define MM_MODE_W (1U << 1) /* write */
+#define MM_MODE_X (1U << 2) /* execute */
+#define MM_MODE_D (1U << 3) /* device */
 
 /*
  * Memory in stage-1 is either valid (present) or invalid (absent).
@@ -59,24 +95,30 @@
  *
  *  Modes are selected so that owner of exclusive memory is the default.
  */
-#define MM_MODE_INVALID UINT32_C(0x0010)
-#define MM_MODE_UNOWNED UINT32_C(0x0020)
-#define MM_MODE_SHARED  UINT32_C(0x0040)
-
-/* Specifies if a mapping will be a user mapping(EL0). */
-#define MM_MODE_USER    UINT32_C(0x0200)
+#define MM_MODE_INVALID (1U << 4)
+#define MM_MODE_UNOWNED (1U << 5)
+#define MM_MODE_SHARED  (1U << 6)
 
 /* Map page as non-global. */
-#define MM_MODE_NG UINT32_C(0x0100) /* non-global */
+#define MM_MODE_NG (1U << 8)
+
+/* Specifies if a mapping will be a user mapping(EL0). */
+#define MM_MODE_USER    (1U << 9)
 
 /* The mask for a mode that is considered unmapped. */
 #define MM_MODE_UNMAPPED_MASK (MM_MODE_INVALID | MM_MODE_UNOWNED)
 
-#define MM_FLAG_COMMIT  0x01
-#define MM_FLAG_UNMAP   0x02
-#define MM_FLAG_STAGE1  0x04
-
 /* clang-format on */
+
+/**
+ * Flags for page table operations.
+ * - commit: Commit the given range rather than preparing it.
+ * - unmap: Unmap the given range rather than mapping it.
+ */
+struct mm_flags {
+	bool commit : 1;
+	bool unmap : 1;
+};
 
 #define MM_PPOOL_ENTRY_SIZE sizeof(struct mm_page_table)
 
@@ -93,9 +135,18 @@ struct mm_ptable {
 	 * VMID/ASID associated with a page table. ASID 0 is reserved for use by
 	 * the hypervisor.
 	 */
-	uint16_t id;
-	/** Address of the root of the page table. */
-	paddr_t root;
+	mm_asid_t id;
+	/**
+	 * Address of the root tables.
+	 * At stage 1, concatenated tables are not used, so there is only one
+	 * root table.
+	 * At stage 2, concatenated tables are used, so there are multiple root
+	 * tables (given by `arch_mm_root_table_count()`). The Arm ARM says
+	 * there can be up to 16 root tables, but we only use 4.
+	 */
+	struct mm_page_table *root_tables;
+	/** If true, the PT is a stage1 PT, otherwise it is a stage2 PT. */
+	bool stage1 : 1;
 };
 
 /** The type of addresses stored in the page table. */
@@ -108,39 +159,47 @@ struct mm_stage1_locked {
 
 void mm_vm_enable_invalidation(void);
 
-bool mm_ptable_init(struct mm_ptable *t, uint16_t id, int flags,
+bool mm_ptable_init(struct mm_ptable *ptable, mm_asid_t id, bool stage1,
 		    struct mpool *ppool);
-ptable_addr_t mm_ptable_addr_space_end(int flags);
+ptable_addr_t mm_ptable_addr_space_end(const struct mm_ptable *ptable);
 
-bool mm_vm_init(struct mm_ptable *t, uint16_t id, struct mpool *ppool);
-void mm_vm_fini(struct mm_ptable *t, struct mpool *ppool);
+bool mm_vm_init(struct mm_ptable *ptable, mm_asid_t id, struct mpool *ppool);
+void mm_vm_fini(const struct mm_ptable *ptable, struct mpool *ppool);
 
-bool mm_identity_prepare(struct mm_ptable *t, paddr_t begin, paddr_t end,
-			 uint32_t mode, struct mpool *ppool);
-void *mm_identity_commit(struct mm_ptable *t, paddr_t begin, paddr_t end,
-			 uint32_t mode, struct mpool *ppool);
+bool mm_identity_prepare(struct mm_ptable *ptable, paddr_t begin, paddr_t end,
+			 mm_mode_t mode, struct mpool *ppool);
+void *mm_identity_commit(struct mm_ptable *ptable, paddr_t begin, paddr_t end,
+			 mm_mode_t mode, struct mpool *ppool);
 
-bool mm_vm_identity_map(struct mm_ptable *t, paddr_t begin, paddr_t end,
-			uint32_t mode, struct mpool *ppool, ipaddr_t *ipa);
-bool mm_vm_identity_prepare(struct mm_ptable *t, paddr_t begin, paddr_t end,
-			    uint32_t mode, struct mpool *ppool);
-void mm_vm_identity_commit(struct mm_ptable *t, paddr_t begin, paddr_t end,
-			   uint32_t mode, struct mpool *ppool, ipaddr_t *ipa);
-bool mm_vm_unmap(struct mm_ptable *t, paddr_t begin, paddr_t end,
+bool mm_vm_identity_map(struct mm_ptable *ptable, paddr_t begin, paddr_t end,
+			mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa);
+bool mm_vm_identity_prepare(struct mm_ptable *ptable, paddr_t begin,
+			    paddr_t end, mm_mode_t mode, struct mpool *ppool);
+void mm_vm_identity_commit(struct mm_ptable *ptable, paddr_t begin, paddr_t end,
+			   mm_mode_t mode, struct mpool *ppool, ipaddr_t *ipa);
+bool mm_vm_unmap(struct mm_ptable *ptable, paddr_t begin, paddr_t end,
 		 struct mpool *ppool);
-void mm_stage1_defrag(struct mm_ptable *t, struct mpool *ppool);
-void mm_vm_defrag(struct mm_ptable *t, struct mpool *ppool, bool non_secure);
-void mm_vm_dump(struct mm_ptable *t);
-bool mm_vm_get_mode(struct mm_ptable *t, ipaddr_t begin, ipaddr_t end,
-		    uint32_t *mode);
-bool mm_get_mode(struct mm_ptable *t, vaddr_t begin, vaddr_t end,
-		 uint32_t *mode);
+void mm_stage1_defrag(struct mm_ptable *ptable, struct mpool *ppool);
+void mm_vm_defrag(struct mm_ptable *ptable, struct mpool *ppool,
+		  bool non_secure);
+void mm_vm_dump(const struct mm_ptable *ptable);
+bool mm_vm_get_mode(const struct mm_ptable *ptable, ipaddr_t begin,
+		    ipaddr_t end, mm_mode_t *mode);
+
+bool mm_vm_get_mode_partial(const struct mm_ptable *ptable, ipaddr_t begin,
+			    ipaddr_t end, mm_mode_t *mode, ipaddr_t *end_ret);
+
+bool mm_get_mode(const struct mm_ptable *ptable, vaddr_t begin, vaddr_t end,
+		 mm_mode_t *mode);
+
+bool mm_get_mode_partial(const struct mm_ptable *ptable, vaddr_t begin,
+			 vaddr_t end, mm_mode_t *mode, vaddr_t *end_ret);
 
 struct mm_stage1_locked mm_lock_ptable_unsafe(struct mm_ptable *ptable);
 struct mm_stage1_locked mm_lock_stage1(void);
 void mm_unlock_stage1(struct mm_stage1_locked *lock);
 void *mm_identity_map(struct mm_stage1_locked stage1_locked, paddr_t begin,
-		      paddr_t end, uint32_t mode, struct mpool *ppool);
+		      paddr_t end, mm_mode_t mode, struct mpool *ppool);
 bool mm_unmap(struct mm_stage1_locked stage1_locked, paddr_t begin, paddr_t end,
 	      struct mpool *ppool);
 void mm_defrag(struct mm_stage1_locked stage1_locked, struct mpool *ppool);

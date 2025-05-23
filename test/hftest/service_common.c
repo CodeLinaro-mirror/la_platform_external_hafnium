@@ -7,12 +7,14 @@
  */
 
 #include "hf/check.h"
+#include "hf/fdt.h"
 #include "hf/fdt_handler.h"
 #include "hf/ffa.h"
 #include "hf/memiter.h"
 #include "hf/mm.h"
 #include "hf/std.h"
 #include "hf/stdout.h"
+#include "hf/string.h"
 
 #include "vmapi/hf/call.h"
 
@@ -109,6 +111,7 @@ void hftest_parse_ffa_manifest(struct hftest_context *ctx, struct fdt *fdt)
 	struct string mem_region_node_name = STRING_INIT("memory-regions");
 	struct string dev_region_node_name = STRING_INIT("device-regions");
 	struct memiter uuid;
+	struct memiter description;
 	uint32_t uuid_word = 0;
 	uint16_t j = 0;
 	uint16_t i = 0;
@@ -177,6 +180,14 @@ void hftest_parse_ffa_manifest(struct hftest_context *ctx, struct fdt *fdt)
 				cur_region->base_address =
 					ctx->partition_manifest.load_addr +
 					number;
+				cur_region->is_relative = true;
+			}
+
+			if (fdt_read_property(&ffa_node, "description",
+					      &description)) {
+				EXPECT_EQ(string_init(&cur_region->description,
+						      &description),
+					  STRING_SUCCESS);
 			}
 
 			EXPECT_TRUE(fdt_read_number(&ffa_node, "attributes",
@@ -276,7 +287,7 @@ noreturn void hftest_service_main(const void *fdt_ptr)
 	struct fdt fdt;
 	const ffa_id_t own_id = hf_vm_get_id();
 	ffa_notifications_bitmap_t bitmap;
-	struct ffa_partition_msg *message;
+	const struct ffa_partition_msg *message;
 	uint32_t vcpu = get_current_vcpu_index();
 
 	ctx = hftest_get_context();
@@ -338,14 +349,15 @@ noreturn void hftest_service_main(const void *fdt_ptr)
 	bitmap = ffa_notification_get_from_framework(ret);
 	ASSERT_TRUE(is_ffa_spm_buffer_full_notification(bitmap) ||
 		    is_ffa_hyp_buffer_full_notification(bitmap));
-	ASSERT_EQ(own_id, ffa_rxtx_header_receiver(&message->header));
+	ASSERT_EQ(own_id, message->header.receiver);
 
 	if (ctx->is_ffa_manifest_parsed &&
 	    ctx->partition_manifest.run_time_el == S_EL1) {
 		ASSERT_EQ(hf_interrupt_get(), HF_NOTIFICATION_PENDING_INTID);
 	}
 
-	memiter_init(&args, message->payload, message->header.size);
+	memiter_init(&args, ffa_partition_msg_payload_const(message),
+		     message->header.size);
 
 	/* Find service handler. */
 	service = find_service(&args);
