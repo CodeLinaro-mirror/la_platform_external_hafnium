@@ -20,12 +20,10 @@
  */
 void host_timer_disable(void)
 {
-#if 0 // TMP: Trusty
 #if SECURE_WORLD == 1
 	write_msr(cnthps_ctl_el2, 0);
 #else
 	write_msr(cnthp_ctl_el2, 0);
-#endif
 #endif
 	/* Ensure that the write to ctl register has taken effect. */
 	isb();
@@ -59,15 +57,12 @@ void host_timer_init(void)
  */
 void host_timer_save_arch_timer(struct timer_state *timer)
 {
-	(void)timer;
-#if 0 // TMP: Trusty
 #if SECURE_WORLD == 1
 	timer->cval = read_msr(MSR_CNTHPS_CVAL_EL2);
 	timer->ctl = read_msr(MSR_CNTHPS_CTL_EL2);
 #else
 	timer->cval = read_msr(MSR_CNTHP_CVAL_EL2);
 	timer->ctl = read_msr(MSR_CNTHP_CTL_EL2);
-#endif
 #endif
 }
 
@@ -81,8 +76,6 @@ void host_timer_track_deadline(struct timer_state *timer)
 	 * a spurious timer interrupt. This could be a problem if the interrupt
 	 * is configured as edge-triggered, as it would then be latched in.
 	 */
-	(void)timer;
-#if 0 // TMP: Trusty
 #if SECURE_WORLD == 1
 	write_msr(cnthps_ctl_el2, 0);
 	write_msr(cnthps_cval_el2, timer->cval);
@@ -91,7 +84,6 @@ void host_timer_track_deadline(struct timer_state *timer)
 	write_msr(cnthp_ctl_el2, 0);
 	write_msr(cnthp_cval_el2, timer->cval);
 	write_msr(cnthp_ctl_el2, timer->ctl);
-#endif
 #endif
 	/* Ensure that the write to ctl register has taken effect. */
 	isb();
