@@ -1,0 +1,58 @@
+# Copyright 2021 The Hafnium Authors.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/BSD-3-Clause.
+
+import("//build/toolchain/platform.gni")
+
+source_set("absent") {
+  public_configs = [ "//src/arch/${plat_arch}:config" ]
+  sources = [ "absent.c" ]
+}
+
+config("hypervisor_config") {
+  include_dirs = [ "inc" ]
+}
+
+source_set("hypervisor") {
+  public_configs = [
+    "//src/arch/${plat_arch}:config",
+    "//src/arch/${plat_arch}:arch_config",
+    ":hypervisor_config",
+  ]
+  deps = [ "//vmlib/${plat_arch}:smc_call" ]
+  sources = [
+    "hypervisor/cpu_cycles.c",
+    "hypervisor/direct_messaging.c",
+    "hypervisor/ffa_memory.c",
+    "hypervisor/indirect_messaging.c",
+    "hypervisor/init.c",
+    "hypervisor/interrupts.c",
+    "hypervisor/notifications.c",
+    "hypervisor/setup_and_discovery.c",
+    "hypervisor/vm.c",
+  ]
+}
+
+source_set("spmc") {
+  public_configs = [
+    "//src/arch/${plat_arch}:config",
+    "//src/arch/${plat_arch}:arch_config",
+  ]
+
+  deps = [ "//vmlib/${plat_arch}:smc_call" ]
+
+  sources = [
+    "//src/arch/aarch64/hypervisor/simd.c",
+    "spmc/cpu_cycles.c",
+    "spmc/direct_messaging.c",
+    "spmc/ffa_memory.c",
+    "spmc/indirect_messaging.c",
+    "spmc/init.c",
+    "spmc/interrupts.c",
+    "spmc/notifications.c",
+    "spmc/setup_and_discovery.c",
+    "spmc/vm.c",
+  ]
+}
