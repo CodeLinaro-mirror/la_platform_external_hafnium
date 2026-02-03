@@ -12,7 +12,7 @@ third_party {
   identifier {
     type: "Git"
     value: "https://git.trustedfirmware.org/hafnium/hafnium.git"
-    version: "1fb54264837ddd78096d9b4c7c565bced1597670"
+    version: "2cf2ca7c4b81ab18e9cd363d9a5c8288e2a94fda"
     closest_version: "v2.12"
     primary_source: true
   }
