@@ -339,6 +339,8 @@ void vcpu_set_running(struct vcpu_locked target_locked,
 {
 	struct vcpu *target_vcpu = target_locked.vcpu;
 
+	assert(!target_vcpu->processing_managed_exit);
+
 	if (args != NULL) {
 		CHECK(target_vcpu->regs_available);
 		assert(target_vcpu->state == VCPU_STATE_WAITING ||
@@ -650,6 +652,8 @@ void vcpu_dir_req_set_state(struct vcpu_locked target_locked, bool is_ffa_req2,
 			    ffa_id_t sender_vm_id, struct ffa_value args)
 {
 	struct vcpu *target_vcpu = target_locked.vcpu;
+
+	assert(!target_vcpu->processing_managed_exit);
 
 	target_vcpu->state = VCPU_STATE_RUNNING;
 	target_vcpu->regs_available = false;
