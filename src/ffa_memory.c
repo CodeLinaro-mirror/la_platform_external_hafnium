@@ -1271,7 +1271,7 @@ struct ffa_value ffa_region_group_identity_map(
 {
 	uint32_t i;
 	uint32_t j;
-	struct ffa_value ret;
+	struct ffa_value ret = (struct ffa_value){.func = FFA_SUCCESS_32};
 
 	if (vm_locked.vm->el0_partition) {
 		mode |= MM_MODE_USER | MM_MODE_NG;
@@ -1314,7 +1314,21 @@ struct ffa_value ffa_region_group_identity_map(
 						fragments,
 						fragment_constituent_counts,
 						i + 1, constituent);
-					break;
+				}
+
+				/*
+				 * Stop immediately on any error (FFA_DENIED,
+				 * FFA_NO_MEMORY, ...) instead of continuing to
+				 * the next constituent. Otherwise, if a later
+				 * constituent happens to succeed (e.g. because
+				 * it needs no new page-table allocation), it
+				 * would overwrite `ret` and hide this failure
+				 * from the caller, which could then proceed to
+				 * commit a transaction that was never actually
+				 * fully prepared.
+				 */
+				if (ret.func == FFA_ERROR_32) {
+					return ret;
 				}
 			} else if (action >= MAP_ACTION_COMMIT &&
 				   action < MAP_ACTION_MAX) {
