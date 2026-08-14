@@ -117,6 +117,17 @@ struct ffa_memory_share_state {
 	uint32_t retrieved_fragment_count[MAX_MEM_SHARE_RECIPIENTS];
 
 	/**
+	 * Number of constituents of
+	 * `fragments[retrieved_fragment_count[i]]` already sent to receiver
+	 * `i` in a previous retrieve response/FFA_MEM_FRAG_TX. Nonzero only
+	 * when a single stored send fragment is larger than what fits in
+	 * receiver `i`'s mailbox and had to be split across multiple
+	 * response fragments. 0 means fragments[retrieved_fragment_count[i]]
+	 * has not been started yet (or there is nothing pending).
+	 */
+	uint32_t retrieved_constituent_offset[MAX_MEM_SHARE_RECIPIENTS];
+
+	/**
 	 * Field for the SPMC to keep track of how many fragments of the memory
 	 * region the hypervisor has managed to retrieve, using a
 	 * `hypervisor retrieve request`, as defined by FF-A v1.1 EAC0

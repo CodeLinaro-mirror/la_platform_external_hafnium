@@ -415,7 +415,8 @@ static struct ffa_value ffa_memory_other_world_reclaim(
 		}
 
 		/* Check that all VMs have relinquished. */
-		if (share_state->retrieved_fragment_count[i] != 0) {
+		if (share_state->retrieved_fragment_count[i] != 0 ||
+		    share_state->retrieved_constituent_offset[i] != 0) {
 			dlog_verbose(
 				"Tried to reclaim memory handle %#lx "
 				"that has not been relinquished by all "
