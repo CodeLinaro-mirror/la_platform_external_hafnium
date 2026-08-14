@@ -463,4 +463,60 @@ TEST(ffa_mixed_mailbox,
 	EXPECT_EQ(sp_ffa_mem_lend_cmd_error(ret), FFA_INVALID_PARAMETERS);
 }
 
+/*
+ * Same SP-to-SP LEND as `oversized_single_fragment_lend_sp_to_sp` above, but
+ * the receiver keeps its default single 4 KiB mailbox instead of the
+ * maximum multi-page one. The single stored send fragment (bigger than one
+ * FF-A page, by construction of `OVERSIZED_CONSTITUENT_COUNT`) then doesn't
+ * even fit in the *first* retrieve response fragment, which is exactly the
+ * case `ffa_partition_retrieve_response_init()` used to assume could never
+ * happen: it panicked via the `CHECK()` guarding that call before this was
+ * fixed to pack a partial prefix of the fragment and let
+ * `memory_region_desc_from_rx_fragments()` (driven by `retrieve_v1_2_or_
+ * later()` in partition_services.c) fetch the remainder with repeated
+ * `FFA_MEM_FRAG_RX` calls.
+ *
+ * LARGE_SP_ID (SP Second) is reused as the small-mailbox receiver here
+ * rather than SMALL_SP_ID/SP First: SP First is pinned to FF-A v1.0, which
+ * takes the separate `retrieve_v1_0()` code path, so using it would
+ * conflate this regression with the v1.0-specific behaviour already
+ * covered by `oversized_single_fragment_lend_v1_0_rejected` above.
+ */
+TEST(ffa_mixed_mailbox, oversized_single_fragment_lend_sp_to_sp_small_receiver)
+{
+	struct ffa_value ret;
+	ffa_id_t own_id = hf_vm_get_id();
+	ffa_memory_handle_t handle;
+	const ffa_id_t sender_sp_id = THIRD_SP_ID;
+	const ffa_id_t receiver_sp_id = LARGE_SP_ID;
+
+	remap_sp_mailbox(sender_sp_id, LARGE_MB_PAGES);
+	remap_sp_mailbox(receiver_sp_id, SMALL_MB_PAGES);
+
+	ret = sp_ffa_mem_lend_cmd_send(own_id, sender_sp_id, receiver_sp_id,
+				       OVERSIZED_CONSTITUENT_COUNT);
+	ASSERT_EQ(ret.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	ASSERT_EQ(sp_resp(ret), SP_SUCCESS);
+	handle = sp_ffa_mem_lend_cmd_handle(ret);
+	ASSERT_NE(handle, FFA_MEMORY_HANDLE_INVALID);
+
+	ret = sp_ffa_mem_lend_retrieve_cmd_send(own_id, receiver_sp_id,
+						sender_sp_id, handle);
+	EXPECT_EQ(ret.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(ret), SP_SUCCESS);
+	EXPECT_EQ(sp_resp_value(ret), FFA_MEM_RETRIEVE_RESP_32);
+	/*
+	 * The one-page mailbox can't have carried every constituent in the
+	 * initial response fragment, so completing the retrieve above must
+	 * have taken at least one FFA_MEM_FRAG_RX continuation.
+	 */
+	EXPECT_LT(sp_resp_value2(ret),
+		  OVERSIZED_CONSTITUENT_COUNT *
+			  sizeof(struct ffa_memory_region_constituent));
+
+	ret = sp_relinquish_shared_buffer_cmd_send(own_id, receiver_sp_id);
+	EXPECT_EQ(ret.func, FFA_MSG_SEND_DIRECT_RESP_32);
+	EXPECT_EQ(sp_resp(ret), SP_SUCCESS);
+}
+
 #endif /* RXTX_MAX_PAGE_COUNT > 1 */
