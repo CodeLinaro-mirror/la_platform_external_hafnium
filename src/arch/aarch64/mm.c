@@ -291,12 +291,9 @@ void arch_mm_invalidate_stage1_range(ffa_id_t asid, vaddr_t va_begin,
 			tlbi(alle2is);
 		}
 	} else {
-		begin >>= 12;
-		end >>= 12;
-
 		/* Invalidate stage-1 TLB, one page from the range at a time. */
-		for (it = begin; it < end;
-		     it += (UINT64_C(1) << (PAGE_BITS - 12))) {
+		for (it = begin; it < end; it += PAGE_SIZE) {
+			uint64_t xt = it >> 12;
 			/*
 			 * Mask upper 8 bits of asid passed in. Hafnium on
 			 * aarch64 currently only uses 8 bit asids.TCR_EL2.AS is
@@ -304,12 +301,11 @@ void arch_mm_invalidate_stage1_range(ffa_id_t asid, vaddr_t va_begin,
 			 * asids and is res0 on implementations that dont
 			 * support 16 bit asids.
 			 */
-			asid &= 0xff;
-			it |= (uint64_t)asid << 48;
+			xt |= (uint64_t)(asid & 0xff) << 48;
 			if (VM_TOOLCHAIN == 1) {
-				tlbi_reg(vae1is, it);
+				tlbi_reg(vae1is, xt);
 			} else {
-				tlbi_reg(vae2is, it);
+				tlbi_reg(vae2is, xt);
 			}
 		}
 	}
@@ -365,23 +361,20 @@ void arch_mm_invalidate_stage2_range(uint16_t vmid, ipaddr_t va_begin,
 		 */
 		tlbi(vmalls12e1is);
 	} else {
-		begin >>= 12;
-		end >>= 12;
-
 		/*
 		 * Invalidate stage-2 TLB, one page from the range at a time.
 		 * Note that this has no effect if the CPU has a TLB with
 		 * combined stage-1/stage-2 translation.
 		 */
-		for (it = begin; it < end;
-		     it += (UINT64_C(1) << (PAGE_BITS - 12))) {
+		for (it = begin; it < end; it += PAGE_SIZE) {
+			uint64_t xt = it >> 12;
 			(void)non_secure;
 #if SECURE_WORLD == 1
 			if (non_secure) {
-				it |= (1ULL << 63);
+				xt |= (1ULL << 63);
 			}
 #endif
-			tlbi_reg(ipas2e1is, it);
+			tlbi_reg(ipas2e1is, xt);
 		}
 
 		/*
