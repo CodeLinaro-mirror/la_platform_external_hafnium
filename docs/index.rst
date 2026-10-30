@@ -10,7 +10,7 @@ Hafnium Documentation
    getting_started/index
    process/index
    secure-partition-manager/index
-   threat_model_spm
+   threat-model/threat_model_spm
    security-advisories/index
    change-log
    deprecated/index

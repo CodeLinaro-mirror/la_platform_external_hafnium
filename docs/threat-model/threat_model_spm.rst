@@ -38,8 +38,8 @@ The scope for this threat model is:
   running in the secure world of TrustZone (at S-EL2 exception level).
   The threat model is not related to the normal world Hypervisor or VMs.
   The S-EL1 and EL3 SPMC solutions are not covered.
-- The implementation complies with the FF-A v1.0 specification, and a few
-  features of FF-A v1.1 specification.
+- The implementation complies with the FF-A v1.0 specification, and selected
+  features of FF-A v1.1 and FF-A v1.3 specifications.
 - Secure partitions are statically provisioned at boot time.
 - Focus on the run-time part of the life-cycle (no specific emphasis on boot
   time, factory firmware provisioning, firmware udpate etc.)
@@ -61,7 +61,7 @@ red broken lines indicate trust boundaries.
 
 Components outside of the broken lines are considered untrusted.
 
-.. uml:: resources/diagrams/plantuml/spm_dfd.puml
+.. uml:: ../resources/diagrams/plantuml/spm_dfd.puml
   :caption: Figure 1: SPMC Data Flow Diagram
 
 .. table:: Table 1: SPMC Data Flow Diagram Description
@@ -112,7 +112,7 @@ Trust boundaries
   implicitely trusted by the usage of secure boot.
 - EL3 monitor, SPMD, SPMC do not trust SPs.
 
-.. figure:: resources/diagrams/spm-threat-model-trust-boundaries.png
+.. figure:: ../resources/diagrams/spm-threat-model-trust-boundaries.png
 
     Figure 2: Trust boundaries
 
@@ -615,13 +615,14 @@ element of the data flow diagram.
 | ID                     | 12                                                 |
 +========================+====================================================+
 | ``Threat``             | **A malicious endpoint may attempt to allocate     |
-|                        | notifications bitmaps in the SPMC, through the     |
+|                        | notification bitmaps in the SPMC, or request an    |
+|                        | excessive extended notification count, through     |
 |                        | FFA_NOTIFICATION_BITMAP_CREATE.**                  |
-|                        | This might be an attempt to exhaust SPMC's memory, |
-|                        | or to allocate a bitmap for a VM that was not      |
-|                        | intended to receive notifications from SPs. Thus   |
-|                        | creating the possibility for a channel that was not|
-|                        | meant to exist.                                    |
+|                        | This might be an attempt to exhaust SPMC's fixed,  |
+|                        | size allocation pool or to allocate a bitmap for a |
+|                        | VM that was not intended to receive notifications  |
+|                        | from SPs. Thus creating the possibility for a      |
+|                        | channel that was not meant to exist.               |
 +------------------------+----------------------------------------------------+
 | ``Diagram Elements``   | DF1, DF2, DF3                                      |
 +------------------------+----------------------------------------------------+
@@ -642,12 +643,16 @@ element of the data flow diagram.
 +------------------------+------------------+-----------------+---------------+
 | ``Total Risk Rating``  | Medium(9)        | Medium(9)       |               |
 +------------------------+------------------+-----------------+---------------+
-| ``Mitigations``        | The TF-A SPMC mitigates this threat by defining a  |
-|                        | a fixed size pool for bitmap allocation.           |
-|                        | It also limits the designated FF-A calls to be used|
-|                        | from NWd endpoints.                                |
-|                        | In the NWd the hypervisor is supposed to limit the |
-|                        | access to the designated FF-A call.                |
+| ``Mitigations``        | The TF-A SPMC mitigates this threat by using a     |
+|                        | fixed-size pool for bitmap allocation and limiting |
+|                        | the number of notification IDs allocated to an     |
+|                        | endpoint to 384. Requests above this limit are     |
+|                        | rejected.                                          |
+|                        | The SPMC restricts the designated FF-A call to the |
+|                        | Hypervisor for valid NWd VM IDs and denies attempts|
+|                        | to create a bitmap more than once for an endpoint. |
+|                        | In the NWd, the Hypervisor must restrict access to |
+|                        | the designated FF-A call.                          |
 +------------------------+----------------------------------------------------+
 
 +------------------------+----------------------------------------------------+
@@ -690,13 +695,13 @@ element of the data flow diagram.
 +------------------------+----------------------------------------------------+
 | ID                     | 14                                                 |
 +========================+====================================================+
-| ``Threat``             | **A malicious endpoint might attempt to give       |
-|                        | permissions to an unintended sender to set         |
-|                        | notifications targeting another receiver using the |
-|                        | FF-A call FFA_NOTIFICATION_BIND.**                 |
-|                        | This might be an attempt to tamper with the SPMC   |
-|                        | state such that an unintended, and possibly        |
-|                        | malicious, communication channel is established.   |
+| ``Threat``             | **A malicious endpoint might attempt to modify     |
+|                        | another receiver's notification bindings using     |
+|                        | FFA_NOTIFICATION_BIND, UNBIND, BIND2 or UNBIND2.** |
+|                        | It might bind notifications to an unintended sender|
+|                        | to establish an unauthorized communication channel,|
+|                        | or unbind a legitimate sender to prevent expected  |
+|                        | notifications from being signaled.                 |
 +------------------------+----------------------------------------------------+
 | ``Diagram Elements``   | DF1, DF2, DF3                                      |
 +------------------------+----------------------------------------------------+
@@ -707,7 +712,7 @@ element of the data flow diagram.
 +------------------------+----------------------------------------------------+
 | ``Threat Agent``       | NS-Endpoint, S-Endpoint                            |
 +------------------------+----------------------------------------------------+
-| ``Threat Type``        | Tampering, Spoofing                                |
+| ``Threat Type``        | Tampering, Spoofing, Denial of Service             |
 +------------------------+------------------+-----------------+---------------+
 | ``Application``        |   ``Server``     |   ``Mobile``    |               |
 +------------------------+------------------+-----------------+---------------+
@@ -717,11 +722,19 @@ element of the data flow diagram.
 +------------------------+------------------+-----------------+---------------+
 | ``Total Risk Rating``  | Medium(6)        | Medium(6)       |               |
 +------------------------+------------------+-----------------+---------------+
-| ``Mitigations``        | The TF-A SPMC mitigates this by restricting        |
-|                        | designated FFA_NOTIFICATION_BIND call to be issued |
-|                        | by the receiver only. The receiver is responsible  |
-|                        | for allocating the notifications IDs to one        |
-|                        | specific partition.                                |
+| ``Mitigations``        | The TF-A SPMC permits an SP receiver to modify only|
+|                        | its own notification bindings. At the Non-secure   |
+|                        | physical FF-A instance, only the Hypervisor can    |
+|                        | modify bindings on behalf of a NWd VM receiver.    |
+|                        | The SPMC verifies the sender and receiver          |
+|                        | relationship and tracks the sender bound to each   |
+|                        | notification ID.                                   |
+|                        | For extended notifications, it rejects notification|
+|                        | IDs outside the receiver's allocated count. A bind |
+|                        | is denied if an ID is already bound, and an unbind |
+|                        | is denied if the ID is not bound to the specified  |
+|                        | sender. Bindings cannot be changed while the       |
+|                        | selected notifications are pending.                |
 |                        | Also, receivers that are not meant to receive      |
 |                        | notifications, must have notifications receipt     |
 |                        | disabled in the respective partition's manifest.   |
@@ -738,7 +751,10 @@ element of the data flow diagram.
 | ID                     | 15                                                 |
 +========================+====================================================+
 | ``Threat``             | **A malicious partition endpoint might attempt to  |
-|                        | set notifications that are not bound to it.**      |
+|                        | use FFA_NOTIFICATION_SET or                        |
+|                        | FFA_NOTIFICATION_SET2 to signal notifications that |
+|                        | are not bound to it, or to select extended IDs     |
+|                        | outside the receiver's allocated count.**          |
 +------------------------+----------------------------------------------------+
 | ``Diagram Elements``   | DF1, DF2, DF3                                      |
 +------------------------+----------------------------------------------------+
@@ -759,20 +775,29 @@ element of the data flow diagram.
 +------------------------+------------------+-----------------+---------------+
 | ``Total Risk Rating``  | Low(4)           | Low(4)          |               |
 +------------------------+------------------+-----------------+---------------+
-| ``Mitigations``        | The TF-A SPMC mitigates this by checking the       |
-|                        | sender's ID provided in the input to the call      |
-|                        | FFA_NOTIFICATION_SET. The SPMC keeps track of which|
-|                        | notifications are bound to which sender, for a     |
-|                        | given receiver. If the sender is an SP, the        |
-|                        | provided sender ID must match the ID of the        |
-|                        | currently running partition.                       |
+| ``Mitigations``        | The TF-A SPMC validates the sender and receiver    |
+|                        | relationship for FFA_NOTIFICATION_SET and          |
+|                        | FFA_NOTIFICATION_SET2. If the sender is an SP, its |
+|                        | provided ID must match the currently running       |
+|                        | partition.                                         |
+|                        | The SPMC tracks the sender bound to each           |
+|                        | notification ID and verifies that every selected   |
+|                        | notification is bound to the specified sender.     |
+|                        | For extended notifications, it rejects IDs outside |
+|                        | the receiver's allocated count. It also rejects an |
+|                        | empty bitmap or a receiver for which notification  |
+|                        | receipt is disabled.                               |
+|                        | For NWd-originated calls, authenticating the       |
+|                        | sending VM is the Hypervisor's responsibility.     |
 +------------------------+----------------------------------------------------+
 
 +------------------------+----------------------------------------------------+
 | ID                     | 16                                                 |
 +========================+====================================================+
 | ``Threat``             | **A malicious partition endpoint might attempt to  |
-|                        | get notifications that are not targeted to it.**   |
+|                        | use FFA_NOTIFICATION_GET or                        |
+|                        | FFA_NOTIFICATION_GET2 to retrieve notifications    |
+|                        | that are not targeted to it.**                     |
 +------------------------+----------------------------------------------------+
 | ``Diagram Elements``   | DF1, DF2, DF3                                      |
 +------------------------+----------------------------------------------------+
@@ -793,12 +818,17 @@ element of the data flow diagram.
 +------------------------+------------------+-----------------+---------------+
 | ``Total Risk Rating``  | Low(2)           | Low(2)          |               |
 +------------------------+------------------+-----------------+---------------+
-| ``Mitigations``        | The TF-A SPMC mitigates this by checking the       |
-|                        | receiver's ID provided in the input to the call    |
-|                        | FFA_NOTIFICATION_GET. The SPMC keeps track of which|
-|                        | notifications are pending for each receiver.       |
-|                        | The provided receiver ID must match the ID of the  |
-|                        | currently running partition, if it is an SP.       |
+| ``Mitigations``        | The TF-A SPMC checks the receiver ID provided to   |
+|                        | FFA_NOTIFICATION_GET and FFA_NOTIFICATION_GET2.    |
+|                        | If the receiver is an SP, the provided receiver ID |
+|                        | must match the currently running partition.        |
+|                        | The SPMC tracks pending notifications separately   |
+|                        | for each receiver.                                 |
+|                        | FFA_NOTIFICATION_GET2 requires FF-A v1.3 and       |
+|                        | validates the bitmap-selection flags, receiver     |
+|                        | vCPU ID and selective retrieval masks. SP and VM   |
+|                        | masks containing IDs outside the receiver's        |
+|                        | allocated count are rejected.                      |
 |                        | For calls forwarded from NWd, the SPMC will return |
 |                        | the pending notifications if the receiver had its  |
 |                        | bitmap created, and has pending notifications.     |
@@ -845,9 +875,14 @@ element of the data flow diagram.
 +------------------------+----------------------------------------------------+
 | ID                     | 18                                                 |
 +========================+====================================================+
-| ``Threat``             | **A malicious partition endpoint might attempt to  |
-|                        | flood another partition endpoint with notifications|
-|                        | hindering its operation.**                         |
+| ``Threat``             | **A malicious partition endpoint might repeatedly  |
+|                        | invoke FFA_NOTIFICATION_SET or                     |
+|                        | FFA_NOTIFICATION_SET2, or signal many bound        |
+|                        | notification IDs, to flood another endpoint and    |
+|                        | hinder its operation.**                            |
+|                        | Extended notifications increase the number of      |
+|                        | distinct IDs that can be pending for a receiver to |
+|                        | its allocated count, up to a maximum of 384.       |
 |                        | The intent of the malicious endpoint could be to   |
 |                        | interfere with both the receiver's and/or primary  |
 |                        | endpoint execution, as they can both be preempted  |
@@ -872,17 +907,25 @@ element of the data flow diagram.
 +------------------------+------------------+-----------------+---------------+
 | ``Total Risk Rating``  | Medium(6)        | Medium(6)       |               |
 +------------------------+------------------+-----------------+---------------+
-| ``Mitigations``        | The TF-A SPMC does not mitigate this threat.       |
-|                        | However, the impact is limited due to the          |
-|                        | architecture:                                      |
-|                        | - Notifications are not queued, one that has been  |
-|                        | signaled needs to be retrieved by the receiver,    |
-|                        | until it can be sent again.                        |
-|                        | - Both SRI and NPI can't be pended until handled   |
-|                        | which limits the amount of spurious interrupts.    |
-|                        | - A given receiver could only bind a maximum number|
-|                        | of notifications to a given sender, within a given |
-|                        | execution context.                                 |
+| ``Mitigations``        | The TF-A SPMC does not rate-limit                  |
+|                        | FFA_NOTIFICATION_SET or FFA_NOTIFICATION_SET2 and  |
+|                        | therefore does not fully mitigate this threat.     |
+|                        | However, the stored pending state is bounded:      |
+|                        |                                                    |
+|                        | - A receiver can allocate at most 384 SP-originated|
+|                        |   IDs and 384 VM-originated notification IDs.      |
+|                        | - Repeatedly signaling an already-pending ID does  |
+|                        |   not create additional stored notification events.|
+|                        | - A sender can signal only IDs that the receiver   |
+|                        |   previously bound to it.                          |
+|                        | - The SRI and NPI can each be pending only once at |
+|                        |   a time, limiting simultaneous outstanding        |
+|                        |   interrupts.                                      |
+|                        |                                                    |
+|                        | These bounds do not prevent CPU-cycle exhaustion   |
+|                        | from repeated calls. A successful non-delayed call |
+|                        | can trigger the SRI even when its selected IDs were|
+|                        | already pending.                                   |
 +------------------------+----------------------------------------------------+
 
 +------------------------+----------------------------------------------------+
