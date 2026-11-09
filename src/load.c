@@ -532,7 +532,8 @@ static mm_mode_t memory_region_attributes_to_mode(uint32_t attributes)
 	}
 
 	assert((mode == (MM_MODE_R | MM_MODE_W)) || (mode == MM_MODE_R) ||
-	       (mode == (MM_MODE_R | MM_MODE_X)));
+	       (mode == (MM_MODE_R | MM_MODE_X)) ||
+	       (mode == (MM_MODE_R | MM_MODE_W | MM_MODE_X)));
 
 	if ((attributes & MANIFEST_REGION_ATTR_SECURITY) != 0U) {
 		mode |= arch_mm_extra_mode_from_vm(HF_HYPERVISOR_VM_ID);
